@@ -2,6 +2,8 @@ import copy
 import csv
 import io
 import json
+import shlex
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -298,6 +300,112 @@ class ExportAndTransportTests(unittest.TestCase):
         self.assertIn("disabled", report["vms"][0]["filesystem_reason"])
         config_calls = [params for p, params in client.calls if p.endswith("/config")]
         self.assertTrue(all(params == {"current": 1} for params in config_calls))
+
+
+class SSHTests(unittest.TestCase):
+    def test_ssh_collects_cluster_with_no_remote_python_and_exports_locally(self):
+        fake = FakeClient()
+        commands = []
+        def ssh_run(command, **kwargs):
+            commands.append((command, kwargs))
+            self.assertEqual(command[0], "ssh")
+            if "-M" in command or "-O" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            remote = shlex.split(command[-1])
+            self.assertEqual(remote[:2], ["pvesh", "get"])
+            path = remote[2]
+            if "/content/" in path:
+                prefix, volume = path.split("/content/", 1)
+                path = prefix + "/content/" + inv.segment(volume)
+            params = {remote[i][2:]: remote[i+1] for i in range(5, len(remote), 2)}
+            return subprocess.CompletedProcess(command, 0, json.dumps(fake.get(path, **params)), "")
+        client = inv.SSHClient("pve.example", port=2222)
+        with patch("pve_inventory.os", SimpleNamespace(name="posix", fsencode=inv.os.fsencode)), patch("pve_inventory.shutil.which", return_value="/usr/bin/ssh"), \
+             patch("pve_inventory.subprocess.run", side_effect=ssh_run), patch("sys.stderr", new=io.StringIO()):
+            try:
+                client.connect()
+                report = collect(client)
+                inv.sort_report(report, "configured")
+                with tempfile.TemporaryDirectory() as tmp:
+                    inv.export_report(report, Path(tmp))
+                    self.assertTrue((Path(tmp) / "inventory.html").exists())
+                    self.assertEqual(report["storage_totals"][0]["total_bytes"], 150*GIB)
+            finally:
+                client.close()
+        self.assertEqual(sum("-M" in cmd for cmd, _ in commands), 1)
+        self.assertEqual(sum("-O" in cmd for cmd, _ in commands), 1)
+        self.assertTrue(all(not kw["shell"] for _, kw in commands))
+        master, master_options = commands[0]
+        self.assertNotIn("capture_output", master_options)  # authentication prompts stay in terminal
+        self.assertIn("StrictHostKeyChecking=ask", master)
+        self.assertIn("2222", master)
+        self.assertIsNone(client.directory)
+        self.assertIsNone(client.control_path)
+
+    def test_remote_command_quotes_untrusted_volume_text(self):
+        client = inv.SSHClient("pve")
+        client.control_path = "/tmp/test-socket"
+        volume = "local:100/disk';touch /tmp/unwanted;#.raw"
+        with patch("pve_inventory.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, '{"used":0}', "")
+            client.get("/nodes/a/storage/local/content/" + inv.segment(volume))
+            remote = shlex.split(run.call_args.args[0][-1])
+            self.assertEqual(remote[2], "/nodes/a/storage/local/content/" + volume)
+            self.assertEqual(len(remote), 5)
+            self.assertIn("BatchMode=yes", run.call_args.args[0])
+        with self.assertRaises(ValueError):
+            client.get("/nodes/a/qemu/100/status/stop")
+
+    def test_ssh_rejects_bad_connection_fields(self):
+        for host in ("-oProxyCommand=bad", "user@host", "host;cmd", "https://pve"):
+            with self.assertRaises(ValueError):
+                inv.SSHClient(host)
+        with self.assertRaises(ValueError):
+            inv.SSHClient("pve", user="root;cmd")
+        with self.assertRaises(ValueError):
+            inv.SSHClient("pve", port=70000)
+
+    def test_connect_failure_cleans_up(self):
+        client = inv.SSHClient("pve")
+        with patch("pve_inventory.os", SimpleNamespace(name="posix", fsencode=inv.os.fsencode)), patch("pve_inventory.shutil.which", return_value="ssh"), \
+             patch("pve_inventory.subprocess.run", return_value=subprocess.CompletedProcess([], 255)), \
+             patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(inv.ReadError):
+                client.connect()
+        self.assertIsNone(client.directory)
+
+    def test_command_timeout_and_sudo_are_explicit(self):
+        client = inv.SSHClient("pve", sudo=True)
+        client.control_path = "/tmp/test-socket"
+        with patch("pve_inventory.subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 20)) as run:
+            with self.assertRaises(inv.ReadError):
+                client.get("/version")
+            self.assertEqual(shlex.split(run.call_args.args[0][-1])[:5], ["sudo", "-n", "--", "pvesh", "get"])
+
+    def test_connection_prompts_and_unattended_credentials(self):
+        args = SimpleNamespace(no_prompt=False, ssh_host=None, ssh_user=None, ssh_port=None,
+                               ssh_key=None, timeout=20, ssh_auth_timeout=120, ssh_sudo=False)
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["pve", "", "2222", ""]):
+            settings = inv.ssh_settings(args, lambda name: None)
+        self.assertEqual(settings["host"], "pve")
+        self.assertEqual(settings["user"], "root")
+        self.assertEqual(settings["port"], 2222)
+        self.assertNotIn("password", settings)
+        args.no_prompt = True
+        with self.assertRaises(ValueError):
+            inv.ssh_settings(args, lambda name: None)
+        settings = inv.ssh_settings(args, lambda name: {"ssh_host": "pve", "ssh_user": "audit"}.get(name))
+        self.assertTrue(settings["batch"])
+
+    def test_main_closes_ssh_on_fatal_error(self):
+        client = FakeClient({"/cluster/resources": inv.ReadError("SSH disconnected")})
+        client.connect, client.close = unittest.mock.Mock(), unittest.mock.Mock()
+        with patch("pve_inventory.SSHClient", return_value=client), \
+             patch("sys.stderr", new=io.StringIO()), patch("sys.stdin.isatty", return_value=False):
+            code = inv.main(["--mode", "ssh", "--ssh-host", "pve", "--no-prompt"])
+        self.assertEqual(code, 1)
+        client.connect.assert_called_once()
+        client.close.assert_called_once()
 
 
 class StandaloneAndPromptTests(unittest.TestCase):

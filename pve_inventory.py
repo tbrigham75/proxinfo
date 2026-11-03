@@ -9,11 +9,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import socket
 import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from urllib import error, parse, request
 
@@ -117,6 +119,10 @@ class Client:
             context = ssl.create_default_context(cafile=ca_file)
             self.opener = request.build_opener(NoRedirect(), request.HTTPSHandler(context=context))
 
+    def run_pvesh(self, command):
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=self.timeout, check=False, shell=False)
+
     def get(self, path, **params):
         # Fixed GET-only surface, including exactly one read-only guest-agent command.
         allowed = (
@@ -135,8 +141,7 @@ class Client:
                 command = ["pvesh", "get", parse.unquote(path), "--output-format", "json"]
                 for key, value in params.items():
                     command.extend([f"--{key}", str(value)])
-                result = subprocess.run(command, capture_output=True, text=True,
-                                        timeout=self.timeout, check=False, shell=False)
+                result = self.run_pvesh(command)
                 if result.returncode:
                     raise ReadError("pvesh: " + result.stderr.strip()[:600])
                 return json.loads(result.stdout)
@@ -153,6 +158,114 @@ class Client:
             if self.secret:
                 message = message.replace(self.secret, "[REDACTED]")
             raise ReadError(message[:600]) from None
+
+
+class SSHClient(Client):
+    """Run only the existing allowlisted pvesh GETs through an OpenSSH master.
+
+    Python and report generation stay local. No code or report is uploaded.
+    """
+    def __init__(self, host, user="root", port=None, identity=None, timeout=20,
+                 auth_timeout=120, sudo=False, batch=False):
+        super().__init__("local", timeout)
+        if not host or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", host):
+            raise ValueError("SSH host must be a hostname, IP address or SSH config alias, without user@ or a URL")
+        if not user or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", user):
+            raise ValueError("Invalid SSH username")
+        if port is not None and not 1 <= int(port) <= 65535:
+            raise ValueError("SSH port must be between 1 and 65535")
+        self.host, self.user, self.port = host, user, port
+        self.identity = str(Path(identity).expanduser().resolve()) if identity else None
+        self.auth_timeout, self.sudo, self.batch = auth_timeout, sudo, batch
+        self.directory = None
+        self.control_path = None
+
+    def ssh_args(self):
+        args = ["ssh", "-a", "-T", "-S", self.control_path,
+                "-o", "ClearAllForwardings=yes", "-o", "ForwardX11=no",
+                "-o", f"ConnectTimeout={max(1, int(self.timeout))}",
+                "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
+                "-l", self.user]
+        if self.port is not None:
+            args += ["-p", str(self.port)]
+        if self.identity:
+            args += ["-i", self.identity]
+        return args
+
+    def connect(self):
+        if os.name != "posix":
+            raise ValueError("SSH mode requires WSL/Linux or another POSIX system with OpenSSH multiplexing. Run from your WSL terminal")
+        if not shutil.which("ssh"):
+            raise ValueError("OpenSSH client not found. Install openssh-client in WSL")
+        self.directory = tempfile.TemporaryDirectory(prefix="pve-ssh-")
+        self.control_path = str(Path(self.directory.name) / "s")
+        if len(os.fsencode(self.control_path)) > 100:
+            self.close()
+            raise ValueError("SSH socket path is too long; set TMPDIR=/tmp before running")
+        # Authenticate in the user's terminal first. OpenSSH owns all password,
+        # key-passphrase and host-key prompts; the script never reads secrets.
+        command = self.ssh_args() + ["-M", "-N", "-f", "-o", "ControlMaster=yes",
+                                    "-o", "ControlPersist=60", "-o", "PermitLocalCommand=no",
+                                    "-o", "StrictHostKeyChecking=" + ("yes" if self.batch else "ask"),
+                                    "-o", "BatchMode=" + ("yes" if self.batch else "no"), "--", self.host]
+        try:
+            print(f"Connecting to {self.user}@{self.host}; SSH will handle authentication...", file=sys.stderr)
+            result = subprocess.run(command, timeout=self.auth_timeout, check=False, shell=False)
+            if result.returncode:
+                raise ReadError("SSH connection failed. See the SSH message above for authentication, host-key or network details")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.close()
+            raise ReadError(f"SSH connection failed: {exc}") from None
+        except BaseException:
+            self.close()
+            raise
+
+    def run_pvesh(self, command):
+        if not self.control_path:
+            raise ReadError("SSH session is not connected")
+        # get() already checked the endpoint. Remote shells still need quoting,
+        # even though subprocess itself uses shell=False locally.
+        if command[:2] != ["pvesh", "get"]:
+            raise ValueError("SSH mode accepts only pvesh get commands")
+        remote = (["sudo", "-n", "--"] if self.sudo else []) + command
+        return subprocess.run(self.ssh_args() + ["-o", "ControlMaster=no", "-o", "BatchMode=yes",
+                              "-o", "StrictHostKeyChecking=yes", "-o", "PermitLocalCommand=no",
+                              "--", self.host, shlex.join(remote)], capture_output=True, text=True,
+                              timeout=self.timeout, check=False, shell=False, stdin=subprocess.DEVNULL)
+
+    def close(self):
+        if self.control_path:
+            try:
+                subprocess.run(self.ssh_args() + ["-O", "exit", "--", self.host],
+                               capture_output=True, timeout=5, check=False, shell=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            self.control_path = None
+        if self.directory:
+            self.directory.cleanup()
+            self.directory = None
+
+
+def ssh_settings(args, setting):
+    interactive = not args.no_prompt and sys.stdin.isatty()
+    host = args.ssh_host or setting("ssh_host")
+    user = args.ssh_user or setting("ssh_user") or "root"
+    port = args.ssh_port or setting("ssh_port")
+    identity = args.ssh_key or setting("ssh_key")
+    if interactive:
+        if not host:
+            host = input("PVE SSH hostname or IP address: ").strip()
+        if not args.ssh_user and not setting("ssh_user"):
+            user = input(f"SSH username [{user}]: ").strip() or user
+        if not port:
+            port = input("SSH port [SSH config default, normally 22]: ").strip() or None
+        if not identity:
+            identity = input("SSH private key path [Enter for SSH defaults/password authentication]: ").strip() or None
+    if not host:
+        raise ValueError("SSH mode requires --ssh-host, PVE_SSH_HOST, a config ssh_host, or an interactive hostname prompt")
+    return dict(host=host, user=user, port=int(port) if port is not None else None, identity=identity,
+                timeout=args.timeout, auth_timeout=args.ssh_auth_timeout, sudo=args.ssh_sudo,
+                batch=args.no_prompt)
 
 
 def key_value_output(text):
@@ -306,7 +419,7 @@ def prompt_choice(prompt, choices, default):
 
 
 def startup_options(args):
-    detected = detect_environment() if args.mode != "api" else None
+    detected = detect_environment() if args.mode not in ("api", "ssh") else None
     interactive = not args.no_prompt and sys.stdin.isatty()
     environment = args.environment
     mode = args.mode
@@ -318,9 +431,11 @@ def startup_options(args):
         else:
             environment = detected or "cluster"
     if mode is None:
-        default = "local" if shutil.which("pvesh") or environment == "cluster" else "cli"
-        mode = prompt_choice("Access: local=pvesh, cli=regular standalone commands, api=HTTPS token",
-                             ("local", "cli", "api") if environment == "standalone" else ("local", "api"), default) if interactive else default
+        default = "local" if shutil.which("pvesh") else "cli" if detected == "standalone" else "ssh"
+        mode = prompt_choice("Access: ssh=remote PVE, local=pvesh, cli=standalone commands, api=HTTPS token",
+                             ("ssh", "local", "cli", "api") if environment == "standalone" else ("ssh", "local", "api"), default) if interactive else default
+    if mode in ("ssh", "api"):
+        detected = None  # Local cluster files say nothing about a remote target.
     if detected == "cluster" and environment == "standalone":
         raise ValueError("Local cluster configuration was detected. Use --environment cluster to avoid an incomplete local-only inventory")
     if mode == "cli" and environment != "standalone":
@@ -814,7 +929,13 @@ def export_report(report, directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("local", "cli", "api"), help="local=pvesh, cli=regular standalone commands, api=HTTPS token")
+    parser.add_argument("--mode", choices=("ssh", "local", "cli", "api"), help="ssh=remote PVE from WSL, local=pvesh, cli=standalone commands, api=HTTPS token")
+    parser.add_argument("--ssh-host", help="PVE hostname/IP or ~/.ssh/config alias")
+    parser.add_argument("--ssh-user", help="Remote username (default root)")
+    parser.add_argument("--ssh-port", type=int, help="SSH port (default from SSH config, normally 22)")
+    parser.add_argument("--ssh-key", help="Local SSH private key path (optional)")
+    parser.add_argument("--ssh-sudo", action="store_true", help="Prefix remote pvesh commands with sudo -n; requires preconfigured noninteractive sudo")
+    parser.add_argument("--ssh-auth-timeout", type=float, default=120, help="Seconds allowed for initial SSH authentication (default 120)")
     parser.add_argument("--environment", choices=("auto", "cluster", "standalone"), default="auto")
     parser.add_argument("--no-prompt", action="store_true", help="Use explicit options/detection without startup questions")
     parser.add_argument("--config", type=Path, help="Optional JSON credentials/settings file; environment overrides it")
@@ -823,18 +944,30 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=20, help="Seconds per API/local command (default 20)")
     parser.add_argument("--no-guest-agent", action="store_true", help="Skip guest filesystem queries")
     args = parser.parse_args(argv)
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if args.timeout <= 0 or args.ssh_auth_timeout <= 0:
+        parser.error("--timeout and --ssh-auth-timeout must be positive")
+    ssh_client = None
     try:
         environment, mode = startup_options(args)
         config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
         def setting(name):
             return os.environ.get("PVE_" + name.upper(), config.get(name))
-        client = (CLIClient(args.timeout) if mode == "cli" else
-                  Client(mode, args.timeout, setting("url"), setting("token_id"),
-                         setting("token_secret"), setting("ca_file")))
+        if mode == "ssh":
+            ssh_client = SSHClient(**ssh_settings(args, setting))
+            ssh_client.connect()
+            client = ssh_client
+        else:
+            client = (CLIClient(args.timeout) if mode == "cli" else
+                      Client(mode, args.timeout, setting("url"), setting("token_id"),
+                             setting("token_secret"), setting("ca_file")))
         report = Collector(client, not args.no_guest_agent).collect()
+        if mode == "ssh" and environment == "standalone" and len(report.get("nodes") or []) > 1:
+            environment = "cluster"
+            report["warnings"].append("SSH target exposes multiple nodes; report scope changed from standalone to cluster. All visible VMs were collected.")
         report["environment"], report["access_mode"] = environment, mode
+        if mode == "ssh":
+            report["limitations"].append("Python and reports run locally. Remote reads use pvesh get over SSH to one PVE host; "
+                                          "PVE proxies other cluster nodes. No Python, script upload or report files are required on PVE.")
         if mode == "cli":
             report["limitations"].append("Standalone CLI mode inventories only this server using qm/pvesm. "
                                           "Container count is N/A because pct was not queried. Backup jobs use optional read-only pvesh; "
@@ -847,9 +980,15 @@ def main(argv=None):
         print(export_report(report, args.output_dir))
         print(f"Reports written to {args.output_dir.resolve()}", file=sys.stderr)
         return 0
-    except (ReadError, OSError, ValueError, TypeError) as exc:
+    except KeyboardInterrupt:
+        print("Inventory cancelled.", file=sys.stderr)
+        return 130
+    except (ReadError, OSError, ValueError, TypeError, EOFError) as exc:
         print(f"Inventory failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if ssh_client is not None:
+            ssh_client.close()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,99 @@
 # PVE cluster VM inventory
 
-Read-only Python inventory for running on a PVE cluster node or a standalone PVE server. PBS reporting is deferred, as requested. No third-party Python dependencies. In cluster mode, the script queries the entire visible cluster, including QEMU templates. LXC containers are outside this VM inventory; API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
+Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. PBS reporting is deferred. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
 
-## First run: step-by-step directions (no Python experience needed)
+## Recommended: run from WSL or Ubuntu over SSH
+
+**Python runs on your WSL/Ubuntu machine. PVE does not need Python.** The script connects to one PVE host, executes its existing read-only `pvesh get` commands, and produces every report on the machine where you launched it. No script upload or manual report download is needed. The same SSH mode supports clusters and standalone servers.
+
+### 1. Open your WSL or Ubuntu terminal
+
+For WSL using this project's existing Windows location:
+
+```sh
+cd /mnt/c/Users/tbrigham/dev/ProxInfo
+```
+
+On a separate Ubuntu machine, copy `pve_inventory.py` to a folder there and open a terminal in that folder. Only the script is needed; the `tests` folder is for development checks.
+
+Check your **local** requirements:
+
+```sh
+python3 --version
+ssh -V
+```
+
+You need Python 3.9+ and OpenSSH locally, plus SSH access to PVE. If either command is missing on Ubuntu/Ubuntu under WSL, install the local packages:
+
+```sh
+sudo apt update
+sudo apt install python3 openssh-client
+```
+
+No `pip install` or virtual environment is required. Run the inventory as your normal local user; local `sudo` is not required.
+
+### 2. Run the script and answer its prompts
+
+```sh
+python3 pve_inventory.py --mode ssh --output-dir ./pve-report
+```
+
+For your cluster, choose `cluster` and enter the address of **one PVE cluster member**. For example:
+
+```text
+Environment (cluster/standalone) [cluster]: cluster
+PVE SSH hostname or IP address: 192.168.1.10
+SSH username [root]:
+SSH port [SSH config default, normally 22]:
+SSH private key path [Enter for SSH defaults/password authentication]:
+```
+
+Replace the example address with yours. Press Enter for defaults. For a single server, choose `standalone`. If you omit `--mode ssh`, an access-method prompt also appears; SSH is the default on machines without local PVE commands.
+
+OpenSSH handles your authentication: it uses your configured local keys or prompts for your PVE password/key passphrase. Leave the key path blank for the normal SSH defaults and password fallback. Password entry shows no characters; type it and press Enter. Passwords are never read or stored by this script.
+
+On a first connection, SSH may ask you to confirm the host fingerprint. Verify it against the PVE server before accepting. Existing host keys remain checked. WSL uses its own SSH configuration and keys unless you have explicitly configured access to Windows keys.
+
+### 3. Open the local reports
+
+Wait for the VM progress messages and `Reports written to ...`. The output directory is **`pve-report` inside the directory where you ran the command**, not on PVE. Start with `inventory.html` for storage totals and the sortable VM table, or `vms.csv` for spreadsheets. All other exports are saved alongside them.
+
+From WSL, open the output folder in Windows Explorer:
+
+```sh
+explorer.exe ./pve-report
+```
+
+Double-click `inventory.html`. On Ubuntu with a desktop, open the folder with your file manager and open that file in a browser. On either system, read the terminal report with:
+
+```sh
+less ./pve-report/inventory.txt
+```
+
+Press `q` to exit `less`. Use a new output directory for later runs to preserve previous results; reusing a directory overwrites its report files.
+
+### SSH options and permissions
+
+```sh
+# Supply the host now; still prompt for remaining connection settings.
+python3 pve_inventory.py --mode ssh --ssh-host 192.168.1.10 --output-dir ./pve-report
+
+# Key-authenticated unattended run: no interactive questions or SSH prompts.
+python3 pve_inventory.py --mode ssh --environment cluster --ssh-host pve1 --ssh-user root --no-prompt --output-dir ./pve-report
+
+# Custom port and local private key.
+python3 pve_inventory.py --mode ssh --ssh-host pve1 --ssh-port 2222 --ssh-key ~/.ssh/id_ed25519 --output-dir ./pve-report
+```
+
+`--ssh-auth-timeout` defaults to 120 seconds for initial authentication; `--timeout` defaults to 20 seconds per query. SSH authenticates once and reuses the connection. On completion, failure or Ctrl+C, the script closes the connection and removes its local temporary socket. A short idle timeout provides fallback cleanup if forcibly terminated. No script or report files are created on PVE.
+
+Use `root` on PVE for the simplest setup. Another remote account needs permission to run the commands. With an already configured noninteractive sudo policy, add `--ssh-sudo` to prefix remote commands with `sudo -n --`. The script does not set up sudo or accept a separate sudo password. Without sufficient permission, metrics are N/A or the initial inventory fails. HTTPS API-token mode remains available for server-enforced audit-only access.
+
+Optional environment variables are `PVE_SSH_HOST`, `PVE_SSH_USER`, `PVE_SSH_PORT`, `PVE_SSH_KEY`; corresponding JSON settings are `ssh_host`, `ssh_user`, `ssh_port`, `ssh_key`. Command-line SSH fields override environment/config settings. SSH config aliases and identities are supported; the default username is root unless overridden. `--no-prompt` also enables SSH batch mode: configure key authentication and establish host trust beforehand.
+
+For SSH failures, read the SSH error above the script's failure message and check address, account, credentials and network access. A missing `pvesh` command usually means the target is not a PVE host. Launch this mode from WSL rather than native PowerShell, because it uses POSIX OpenSSH connection multiplexing. **Regular Ubuntu and WSL use the same script and options.** Live testing against your PVE environment remains outstanding.
+
+## Alternative: run directly on PVE (no Python experience needed)
 
 You only need to copy one file, `pve_inventory.py`, onto a PVE server and run it. You do not need to edit the Python code, install Python libraries, create a virtual environment, or configure API credentials for the local method below. Use **one cluster node** for your cluster; it will collect the other nodes too.
 
@@ -49,7 +140,7 @@ For **your cluster**, answer the startup prompts as follows:
 
 ```text
 Environment (cluster/standalone) [cluster]: cluster
-Access: local=pvesh, cli=regular standalone commands, api=HTTPS token (local/api) [local]: local
+Access: ssh=remote PVE, local=pvesh, cli=standalone commands, api=HTTPS token (ssh/local/api) [local]: local
 ```
 
 Type the answer after each prompt and press Enter. Pressing Enter without typing accepts the answer in brackets. For a standalone PVE server, choose `standalone`, then either `local` for `pvesh` or `cli` for regular `qm`/`pvesm` commands. Actual default answers depend on what the script detects.
@@ -121,7 +212,7 @@ sudo python3 pve_inventory.py --output-dir ./pve-report
 On an interactive terminal the script prompts **before collection** for:
 
 1. **Cluster or standalone**, with a default detected from `/etc/pve/corosync.conf` and `/etc/pve`.
-2. **Access method**: local `pvesh`, regular standalone CLI commands, or HTTPS API token. Cluster mode offers `pvesh` or HTTPS so all nodes are covered.
+2. **Access method**: remote SSH, local `pvesh`, regular standalone CLI commands, or HTTPS API token. Cluster mode offers SSH, `pvesh` or HTTPS so all nodes are covered.
 
 Local mode uses the installed `pvesh` command with your existing root privileges. It works for both clusters and standalone servers. It does not create a user or ask for credentials. PVE forwards node-specific API requests to the relevant cluster node. Local mode avoids an HTTPS connection; it does not disable TLS verification. If `python3` is absent, install your distribution's Python 3 package separately. Do not install Python packages into PVE's system environment for this tool.
 
@@ -162,7 +253,7 @@ sudo python3 pve_inventory.py --sort actual --output-dir ./pve-report-actual
 
 `--sort configured` is the default. With `--sort actual`, incomplete coverage, a diskless VM, or mixed allocation metric meanings cause a clearly recorded fallback to configured sorting. No VMs are silently removed to make an actual sort look complete. N/A always sorts after known numbers in both directions in the HTML table.
 
-Use a fresh output directory for each run; an existing directory's report files will be overwritten. The only writes are these local report files. Restrict access to reports because they contain infrastructure names and storage identifiers. A partial report exits 0 and includes collection warnings and coverage counts; failure to obtain the VM list exits 1. No live cluster validation has been performed for your environment yet; PVE version and backend details have not been supplied.
+Use a fresh output directory for each run; an existing directory's report files will be overwritten. Reports are written locally. SSH mode also uses a temporary local connection socket; OpenSSH may update local known-host records when you accept a new host. Restrict access to reports because they contain infrastructure names and storage identifiers. A partial report exits 0 and includes collection warnings and coverage counts; failure to obtain the VM list exits 1. No live cluster validation has been performed for your environment yet; PVE version and backend details have not been supplied.
 
 ## Optional HTTPS API-token mode
 
@@ -288,3 +379,5 @@ API behavior was checked against upstream Proxmox sources. Your installed versio
 - [Backup-job API and server-side inclusion endpoint](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Backup.pm)
 - [Regular qm command implementation](https://github.com/proxmox/qemu-server/blob/master/src/PVE/CLI/qm.pm)
 - [Regular pvesm command implementation](https://github.com/proxmox/pve-storage/blob/master/src/PVE/CLI/pvesm.pm)
+- [OpenSSH command execution and authenticated background connections](https://man.openbsd.org/ssh)
+- [OpenSSH connection multiplexing and host verification](https://man.openbsd.org/ssh_config)
