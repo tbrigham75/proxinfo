@@ -108,13 +108,13 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(inv.human(0), "0.00 B")
         self.assertEqual(inv.human(None), "N/A")
 
-    def test_missing_size_and_unsupported_thin_backend(self):
+    def test_missing_size_and_unavailable_thin_metrics(self):
         client = FakeClient({"/nodes/b/qemu/101/config": {"scsi0": "thin:vm-101-disk-0"}})
         report = collect(client)
         vm = report["vms"][1]
         self.assertIsNone(vm["configured_bytes"])
         self.assertIsNone(vm["actual_bytes"])
-        self.assertIn("no validated", vm["disks"][0]["actual_reason"])
+        self.assertIn("volume-group name", vm["disks"][0]["actual_reason"])
         self.assertFalse(any("/storage/thin/" in p for p, _ in client.calls))
         inv.sort_report(report, "configured")
         self.assertEqual(report["vms"][-1]["vmid"], 101)
@@ -231,6 +231,83 @@ class AccountingTests(unittest.TestCase):
 
 
 class ExportAndTransportTests(unittest.TestCase):
+    def test_manager_pages_have_help_and_separate_vm_information(self):
+        report = collect()
+        inv.sort_report(report, "configured")
+        markup = inv.html_report(report)
+        for page in ("overview", "machines", "storage", "backups", "help", "technical"):
+            self.assertIn('data-page="' + page + '"', markup)
+            self.assertIn('data-page-link="' + page + '"', markup)
+        for topic in inv.REPORT_HELP:
+            self.assertIn('id="help-' + topic + '"', markup)
+        self.assertIn('id="explanation-dialog"', markup)
+        details = inv.vm_information_html(report["vms"][0])
+        for title in ("Disks and storage", "Space inside the VM", "Backup schedules", "Data availability", "IT reference for this VM"):
+            self.assertIn('<summary>' + title + '</summary>', details)
+        self.assertNotIn("Disks, filesystems, reasons", markup)
+
+    def test_table_totals_keep_identity_and_unavailable_data_for_filters(self):
+        import html
+        import re
+        report = collect()
+        inv.sort_report(report, "configured")
+        markup = inv.html_report(report)
+        self.assertIn('<td id="table-assigned-total">150.00 GiB</td>', markup)
+        self.assertIn('<td id="table-used-total">20.00 GiB</td>', markup)
+        records = [json.loads(html.unescape(m)) for m in re.findall(r'data-disks="([^"]+)"', markup)]
+        self.assertEqual(len(records[0]), 2)  # repeated attachment is not counted twice
+        self.assertEqual(records[0][0]["identity"], records[1][0]["identity"])
+        self.assertEqual(records[0][0]["capacity"], str(100*GIB))
+        self.assertEqual(records[0][1]["used"], "0")  # zero survives JSON, rather than becoming missing
+
+    def test_backup_rules_are_readable_and_do_not_imply_success(self):
+        self.assertEqual(inv.retention_description({"prune-backups": {"keep-last": 7}}), "Keep the 7 most recent backups.")
+        self.assertIn("storage settings may apply", inv.retention_description({}))
+        self.assertIn("Keep every backup", inv.retention_description({"prune-backups": "keep-all=1"}))
+        self.assertEqual(inv.schedule_description({"schedule": "02:00"}), "Every day at 02:00")
+        self.assertEqual(inv.schedule_description({"schedule": "mon..fri 02:00"}), "Custom schedule")
+
+    def test_power_badges_distinguish_on_off_and_unknown(self):
+        self.assertEqual(inv.power_state("running"), "On")
+        self.assertEqual(inv.power_state("stopped"), "Off")
+        self.assertEqual(inv.power_state(None), "Unknown")
+        self.assertEqual(inv.power_state("unrecognized"), "Unknown")
+        report = collect()
+        inv.sort_report(report, "configured")
+        markup = inv.html_report(report)
+        self.assertIn('data-col="3">Power</button>', markup)
+        self.assertIn('title="PVE status: running">On</span>', markup)
+        self.assertIn('title="PVE status: stopped">Off</span>', markup)
+        report["vms"][1]["status"] = None
+        markup = inv.html_report(report)
+        self.assertIn('data-value="Unknown" data-missing="true"', markup)
+        self.assertIn('title="PVE status: N/A">Unknown</span>', markup)
+
+    def test_unavailable_usage_explains_backend_in_each_row(self):
+        report = collect(FakeClient({"/nodes/b/qemu/101/config": {"scsi0": "thin:vm-101-disk-0,size=30G"}}))
+        inv.sort_report(report, "configured")
+        diagnostics = report["allocation_diagnostics"]
+        self.assertEqual(diagnostics["measured_disks"], 2)
+        self.assertEqual(diagnostics["identified_disks"], 3)
+        self.assertIn("2 of 3 identified disks", " ".join(diagnostics["reasons"]))
+        markup = inv.html_report(report)
+        self.assertIn("N/A · why?", markup)
+        self.assertIn("Storage settings were incomplete", markup)
+        self.assertIn("Understanding the report", markup)
+        self.assertIn('id="theme-toggle"', markup)
+        self.assertIn('id="missing-only"', markup)
+        self.assertNotIn("incomplete coverage or different allocation metric meanings", markup)
+
+    def test_diagnostics_separate_missing_config_and_different_methods(self):
+        report = collect(FakeClient({"/nodes/b/qemu/101/config": inv.ReadError("offline")}))
+        inv.sort_report(report, "configured")
+        self.assertEqual(report["allocation_diagnostics"]["missing_config_vmids"], [101])
+        self.assertIn("configuration for 1 VM", " ".join(report["allocation_diagnostics"]["reasons"]))
+        report = collect()
+        next(d for d in report["vms"][0]["disks"] if d["slot"] == "scsi2")["actual_method"] = "ZFS usedbydataset"
+        inv.sort_report(report, "configured")
+        self.assertIn("different ways", " ".join(report["allocation_diagnostics"]["reasons"]))
+
     def test_exports_preserve_unknowns_and_escape_html_and_csv(self):
         report = collect()
         report["vms"][0]["name"] = "=HYPERLINK(1)"
@@ -248,7 +325,7 @@ class ExportAndTransportTests(unittest.TestCase):
             markup = (directory / "inventory.html").read_text(encoding="utf-8")
             self.assertNotIn("<script>bad</script>", markup)
             self.assertIn("&lt;script&gt;bad&lt;/script&gt;", markup)
-            self.assertIn("Total configured VM disks", markup)
+            self.assertIn("Assigned disk space", markup)
             with (directory / "storage_totals.csv").open(encoding="utf-8-sig", newline="") as stream:
                 totals = list(csv.DictReader(stream))
             self.assertEqual(totals[0]["total_bytes"], str(150*GIB))
@@ -303,6 +380,39 @@ class ExportAndTransportTests(unittest.TestCase):
 
 
 class SSHTests(unittest.TestCase):
+    def test_explicit_password_or_key_authentication(self):
+        password = inv.SSHClient("pve", authentication="password")
+        password.control_path = "/tmp/test"
+        self.assertIn("PubkeyAuthentication=no", password.ssh_args())
+        key = inv.SSHClient("pve", authentication="key")
+        key.control_path = "/tmp/test"
+        self.assertIn("PreferredAuthentications=publickey", key.ssh_args())
+        with self.assertRaises(ValueError):
+            inv.SSHClient("pve", authentication="password", batch=True)
+
+    def test_api_prompts_use_token_fields_and_hide_secret(self):
+        args = SimpleNamespace(no_prompt=False)
+        with patch("sys.stdin.isatty", return_value=True), patch("sys.stderr", new=io.StringIO()), \
+             patch("builtins.input", side_effect=["pve.example", "inventory@pve!report", "/local/ca.pem"]) as ask, \
+             patch("pve_inventory.getpass.getpass", return_value="private-secret") as secret:
+            result = inv.api_settings(args, lambda name: None)
+        self.assertEqual(result, dict(url="https://pve.example:8006", token_id="inventory@pve!report",
+                                     token_secret="private-secret", ca_file="/local/ca.pem"))
+        secret.assert_called_once()
+        self.assertFalse(any("SSH" in str(call) for call in ask.call_args_list))
+
+    def test_api_mode_does_not_start_ssh_or_export_secret(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("sys.stdin.isatty", return_value=True), \
+             patch("sys.stdout", new=io.StringIO()) as output, patch("sys.stderr", new=io.StringIO()), \
+             patch("builtins.input", side_effect=["pve.example", "inventory@pve!r", ""]), \
+             patch("pve_inventory.getpass.getpass", return_value="private-secret"), \
+             patch("pve_inventory.Client", return_value=FakeClient()), patch("pve_inventory.SSHClient") as ssh:
+            code = inv.main(["--mode", "api", "--environment", "cluster", "--no-pbs", "--output-dir", tmp])
+            self.assertEqual(code, 0)
+            ssh.assert_not_called()
+            self.assertNotIn("private-secret", output.getvalue())
+            self.assertNotIn("private-secret", (Path(tmp) / "inventory.json").read_text(encoding="utf-8"))
+
     def test_ssh_collects_cluster_with_no_remote_python_and_exports_locally(self):
         fake = FakeClient()
         commands = []
@@ -458,10 +568,11 @@ class StandaloneAndPromptTests(unittest.TestCase):
         args = SimpleNamespace(mode=None, environment="auto", no_prompt=False)
         with patch("pve_inventory.detect_environment", return_value="cluster"), \
              patch("sys.stdin.isatty", return_value=True), \
-             patch("builtins.input", side_effect=["cluster", "local"]) as ask, \
+             patch("builtins.input", side_effect=["local", "cluster"]) as ask, \
              patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(inv.startup_options(args), ("cluster", "local"))
             self.assertEqual(ask.call_count, 2)
+            self.assertIn("Connection method", ask.call_args_list[0].args[0])
         args = SimpleNamespace(mode="cli", environment="standalone", no_prompt=True)
         with patch("pve_inventory.detect_environment", return_value="cluster"):
             with self.assertRaises(ValueError):
@@ -471,7 +582,7 @@ class StandaloneAndPromptTests(unittest.TestCase):
         args = SimpleNamespace(mode=None, environment="auto", no_prompt=False)
         with patch("pve_inventory.detect_environment", return_value="standalone"), \
              patch("sys.stdin.isatty", return_value=True), \
-             patch("builtins.input", side_effect=["standalone", "cli"]), \
+             patch("builtins.input", side_effect=["cli", "standalone"]), \
              patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(inv.startup_options(args), ("standalone", "cli"))
         args = SimpleNamespace(mode="local", environment="cluster", no_prompt=True)

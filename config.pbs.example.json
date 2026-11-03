@@ -1,0 +1,6 @@
+{
+  "pbs_url": "https://pbs.example.internal:8007",
+  "pbs_token_id": "inventory@pbs!report",
+  "pbs_token_secret": "REPLACE_WITH_YOUR_PBS_TOKEN_SECRET",
+  "pbs_ca_file": "/home/your-user/pbs-ca.pem"
+}

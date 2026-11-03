@@ -1,6 +1,6 @@
 # PVE cluster VM inventory
 
-Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. PBS reporting is deferred. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
+Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. Optional PBS reporting is **off by default**. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
 
 ## Recommended: run from WSL or Ubuntu over SSH
 
@@ -35,22 +35,27 @@ No `pip install` or virtual environment is required. Run the inventory as your n
 ### 2. Run the script and answer its prompts
 
 ```sh
-python3 pve_inventory.py --mode ssh --output-dir ./pve-report
+python3 pve_inventory.py --output-dir ./pve-report
 ```
 
-For your cluster, choose `cluster` and enter the address of **one PVE cluster member**. For example:
+First choose how to connect. Use **`ssh` for your normal PVE account login**, or **`api` to paste a token created in the PVE web interface**. Only the questions for your chosen method are shown. For your cluster over SSH, choose `cluster` and enter the address of **one PVE cluster member**:
 
 ```text
+Connection method (ssh/api/local/cli) [ssh]: ssh
 Environment (cluster/standalone) [cluster]: cluster
 PVE SSH hostname or IP address: 192.168.1.10
 SSH username [root]:
 SSH port [SSH config default, normally 22]:
-SSH private key path [Enter for SSH defaults/password authentication]:
+SSH sign-in method (password/key/auto) [password]: password
 ```
 
-Replace the example address with yours. Press Enter for defaults. For a single server, choose `standalone`. If you omit `--mode ssh`, an access-method prompt also appears; SSH is the default on machines without local PVE commands.
+Replace the example address with yours. Press Enter for defaults. For a single server, choose `standalone`. Supplying `--mode ssh` or `--mode api` skips the connection-method question.
 
-OpenSSH handles your authentication: it uses your configured local keys or prompts for your PVE password/key passphrase. Leave the key path blank for the normal SSH defaults and password fallback. Password entry shows no characters; type it and press Enter. Passwords are never read or stored by this script.
+Choose **`password`** to sign in with the account password you normally use for SSH to PVE. OpenSSH will ask for it when connecting. Password entry shows no characters; type it and press Enter. The script never reads or stores the password. Choose **`key`** if you already have an SSH key file; it then asks where that file is on your local computer. You can press Enter at the key-file question to use your existing default SSH keys. **`auto`** lets OpenSSH try its normal configured methods. The confusing key-file question is no longer shown to password users.
+
+To use a token instead, select **`api`** at the first question. The script asks for the PVE API host, **API Token ID** (such as `inventory@pve!report`), **API Token Secret** (the Value shown when you created the token), and an optional trusted CA certificate file. Paste the secret at the hidden-input prompt. The token secret is not your account password or the token's name. It is not written into the reports. If your server uses the private PVE CA, provide a trusted copy of its CA PEM file; certificate verification remains enabled. See the API permissions section below.
+
+PBS backup-server reporting is optional and **off by default**. At `Optional PBS backup-server report (include/skip) [skip]`, press Enter to skip it. Only selecting `include` asks for PBS connection details. `--no-pbs` skips this question too. PVE inventory and all PVE review/summary exports still work when PBS is skipped or unreachable.
 
 On a first connection, SSH may ask you to confirm the host fingerprint. Verify it against the PVE server before accepting. Existing host keys remain checked. WSL uses its own SSH configuration and keys unless you have explicitly configured access to Windows keys.
 
@@ -64,7 +69,19 @@ From WSL, open the output folder in Windows Explorer:
 explorer.exe ./pve-report
 ```
 
-Double-click `inventory.html`. On Ubuntu with a desktop, open the folder with your file manager and open that file in a browser. On either system, read the terminal report with:
+Double-click `inventory.html`. The top navigation switches between **Summary**, **Review list**, **Virtual machines**, **Storage**, **PVE backup jobs**, **PBS backup storage**, **Management summary**, **Help**, and **IT reference**. Each is its own report view. The main report remains one offline HTML file; the printable management summary is also exported separately. No web server or external assets are required. A link ending in `#machines`, for example, opens the Virtual machines view directly.
+
+The **Summary** uses plain-language cards: machines reviewed, assigned disk space, measured storage used and machines scheduled for backup. **Explain**, **What does this mean?**, and **?** links open readable explanations without leaving your place. Use **Help** for a short guide and all definitions. Original collection errors, measurement rules and technical totals are kept in **IT reference** for the IT team.
+
+In **Virtual machines**, search by name, ID, host server or label. Filter by host server or show only machines whose usage could not be measured. **Power** shows On, Off or Unknown. Click column headings to sort, or their **?** links for definitions. The main table focuses on storage and backup selection; check **Show memory & CPUs** to reveal those extra columns. Uncheck it for a simpler view.
+
+The storage-total row **below the VM rows** updates for the machines currently shown. It keeps **assigned disk space** separate from **storage used**, counts a shared disk ID once, and leaves an incomplete or incompatible full total as **N/A**. Known partial amounts and an explanation are shown when available. Filtering can therefore give a complete total for a readable subset even when the whole report has missing data. These are VM disk totals, not PBS backup usage; shared data and other storage overhead prevent treating them as a unique physical-storage footprint.
+
+Open **View VM information** for separate sections: **Disks and storage**, **Space inside the VM**, **Backup schedules**, **Memory and processing**, **Data availability**, and **IT reference for this VM**. Data-collection problems are explained separately from the disk and drive information. **N/A · why?** in the Storage used column gives a specific explanation, and **Storage measurements** explains why a full total may be unavailable.
+
+Use **Dark mode / Light mode** at the top to change the theme. It initially follows your system preference and saves your choice when browser storage is available. To see changes made by a newer script, run the updated script and open its newly generated `inventory.html`.
+
+On Ubuntu with a desktop, open the folder with your file manager and open `inventory.html` in a browser. On either system, read the terminal report with:
 
 ```sh
 less ./pve-report/inventory.txt
@@ -89,7 +106,7 @@ python3 pve_inventory.py --mode ssh --ssh-host pve1 --ssh-port 2222 --ssh-key ~/
 
 Use `root` on PVE for the simplest setup. Another remote account needs permission to run the commands. With an already configured noninteractive sudo policy, add `--ssh-sudo` to prefix remote commands with `sudo -n --`. The script does not set up sudo or accept a separate sudo password. Without sufficient permission, metrics are N/A or the initial inventory fails. HTTPS API-token mode remains available for server-enforced audit-only access.
 
-Optional environment variables are `PVE_SSH_HOST`, `PVE_SSH_USER`, `PVE_SSH_PORT`, `PVE_SSH_KEY`; corresponding JSON settings are `ssh_host`, `ssh_user`, `ssh_port`, `ssh_key`. Command-line SSH fields override environment/config settings. SSH config aliases and identities are supported; the default username is root unless overridden. `--no-prompt` also enables SSH batch mode: configure key authentication and establish host trust beforehand.
+Use `--ssh-auth password`, `--ssh-auth key` or `--ssh-auth auto` to preselect the SSH sign-in method. Optional environment variables are `PVE_SSH_HOST`, `PVE_SSH_USER`, `PVE_SSH_PORT`, `PVE_SSH_KEY`, `PVE_SSH_AUTH`; corresponding JSON settings are `ssh_host`, `ssh_user`, `ssh_port`, `ssh_key`, `ssh_auth`. Command-line SSH fields override environment/config settings. SSH config aliases and identities are supported; the default username is root unless overridden. `--no-prompt` also enables SSH batch mode: configure key authentication and establish host trust beforehand. Explicit password login is incompatible with `--no-prompt`.
 
 For SSH failures, read the SSH error above the script's failure message and check address, account, credentials and network access. A missing `pvesh` command usually means the target is not a PVE host. Launch this mode from WSL rather than native PowerShell, because it uses POSIX OpenSSH connection multiplexing. **Regular Ubuntu and WSL use the same script and options.** Live testing against your PVE environment remains outstanding.
 
@@ -139,8 +156,8 @@ Because you are logged in as root, you do not need `sudo`. You also do not need 
 For **your cluster**, answer the startup prompts as follows:
 
 ```text
+Connection method (ssh/api/local/cli) [local]: local
 Environment (cluster/standalone) [cluster]: cluster
-Access: ssh=remote PVE, local=pvesh, cli=standalone commands, api=HTTPS token (ssh/local/api) [local]: local
 ```
 
 Type the answer after each prompt and press Enter. Pressing Enter without typing accepts the answer in brackets. For a standalone PVE server, choose `standalone`, then either `local` for `pvesh` or `cli` for regular `qm`/`pvesm` commands. Actual default answers depend on what the script detects.
@@ -211,8 +228,8 @@ sudo python3 pve_inventory.py --output-dir ./pve-report
 
 On an interactive terminal the script prompts **before collection** for:
 
-1. **Cluster or standalone**, with a default detected from `/etc/pve/corosync.conf` and `/etc/pve`.
-2. **Access method**: remote SSH, local `pvesh`, regular standalone CLI commands, or HTTPS API token. Cluster mode offers SSH, `pvesh` or HTTPS so all nodes are covered.
+1. **Connection method**: SSH (account login), API (GUI-created token), local `pvesh`, or regular standalone CLI commands.
+2. **Cluster or standalone**, with a default detected from local PVE files for local methods. Remote methods ask about the remote target, rather than assuming your local machine is PVE.
 
 Local mode uses the installed `pvesh` command with your existing root privileges. It works for both clusters and standalone servers. It does not create a user or ask for credentials. PVE forwards node-specific API requests to the relevant cluster node. Local mode avoids an HTTPS connection; it does not disable TLS verification. If `python3` is absent, install your distribution's Python 3 package separately. Do not install Python packages into PVE's system environment for this tool.
 
@@ -259,6 +276,8 @@ Use a fresh output directory for each run; an existing directory's report files 
 
 Use this when you prefer enforcement of read-only access by PVE's ACLs. It also runs from a non-PVE machine. Only Python's standard library is needed.
 
+For an interactive setup, select `api` at the first connection-method prompt, or run `python3 pve_inventory.py --mode api`. The script prompts for the API host, Token ID, hidden Token Secret and optional trusted CA file. You do not need to create a configuration file. The variables below are an alternative if you prefer to supply settings in advance.
+
 ```sh
 export PVE_URL='https://pve.example.internal:8006'
 export PVE_TOKEN_ID='inventory@pve!report'
@@ -278,6 +297,77 @@ python3 pve_inventory.py --mode api --config ./config.json --output-dir ./pve-re
 ```
 
 Environment variables override corresponding JSON fields (`url`, `token_id`, `token_secret`, `ca_file`). Omit `ca_file` for a publicly trusted certificate. Secrets are not command-line arguments and configuration contents are not exported. The example contains placeholders only. Keep credential files out of source control.
+
+## Review list, storage breakdowns and management handoff
+
+**Review list** contains findings with the machine/datastore, evidence and a suggested follow-up. The rules flag large assigned disk space, large machines currently off, disks marked `backup=0`, no enabled PVE backup job, unreadable settings, incomplete measurements, PBS capacity at the review threshold and reported prune/GC failures. An off machine is not assumed unused. A missing PVE job is not proof that no backups exist. These are review prompts; nothing is excluded, changed or deleted.
+
+Defaults are **500 GiB** assigned space for a large machine and **90%** used filesystem capacity for a PBS capacity review. Override them explicitly:
+
+```sh
+python3 pve_inventory.py --large-vm-gib 750 --pbs-warning-percent 85
+```
+
+On **Storage**, the host breakdown counts **local disks on each host**, then lists **shared disks in a separate cluster-wide row**. The storage-location breakdown separates identically named local storage on different hosts, while counting a shared volume ID once. Machine counts may repeat when a VM has disks in several locations. These are attached-disk totals, not pool capacities. Missing settings prevent a full total; known subtotals remain labeled. Do not add the host table to the location table: they are two views of the same disks.
+
+**Management summary** gives a short handoff with key totals, up to five findings, five largest machines, and up to three PBS datastore capacity entries. Open **Print / PDF view**, or open `management-summary.html` directly, then use **Print / Save as PDF** in that file. The layout is designed for one A4 page for ordinary report data. All findings, machines and stores remain in the full report and CSV files. Keep `management-summary.html` beside `inventory.html` to use its link back to the full report.
+
+Additional exports:
+
+| File | Contents |
+| --- | --- |
+| `review_items.csv` | Every finding, supporting evidence and suggested follow-up |
+| `storage_breakdowns.csv` | Host/local/shared and storage-location totals, coverage and unknown-data counts |
+| `management-summary.html` | Separate printable summary; no additional Python libraries are needed |
+| `pbs_datastores.csv` | Filesystem capacity, inventory coverage, retention/prune metadata and recorded GC results |
+| `pbs_groups.csv` | Group identity including namespace, version count, last backup time and latest logical size |
+| `pbs_snapshots.csv` | Each collected snapshot and its reported logical archive size |
+
+When PBS is skipped, PBS CSV files contain headers only and the report explicitly says PBS was not requested. The complete structured data, including collection status and warnings, is in `inventory.json`.
+
+## Optional PBS reporting — off by default
+
+Choose `include` at the optional prompt or enable it explicitly:
+
+```sh
+python3 pve_inventory.py --pbs
+```
+
+The script asks for the **PBS** hostname, **PBS Token ID**, hidden **PBS Token Secret**, and optional trusted **PBS CA certificate file**. These are separate from your PVE login/token. Use a token created in the PBS web interface for a user with the audit permissions below. The script never uses PVE's stored backup credentials or reads backup contents.
+
+For saved settings, copy `config.pbs.example.json` to a protected configuration file, edit the placeholders, and run:
+
+```sh
+chmod 600 config.pbs.json
+python3 pve_inventory.py --pbs --config ./config.pbs.json
+```
+
+You can combine the `pbs_*` fields with PVE fields in the same configuration file. Environment variables override those fields: `PBS_URL`, `PBS_TOKEN_ID`, `PBS_TOKEN_SECRET`, `PBS_CA_FILE`. Set the URL to `https://pbs-hostname:8007`. A private CA certificate path is local to the WSL/Ubuntu machine. Certificate and hostname verification are enabled, and redirects are refused.
+
+**Saved credentials or `--pbs-url` alone do not enable PBS reporting.** In an unattended run you must pass `--pbs`; otherwise it stays off. For example, after setting credentials in your environment/config:
+
+```sh
+# All PBS datastores visible to the token:
+python3 pve_inventory.py --mode ssh --environment cluster --ssh-host pve1 --no-prompt --pbs --config ./config.pbs.json
+
+# Limit PBS queries to named datastores (option may be repeated):
+python3 pve_inventory.py --pbs --pbs-store backup-store
+
+# PVE only, without the optional PBS question:
+python3 pve_inventory.py --no-pbs
+```
+
+PBS metadata requires **`Datastore.Audit` on `/datastore/STORE` with propagation to its namespaces**, for both the token and its owning user. Optional recent-task visibility uses **`Sys.Audit` on `/system/tasks`**. Narrower ACLs can silently hide stores, namespaces or tasks; read successes prove visibility only within the token's scope. Missing privilege, unsupported endpoints or an unreachable PBS produce unavailable/partial PBS data while the PVE report continues. PBS API support varies by version; older namespace/prune endpoints may be unavailable.
+
+The PBS collector sends **GET only** to `/version`, `/admin/datastore`, `/config/datastore/STORE`, `/config/prune`, `/admin/prune`, `/admin/datastore/STORE/status`, `/namespace`, `/groups`, `/snapshots`, `/gc`, and `/nodes/localhost/tasks` (the short subpaths are under that datastore). It never starts prune, GC, verification, backup or deletion operations. Namespace inventory includes the root and all visible descendants up to PBS's supported depth; failed enumeration is explicitly incomplete. Groups are kept distinct by datastore, namespace, backup type and ID. Reused VM IDs across different clusters prevent proving group ownership from ID alone.
+
+PBS capacity is **filesystem capacity reported for each datastore**, and may include other data or overlap another datastore's filesystem. It is not summed across datastores. `latest_logical_bytes` and snapshot `logical_bytes` come from PBS's snapshot archive-size field. They are logical referenced backup data, not compressed unique chunk usage or a VM's share of physical PBS storage. They are never added into a physical-use claim. GC counters without a recorded statistics run are N/A rather than a placeholder zero; recorded statistics may be older than the latest job result. Pending GC bytes can remain held by safety rules.
+
+## Exact backend measurements and additional host permissions
+
+For **LVM-thin**, SSH/local modes use only `hostname -s` and `dmsetup status --target thin --noflush`. The mapped-sector counter is converted exactly to bytes using 512 bytes per sector. Stopped/inactive volumes can lack a counter and remain N/A; no disk is activated and no rounded `Data%` is converted into an estimate. This reports mapped blocks for a volume, including blocks that can be shared with snapshots/clones, not exclusive pool allocation or deletion savings.
+
+For another PVE cluster member, the entry host uses its **existing noninteractive root SSH trust**, with strict host-key checking, to run that exact status command on the owning node. No trust entries, keys or permissions are added, and no SSH agent is forwarded. Missing tools, privilege or host trust leave a clear measurement gap. Root or an already suitable sudo policy is needed for host counters; a PVE audit API token alone is not sufficient. Other inventory data still covers all visible nodes. Ceph RBD uses PVE's read-only volume API and its existing Ceph credentials; the script does not export them or execute direct Ceph management commands.
 
 ## Permissions and read-only boundary
 
@@ -319,6 +409,7 @@ Each command/request has a configurable timeout (local file metadata reads depen
 | --- | --- |
 | VM ID, name, node | QEMU resource identity and current owning cluster node |
 | Status | Current status API response; unavailable current status is N/A, with cached cluster status disclosed separately |
+| Power (HTML table) | On = running, Off = stopped, Unknown = current power state could not be confirmed. The original PVE status remains in the row details and the CSV `status` column. |
 | Tags | Configured tags; an empty field means no tags, N/A means not observable |
 | Template | Whether this resource is a QEMU template; included for storage review |
 | Configured capacity | Sum of unique attached writable disk `size=` values in the current configuration, including EFI/TPM state; not the boot-disk-only `maxdisk` field |
@@ -344,9 +435,11 @@ The generic storage `used` field is **not** trusted for arbitrary plugins. The f
 | --- | --- |
 | Directory, NFS, CIFS, CephFS, GlusterFS | PVE file allocation metric (allocated bytes, not virtual disk length). Does not establish unique physical usage on deduplicated/reflinked/compressed backing storage or include external backing-chain files. |
 | Local ZFS (`zfspool`) | PVE's `usedbydataset` value. Excludes snapshot usage and reservations; compression, sharing and clones affect accounting. Not pool consumption or space that deleting the VM would reclaim. |
-| LVM, LVM-thin, Ceph RBD, iSCSI, ZFS over iSCSI, other plugins | N/A: a validated per-volume allocation metric is not implemented here. The script will not substitute a virtual size or a plugin's placeholder zero. |
+| LVM-thin | Exact mapped sectors × 512 from `dmsetup status --target thin --noflush`, via local/SSH access. Only active volumes can be measured this way. Shared blocks may appear in several volumes, so this is not unique pool usage. No rounded `Data%` calculation or volume activation is used. PVE API-token mode alone cannot obtain this host-level counter. |
+| Ceph RBD on PVE 8+ | PVE volume-info `used` backed by `rbd du` for the current image, excluding its snapshots. This does not include all Ceph replication, shared-clone data or cluster overhead. Older/unrecognized PVE versions stay N/A. A slow or unsupported query is recorded as unavailable. |
+| Plain LVM, iSCSI, ZFS over iSCSI, other plugins | N/A: no validated allocation metric is implemented here. Virtual size and placeholder zeros are not substituted. |
 
-Absent `used` on a supported backend remains N/A; genuine returned zero is preserved. Even complete per-VM allocation counters do not establish a unique cluster physical footprint. There is deliberately no summed physical-use claim. File and ZFS allocation semantics cannot be mixed for `--sort actual`. Snapshots, unreferenced disks, base images and other storage consumers are not a complete datastore audit; the report is a VM review inventory.
+Absent API `used` on supported file/ZFS/RBD backends remains N/A; genuine returned zero is preserved. LVM-thin ignores that generic field and uses only the exact active-volume counter described above. Even complete per-VM allocation counters do not establish a unique cluster physical footprint. There is deliberately no summed physical-use claim. Different measurement families cannot be mixed for `--sort actual`. Snapshots, unreferenced disks, base images and other storage consumers are not a complete datastore audit; the report is a VM review inventory.
 
 Guest usage requires a running VM, an installed/enabled QEMU guest agent and permission. Agent data may omit usage counters, especially on older guest agents. Free is calculated only from valid reported total/used values and means `total-used`, not necessarily the space available to a particular guest user. Repeated mounts, network shares, pseudo-filesystems and overlapping devices make a guest-wide total unsafe, so each returned filesystem remains separate.
 
@@ -356,7 +449,7 @@ Use the largest-VM list to prioritize investigation, then inspect enabled job me
 
 Nominal 2 TB is about 1.82 TiB before filesystem overhead. Neither sum(configured disks) nor sum(guest used) is PBS consumption. PBS stores deduplicated, compressed chunks shared by VMs and snapshots. Requirements depend on the initially backed-up data, changed data rate, retention windows, sharing/compression, and cleanup progress. One VM's logical backup size cannot reliably attribute shared PBS chunks to that VM. Old/deleted VMs, containers and other clients may still have backup groups. Prune and GC are separate steps, with GC safety delays.
 
-A future PBS phase should collect datastore total/used/available, groups and snapshot counts, effective retention/prune configuration, and recent prune/GC results. This version explicitly makes **no conclusion** about whether the datastore is undersized or cleanup is failing, and performs no changes.
+Enable the optional PBS phase below to collect datastore filesystem total/used/available, visible groups and snapshot counts, configured retention/prune settings, and recent prune/GC status. It highlights capacity thresholds and reported cleanup failures for review, without claiming that every listed setting is the complete effective policy or attributing shared backup data to individual VMs. It performs no changes.
 
 ## Verification and sources
 
@@ -381,3 +474,8 @@ API behavior was checked against upstream Proxmox sources. Your installed versio
 - [Regular pvesm command implementation](https://github.com/proxmox/pve-storage/blob/master/src/PVE/CLI/pvesm.pm)
 - [OpenSSH command execution and authenticated background connections](https://man.openbsd.org/ssh)
 - [OpenSSH connection multiplexing and host verification](https://man.openbsd.org/ssh_config)
+- [Linux thin-device status: mapped sectors](https://docs.kernel.org/admin-guide/device-mapper/thin-provisioning.html)
+- [PVE Ceph RBD allocation implementation](https://github.com/proxmox/pve-storage/blob/master/src/PVE/Storage/RBDPlugin.pm)
+- [PBS API tokens and audit permissions](https://pbs.proxmox.com/docs/user-management.html)
+- [PBS datastore API](https://github.com/proxmox/proxmox-backup/blob/master/src/api2/admin/datastore.rs)
+- [PBS prune-job status API](https://github.com/proxmox/proxmox-backup/blob/master/src/api2/admin/prune.rs)
