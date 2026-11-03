@@ -1,0 +1,6 @@
+{
+  "url": "https://pve.example.internal:8006",
+  "token_id": "inventory@pve!report",
+  "token_secret": "REPLACE_WITH_YOUR_TOKEN_SECRET",
+  "ca_file": "/etc/pve/pve-root-ca.pem"
+}

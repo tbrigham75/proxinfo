@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+pve-report-*/
+config.json
+*.secret.json
