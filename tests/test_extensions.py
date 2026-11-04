@@ -219,7 +219,7 @@ class ReviewBreakdownAndSummaryTests(unittest.TestCase):
             for name in ('management-summary.html', 'review_items.csv', 'storage_breakdowns.csv', 'pbs_groups.csv', 'pbs_snapshots.csv', 'pbs_datastores.csv'):
                 self.assertTrue((Path(tmp)/name).exists())
             summary = (Path(tmp)/'management-summary.html').read_text(encoding='utf-8')
-            self.assertIn('Print / Save as PDF', summary)
+            self.assertIn('Print / Save As PDF', summary)
             self.assertIn('N/A means unavailable', summary)
             self.assertNotIn('<script>bad</script>', summary)
             self.assertIn('may overlap', summary)

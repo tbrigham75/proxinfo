@@ -501,17 +501,50 @@ def api_settings(args, setting):
 
 class PBSClient:
     """GET-only PBS API token client. Separate credentials and authorization scheme."""
-    def __init__(self, url, token_id, token_secret, ca_file=None, timeout=20):
+    def __init__(self, url, token_id=None, token_secret=None, ca_file=None, timeout=20,
+                 auth='token', username=None, password=None, interactive=False, ssh_options=None):
         parsed = parse.urlsplit(url or "")
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
                 or parsed.query or parsed.fragment or parsed.path.rstrip("/") not in ("", "/api2/json")):
             raise ValueError("PBS URL must be https://hostname:8007 without credentials or query parameters")
-        if not token_id or not token_secret:
+        if auth == 'token' and (not token_id or not token_secret):
             raise ValueError("PBS reporting requires a PBS Token ID and Secret, separate from the PVE token")
-        self.base, self.timeout, self.secret = "https://" + parsed.netloc + "/api2/json", timeout, token_secret
+        self.base, self.timeout, self.secret = "https://" + parsed.netloc + "/api2/json", timeout, token_secret or password or '[unset]'
         self.authorization = f"PBSAPIToken={token_id}:{token_secret}"
         context = ssl.create_default_context(cafile=str(Path(ca_file).expanduser()) if ca_file else None)
         self.opener = request.build_opener(NoRedirect(), request.HTTPSHandler(context=context))
+        self.ssh, self.cookie = None, None
+        if auth == 'ssh':
+            self.ssh = SSHClient(**ssh_options)
+            self.ssh.connect()
+        elif auth == 'password':
+            if not username or '@' not in username or not password:
+                raise ValueError('PBS password login requires username@realm and a password')
+            def login(fields):
+                try:
+                    req = request.Request(self.base + '/access/ticket', data=parse.urlencode(fields).encode(), method='POST')
+                    with self.opener.open(req, timeout=self.timeout) as response:
+                        return json.load(response)['data']
+                except (OSError, ValueError, KeyError):
+                    raise ReadError('PBS password login failed. Check credentials, certificate trust and authentication requirements') from None
+            data = login(dict(username=username, password=password))
+            if data.get('NeedTFA') or str(data.get('ticket', '')).startswith('PBS:!tfa!'):
+                if not interactive:
+                    raise ReadError('PBS requires interactive two-factor authentication; use an API token for scheduled reports')
+                code = getpass.getpass('PBS authenticator code (TOTP; hidden): ')
+                data = login(dict(username=username, password='totp:' + code, **{'tfa-challenge': data['ticket']}))
+            ticket = data.get('ticket')
+            if not ticket or data.get('NeedTFA'):
+                raise ReadError('PBS did not return a usable session. Use an API token for browser/security-key login accounts')
+            self.cookie = 'PBSAuthCookie=' + ticket
+            self.renew = lambda: login(dict(username=username, password=self.cookie.split('=', 1)[1]))
+            self.ticket_time = time.monotonic()
+
+    def close(self):
+        if self.ssh:
+            self.ssh.close()
+        self.cookie = None
+        self.renew = None
 
     def get(self, path, **params):
         paths = (r"/version", r"/admin/datastore", r"/config/datastore/[^/]+", r"/config/prune",
@@ -519,9 +552,35 @@ class PBSClient:
                  r"/admin/datastore/[^/]+/(?:status|namespace|groups|snapshots|gc)")
         if not any(re.fullmatch(pattern, path) for pattern in paths):
             raise ValueError("Not an approved PBS inventory GET path: " + path)
+        allowed = ({'store', 'start', 'limit', 'since'} if path == '/nodes/localhost/tasks' else
+                   {'max-depth', 'ns'} if path.endswith('/namespace') else
+                   {'ns'} if path.endswith(('/groups', '/snapshots')) else set())
+        if set(params) - allowed:
+            raise ValueError('Not an approved PBS inventory query parameter')
+        if self.ssh:
+            command = ['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug', 'api', 'get', path, '--output-format', 'json']
+            for key, value in params.items():
+                if not re.fullmatch(r'[a-z][a-z0-9-]*', key):
+                    raise ValueError('Invalid PBS query parameter')
+                command += ['--' + key, str(value).lower() if isinstance(value, bool) else str(value)]
+            if self.ssh.sudo:
+                command = ['sudo', '-n', '--'] + command
+            try:
+                result = subprocess.run(self.ssh.ssh_args() + ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'PermitLocalCommand=no', '--', self.ssh.host, shlex.join(command)], capture_output=True, text=True, timeout=self.timeout, stdin=subprocess.DEVNULL)
+                if result.returncode:
+                    raise ReadError('PBS SSH read failed; check root/restricted sudo access and proxmox-backup-debug availability')
+                return json.loads(result.stdout)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                raise ReadError('PBS SSH query failed or timed out') from None
         try:
+            if self.cookie and time.monotonic() - self.ticket_time > 3600:
+                renewed = self.renew()
+                if not renewed.get('ticket') or renewed.get('NeedTFA'):
+                    raise ReadError('PBS session renewal failed; rerun interactively or use an API token')
+                self.cookie = 'PBSAuthCookie=' + renewed['ticket']
+                self.ticket_time = time.monotonic()
             url = self.base + path + ("?" + parse.urlencode(params) if params else "")
-            req = request.Request(url, headers={"Authorization": self.authorization}, method="GET")
+            req = request.Request(url, headers={"Cookie": self.cookie} if self.cookie else {"Authorization": self.authorization}, method="GET")
             with self.opener.open(req, timeout=self.timeout) as response:
                 data = json.load(response)
                 if not isinstance(data, dict) or "data" not in data:
@@ -535,7 +594,8 @@ class PBSClient:
 
 def pbs_settings(args, config):
     def setting(key):
-        return os.environ.get("PBS_" + key.upper(), config.get("pbs_" + key))
+        explicit = getattr(args, 'pbs_' + key, None)
+        return explicit if explicit is not None else os.environ.get("PBS_" + key.upper(), config.get("pbs_" + key))
     interactive = not args.no_prompt and sys.stdin.isatty()
     requested = args.pbs
     if requested is None:
@@ -546,6 +606,30 @@ def pbs_settings(args, config):
         return None
     values = dict(url=args.pbs_url or setting("url"), token_id=setting("token_id"),
                   token_secret=setting("token_secret"), ca_file=setting("ca_file"), timeout=getattr(args, "pbs_timeout", 60))
+    auth = getattr(args, 'pbs_auth', None) or setting('auth')
+    if not auth:
+        auth = 'token' if values['token_id'] else (prompt_choice('PBS connection: password = web account; token = API token; ssh = system login', ('password', 'token', 'ssh'), 'password') if interactive else 'token')
+    if auth not in ('token', 'password', 'ssh'):
+        raise ValueError('PBS auth must be token, password or ssh')
+    if auth != 'token':
+        values.update(auth=auth, interactive=interactive)
+        if auth == 'ssh':
+            method = setting('ssh_auth') or (prompt_choice('PBS SSH sign-in method', ('password', 'key', 'auto'), 'password') if interactive else 'key')
+            host = setting('ssh_host') or (input('PBS SSH hostname or IP: ').strip() if interactive else None)
+            user = setting('ssh_user') or (input('PBS SSH system username [root]: ').strip() or 'root' if interactive else 'root')
+            identity = setting('ssh_key')
+            if method == 'key' and interactive and not identity:
+                identity = input('PBS SSH private key file [Enter for configured keys/agent]: ').strip() or None
+            values['ssh_options'] = dict(host=host, user=user, identity=identity, port=setting('ssh_port'), authentication=method, batch=not interactive, timeout=values['timeout'], sudo=bool(config.get('pbs_ssh_sudo', False)))
+            if not values['url'] and host:
+                values['url'] = 'https://' + ('[' + host + ']' if ':' in host else host) + ':8007'
+        else:
+            values['username'] = setting('username') or (input('PBS web account including realm (e.g. inventory@pbs): ').strip() if interactive else None)
+            values['password'] = setting('password') or (getpass.getpass('PBS web-account password (hidden): ') if interactive else None)
+        if not values['url'] and interactive:
+            host = input('PBS HTTPS hostname/IP or URL: ').strip()
+            values['url'] = host if host.startswith('https://') else 'https://' + ('[' + host + ']' if ':' in host else host) + ':8007'
+        return values
     if interactive:
         print("PBS is a separate backup server. Use a read-only API token created in its web interface; no backups will be changed.", file=sys.stderr)
         if not values["url"]:
@@ -1580,6 +1664,7 @@ def review_items(report):
 def summary(report):
     vms = report["vms"]
     volumes, allocations, missing = {}, {}, 0
+    capacity_conflicts, allocation_conflicts = set(), set()
     identity_unknown = False
     unidentified_disks = 0
     for vm in vms:
@@ -1593,14 +1678,16 @@ def summary(report):
             key = tuple(disk["identity"])
             capacity = disk["capacity_bytes"]
             if key in volumes and volumes[key] != capacity:
-                volumes[key] = None  # conflicting config observations are not silently resolved
+                capacity_conflicts.add(key)
+                volumes[key] = None  # conflicting observations stay excluded
             else:
-                volumes[key] = capacity
+                volumes[key] = None if key in capacity_conflicts else capacity
             allocation = (disk["actual_bytes"], disk["actual_method"])
             if key in allocations and allocations[key] != allocation:
+                allocation_conflicts.add(key)
                 allocations[key] = (None, None)
             else:
-                allocations[key] = allocation
+                allocations[key] = (None, None) if key in allocation_conflicts else allocation
     unknown_sizes = sum(v is None for v in volumes.values())
     known = sum(v for v in volumes.values() if v is not None)
     full = missing == 0 and unknown_sizes == 0 and not identity_unknown
@@ -1640,7 +1727,7 @@ def summary(report):
              measured_volumes=len(volumes)-unknown_sizes, known_identity_volumes=len(volumes),
              complete_coverage=full, notes=accounting_note),
         dict(metric="Measured VM disk allocation", total_bytes=allocation_total,
-             known_subtotal_bytes=allocation_total, measured_volumes=len(measured),
+             known_subtotal_bytes=next(iter(subtotals.values())) if len(subtotals) == 1 else None, measured_volumes=len(measured),
              known_identity_volumes=len(volumes), complete_coverage=allocation_complete,
              notes="A combined total requires complete coverage and one allocation metric meaning. " + accounting_note),
     ] + [dict(metric="Allocation subtotal: " + method, total_bytes=None, known_subtotal_bytes=subtotal,
@@ -1805,7 +1892,7 @@ HTML_STYLE += r'''
 
 HTML_SCRIPT = r'''
 const root=document.documentElement, themeButton=document.querySelector('#theme-toggle');
-function applyTheme(theme){root.dataset.theme=theme;themeButton.textContent=theme==='dark'?'Light mode':'Dark mode';themeButton.setAttribute('aria-pressed',String(theme==='dark'));}
+function applyTheme(theme){root.dataset.theme=theme;themeButton.textContent=theme==='dark'?'Light Mode':'Dark Mode';themeButton.setAttribute('aria-pressed',String(theme==='dark'));}
 let preferred=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';
 try{const stored=localStorage.getItem('pve-inventory-theme');if(stored==='light'||stored==='dark')preferred=stored;}catch{}
 applyTheme(preferred);
@@ -1828,24 +1915,24 @@ window.addEventListener('hashchange',route);route();
 const dialog=document.querySelector('#explanation-dialog');
 document.querySelectorAll('[data-help]').forEach(link=>link.addEventListener('click',event=>{const entry=document.getElementById('help-'+link.dataset.help);if(!entry||typeof dialog.showModal!=='function')return;event.preventDefault();const content=entry.cloneNode(true);content.removeAttribute('id');const heading=content.querySelector('h3');document.querySelector('#explanation-title').textContent=heading.textContent;heading.remove();document.querySelector('#explanation-content').replaceChildren(content);dialog.showModal();}));
 dialog.addEventListener('click',event=>{if(event.target===dialog){const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();}});
-const vmDialog=document.createElement('dialog');vmDialog.className='vm-drawer';vmDialog.innerHTML='<form method="dialog"><button class="button">Close VM information</button></form><div class="vm-drawer-body"></div>';document.body.append(vmDialog);
+const vmDialog=document.createElement('dialog');vmDialog.className='vm-drawer';vmDialog.innerHTML='<form method="dialog"><button class="button">Close VM Information</button></form><div class="vm-drawer-body"></div>';document.body.append(vmDialog);
 document.querySelectorAll('.vm-details').forEach(details=>details.addEventListener('toggle',()=>{if(details.open){vmDialog.querySelector('.vm-drawer-body').innerHTML=details.innerHTML;vmDialog.querySelector('.vm-drawer-body summary')?.remove();details.open=false;vmDialog.showModal();}}));
-const pbsPage=document.querySelector('[data-page="pbs"]');if(pbsPage&&pbsPage.querySelector('#pbs-inventory')){Array.from(pbsPage.children).filter(e=>e.querySelector('h2')?.textContent.startsWith('Datastore:')).forEach(panel=>{const retention=panel.querySelector(':scope > .subsection');if(retention){const section=document.createElement('section');section.className='panel';const title=document.createElement('h2');title.textContent='Retention & cleanup · '+panel.querySelector('h2').textContent;section.append(title,retention);pbsPage.append(section);}});const panels=Array.from(pbsPage.children).filter(e=>e.tagName==='SECTION');const controls=document.createElement('div');controls.className='toolbar';const groups=['Overview','Backups','Activity','Retention & cleanup','Evidence'];panels.forEach(panel=>{const heading=panel.querySelector('h2')?.textContent||'';panel.dataset.pbsSection=heading.startsWith('Retention & cleanup')?'Retention & cleanup':heading==='Backup inventory'?'Backups':heading.includes('attempts and secondary')?'Activity':heading.includes('evidence')||heading.includes('visibility')||heading.includes('checks')?'Evidence':'Overview';});groups.forEach(name=>{const button=document.createElement('button');button.className='button';button.textContent=name;button.type='button';button.onclick=()=>{panels.forEach(p=>p.hidden=p.dataset.pbsSection!==name);controls.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));};controls.append(button);});pbsPage.insertBefore(controls,panels[0]);controls.firstElementChild.click();}
+const pbsPage=document.querySelector('[data-page="pbs"]');if(pbsPage&&pbsPage.querySelector('#pbs-inventory')){Array.from(pbsPage.children).filter(e=>e.querySelector('h2')?.textContent.startsWith('Datastore:')).forEach(panel=>{const retention=panel.querySelector(':scope > .subsection');if(retention){const section=document.createElement('section');section.className='panel';const title=document.createElement('h2');title.textContent='Retention & Cleanup · '+panel.querySelector('h2').textContent;section.append(title,retention);pbsPage.append(section);}});const panels=Array.from(pbsPage.children).filter(e=>e.tagName==='SECTION');const controls=document.createElement('div');controls.className='toolbar';const groups=['Overview','Backups','Activity','Retention & Cleanup','Evidence'];panels.forEach(panel=>{const heading=panel.querySelector('h2')?.textContent||'';panel.dataset.pbsSection=heading.startsWith('Retention & Cleanup')?'Retention & Cleanup':heading==='Backup inventory'?'Backups':heading.includes('attempts and secondary')?'Activity':heading.includes('evidence')||heading.includes('visibility')||heading.includes('checks')?'Evidence':'Overview';});groups.forEach(name=>{const button=document.createElement('button');button.className='button';button.textContent=name;button.type='button';button.onclick=()=>{panels.forEach(p=>p.hidden=p.dataset.pbsSection!==name);controls.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));};controls.append(button);});pbsPage.insertBefore(controls,panels[0]);controls.firstElementChild.click();}
 function humanBytes(value){let amount=Number(value);for(const unit of ['B','KiB','MiB','GiB','TiB','PiB','EiB']){if(amount<1024||unit==='EiB')return amount.toFixed(2)+' '+unit;amount/=1024;}}
 function updateStorageTotals(rows){const label=document.querySelector('#table-total-label'),assigned=document.querySelector('#table-assigned-total'),used=document.querySelector('#table-used-total'),note=document.querySelector('#table-total-note');const ram=document.querySelector('#table-ram-total');const values=rows.map(r=>r.cells[7]).filter(c=>c.dataset.missing!=='true').map(c=>BigInt(c.dataset.value));ram.textContent=!rows.length?'—':values.length===rows.length?humanBytes(values.reduce((a,b)=>a+b,0n)):(values.length?humanBytes(values.reduce((a,b)=>a+b,0n))+' known · '+values.length+' of '+rows.length+' VMs':'N/A');label.textContent=`Totals for ${rows.length} shown VMs`;if(!rows.length){assigned.textContent='—';used.textContent='—';note.textContent='No machines match the filters.';return;}
  const disks=new Map();let missingConfig=false,unknownIdentity=false;
  rows.forEach(row=>{if(row.dataset.configAvailable!=='true')missingConfig=true;JSON.parse(row.dataset.disks).forEach(d=>{if(!d.identity){unknownIdentity=true;return;}const key=JSON.stringify(d.identity);if(disks.has(key)){const old=disks.get(key);if(old.capacity!==d.capacity)old.capacity=null;if(old.used!==d.used||old.method!==d.method){old.used=null;old.method=null;}}else disks.set(key,{...d});});});
  let assignedKnown=0n,usedKnown=0n,sizes=0,measurements=0;const methods=new Set();disks.forEach(d=>{if(d.capacity!==null){assignedKnown+=BigInt(d.capacity);sizes++;}if(d.used!==null&&d.method){usedKnown+=BigInt(d.used);measurements++;methods.add(d.method);}});
  const fullSizes=!missingConfig&&!unknownIdentity&&sizes===disks.size,fullUsage=disks.size>0&&!missingConfig&&!unknownIdentity&&measurements===disks.size&&methods.size===1;
- assigned.textContent=fullSizes?humanBytes(assignedKnown):'N/A';used.textContent=fullUsage?humanBytes(usedKnown):'N/A';
- const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');const partial=new Map();disks.forEach(d=>{if(d.used!==null&&d.method)partial.set(d.method,(partial.get(d.method)||0n)+BigInt(d.used));});if(!fullUsage)partial.forEach((amount,method)=>messages.push('Measured subtotal ('+method+'): '+humanBytes(amount)+'.'));messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig||unknownIdentity)messages.push('Some disk settings or storage locations are unavailable.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
+ assigned.textContent=fullSizes?humanBytes(assignedKnown):'N/A';used.textContent=fullUsage?humanBytes(usedKnown)+' · Complete':measurements&&methods.size===1?humanBytes(usedKnown)+' · Partial':measurements?'Separate Measurement Totals':'No Measurements Collected';
+ const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');const partial=new Map();disks.forEach(d=>{if(d.used!==null&&d.method)partial.set(d.method,(partial.get(d.method)||0n)+BigInt(d.used));});if(methods.size>1)used.textContent=Array.from(partial,([method,amount])=>method+': '+humanBytes(amount)).join('; ');if(!fullUsage)partial.forEach((amount,method)=>messages.push('Measured subtotal ('+method+'): '+humanBytes(amount)+'.'));messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig||unknownIdentity)messages.push('Some disk settings or storage locations are unavailable.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
 }
 const search=document.querySelector('#search'),nodeFilter=document.querySelector('#node-filter'),missingOnly=document.querySelector('#missing-only'),resultCount=document.querySelector('#result-count');
 function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const match=row.dataset.search.includes(search.value.toLowerCase().trim())&&(!nodeFilter.value||row.dataset.node===nodeFilter.value)&&(!missingOnly.checked||row.dataset.missingAllocation==='true');row.hidden=!match;if(match)shown.push(row);});const active=[search.value.trim()?'Search: '+search.value.trim():'',nodeFilter.value?'PVE node: '+nodeFilter.value:'',missingOnly.checked?'Usage unavailable':''].filter(Boolean);resultCount.textContent=`${shown.length} of ${body.rows.length} machines shown`+(active.length?' — '+active.join(' · '):' — All VMs');document.querySelector('#no-results').hidden=shown.length!==0;updateStorageTotals(shown);}
 search.addEventListener('input',filterRows);nodeFilter.addEventListener('change',filterRows);missingOnly.addEventListener('change',filterRows);
 document.querySelector('#show-resources').addEventListener('change',event=>{table.dataset.resources=String(event.target.checked);document.querySelector('#table-total-note').closest('td').colSpan=event.target.checked?4:2;document.querySelector('#table-ram-total').hidden=!event.target.checked;});
 const globalNode=document.querySelector('#global-node-filter');const nodeViews=JSON.parse(document.querySelector('#node-view-data')?.textContent||'{}');const fullViews={};['overview','hosts','review','storage'].forEach(key=>{fullViews[key]=document.querySelector(`[data-page="${key}"]`).innerHTML;});
-function applyNodeView(value){if(globalNode)globalNode.value=value;nodeFilter.value=value;filterRows();for(const key of Object.keys(fullViews)){document.querySelector(`[data-page="${key}"]`).innerHTML=value&&nodeViews[value]?nodeViews[value][key]:fullViews[key];}const note=document.querySelector('#global-scope-note');if(note)note.textContent=(value?'Viewing PVE node: '+value:'Viewing all collected PVE nodes')+'. PBS, backup-job definitions and exports retain their full collected scope.';document.querySelectorAll('[data-review-vmid]').forEach(link=>{link.onclick=event=>{event.preventDefault();applyNodeView('');search.value='';missingOnly.checked=false;filterRows();showPage('machines');location.hash='machines';const target=Array.from(body.rows).find(row=>row.cells[0].dataset.value===link.dataset.reviewVmid);body.querySelectorAll('.selected-vm').forEach(r=>r.classList.remove('selected-vm'));if(target){target.classList.add('selected-vm');target.scrollIntoView({block:'center'});}};});const missingButton=document.querySelector('#show-missing');if(missingButton)missingButton.onclick=()=>{missingOnly.checked=true;filterRows();showPage('machines');location.hash='machines';};}
+function applyNodeView(value){if(globalNode)globalNode.value=value;nodeFilter.value=value;filterRows();for(const key of Object.keys(fullViews)){document.querySelector(`[data-page="${key}"]`).innerHTML=value&&nodeViews[value]?nodeViews[value][key]:fullViews[key];}const note=document.querySelector('#global-scope-note');if(note)note.textContent=(value?'Viewing PVE node: '+value:'Viewing all collected PVE nodes')+'. Management Summary, print, PBS, backup-job definitions and exports retain their full collected scope.';document.querySelectorAll('[data-review-vmid]').forEach(link=>{link.onclick=event=>{event.preventDefault();applyNodeView('');search.value='';missingOnly.checked=false;filterRows();showPage('machines');location.hash='machines';const target=Array.from(body.rows).find(row=>row.cells[0].dataset.value===link.dataset.reviewVmid);body.querySelectorAll('.selected-vm').forEach(r=>r.classList.remove('selected-vm'));if(target){target.classList.add('selected-vm');target.scrollIntoView({block:'center'});}};});const missingButton=document.querySelector('#show-missing');if(missingButton)missingButton.onclick=()=>{missingOnly.checked=true;filterRows();showPage('machines');location.hash='machines';};}
 if(globalNode){globalNode.onchange=()=>applyNodeView(globalNode.value);nodeFilter.addEventListener('change',()=>applyNodeView(nodeFilter.value));}
 function clearFilters(){search.value='';nodeFilter.value='';missingOnly.checked=false;applyNodeView('');}
 document.querySelector('#clear-filters').addEventListener('click',clearFilters);
@@ -1862,13 +1949,13 @@ pbsPanel.querySelectorAll('[data-pbs-col]').forEach(button=>button.onclick=()=>{
 
 
 REPORT_HELP = {
-    "machines": ("Virtual machines and templates", "A virtual machine (VM) is a computer created in software. It runs on a physical server and has its own applications, disk space, memory and processing capacity. A template is a saved setup used to create new VMs; templates are included because their disks can take up storage. This report includes only machines the connected account can see."),
+    "machines": ("Virtual Machines and templates", "A virtual machine (VM) is a computer created in software. It runs on a physical server and has its own applications, disk space, memory and processing capacity. A template is a saved setup used to create new VMs; templates are included because their disks can take up storage. This report includes only machines the connected account can see."),
     "hosts": ("Host servers and clusters", "A host is the physical Proxmox server that runs a VM. Proxmox calls it a node. A cluster is a group of these servers managed together. The Host server column identifies where the VM was assigned when this report was collected."),
     "power": ("Power state", "On means Proxmox reports that the VM is running. Off means it is stopped. Unknown means the current state could not be confirmed. A machine can be On while an application inside it is unhealthy; this report does not test application availability."),
     "labels": ("Labels", "Labels are the tags your team has assigned to a VM, such as production or finance. They help identify its purpose or owner. A blank field means there are no labels. N/A means the labels could not be read."),
     "assigned": ("Assigned disk space", "This is the size of the disks made available to a VM, whether or not it has filled them. For example, a 500 GiB disk counts as 500 GiB even if it contains only 20 GiB of files. The overall total counts repeated references to the same identified disk once. It excludes installation media and disks that are no longer attached. It is not a measurement of backup storage used."),
-    "measured": ("Measured storage used", "This is the disk space that a supported storage system reports as allocated to VM disks. It differs from assigned disk size and from files used inside a VM. Storage systems can count shared data, snapshots and compressed data differently. A total is shown only when every disk can be identified and has a comparable measurement. It does not establish unique physical space used, space recoverable by deletion, or backup storage used."),
-    "missing": ("Why a number may be unavailable", "N/A means no reliable number is available; it does not mean zero. The storage system may not provide a supported measurement, the account may lack access, or a server may not respond. A missing VM configuration can also prevent a full total. Known subtotals cover only the disks that could be read. Open the VM's Data availability section for a plain-language explanation, or its IT reference for the exact request details."),
+    "measured": ("Measured storage used", "This is the disk space that a supported storage system reports as allocated to VM disks. It differs from assigned disk size and from files used inside a VM. Storage systems can count shared data, snapshots and compressed data differently. Known measured amounts are shown with Complete or Partial coverage. Different measurement types have separate subtotals. It does not establish unique physical space used, space recoverable by deletion, or backup storage used."),
+    "missing": ("Why a number may be unavailable", "N/A means no reliable number is available; it does not mean zero. The storage system may not provide a supported measurement, the account may lack access, or a server may not respond. A missing VM configuration can also prevent a full total. Known subtotals cover only the disks that could be read. Open the VM's Data availability section for a plain-language explanation, or its IT Reference for the exact request details."),
     "memory": ("RAM assigned and memory in use", "Memory (RAM) is the short-term workspace a computer uses while running applications. It is different from disk space, which stores files. Assigned memory is the maximum configured for the VM. RAM in use is the current value reported by Proxmox; it can be affected by memory-sharing and reporting settings. This report does not measure the memory used by each application."),
     "cpu": ("Virtual CPUs", "Virtual CPUs are the processing capacity assigned to a VM. A larger number lets it use more processing work at once, subject to what the host can supply. They are not a count of physical processor cores owned by the VM, and this number does not show current processor usage."),
     "backups": ("Scheduled for backup", "Yes means at least one currently enabled Proxmox backup schedule selects this VM. No means no enabled schedule selects it among the schedules successfully checked. Unknown means the selection could not be determined. This does not prove that a backup ran or succeeded. Manual backups, older backups and jobs outside PVE are not discovered here. A schedule can select a VM while excluding some of its disks."),
@@ -1934,7 +2021,7 @@ def allocation_vm_reason(vm):
             elif "did not return used" in raw:
                 reason = "The storage system answered but did not provide a storage-used measurement for this disk."
             elif "timed out" in raw.lower() or "timeout" in raw.lower():
-                reason = "The storage measurement exceeded its time limit. This does not establish that storage is offline. Check the node, storage and query details in IT reference; guest tools are not required for this measurement."
+                reason = "The storage measurement exceeded its time limit. This does not establish that storage is offline. Check the node, storage and query details in IT Reference; guest tools are not required for this measurement."
             elif "passthrough" in raw.lower() or "unmanaged" in raw.lower():
                 reason = "This disk is attached directly rather than managed through a supported storage system. Its storage usage is unavailable."
             elif "not active" in raw.lower():
@@ -1942,7 +2029,7 @@ def allocation_vm_reason(vm):
             elif "require" in raw.lower() and "SSH" in raw:
                 reason = "This storage measurement needs SSH or local host access. A PVE API token alone cannot read the exact thin-volume counter."
             else:
-                reason = "A reliable measurement could not be collected. IT can review the exact request in this machine's IT reference."
+                reason = "A reliable measurement could not be collected. IT can review the exact request in this machine's IT Reference."
             reasons.append(f"{disk['slot']} ({disk['volume']}): {reason} Exact result: {raw}")
     if len({d["actual_method"] for d in unique_disks(vm["disks"]) if d["actual_method"]}) > 1:
         reasons.append("The storage systems count space differently. Their measurements cannot safely be added into one total.")
@@ -1971,7 +2058,7 @@ def vm_information_html(vm):
     if vm["filesystems"]:
         inside_html = ''.join('<article class="disk-detail"><h3>Drive or folder: ' + esc(f["mountpoint"]) + '</h3><p>Space used: <strong>' + human(f["used_bytes"]) + '</strong><br>Space free: <strong>' + human(f["free_bytes"]) + '</strong><br>Total size: <strong>' + human(f["total_bytes"]) + '</strong></p></article>' for f in vm["filesystems"])
     else:
-        inside_html = '<p class="muted">Drive-level space information was not available. The machine may be off, its reporting helper may be unavailable, or this check may have been skipped. The exact collection message is in IT reference below.</p>'
+        inside_html = '<p class="muted">Drive-level space information was not available. The machine may be off, its reporting helper may be unavailable, or this check may have been skipped. The exact collection message is in IT Reference below.</p>'
     availability = []
     if vm["actual_bytes"] is None:
         availability.extend(allocation_vm_reason(vm))
@@ -1995,7 +2082,7 @@ def vm_information_html(vm):
         '<details class="subsection"><summary>Backup schedules</summary><p>' + ('Selection could not be confirmed.' if vm["backup"] == NA else 'An active schedule selects this machine.' if vm["backup"] == 'Yes' else 'No active schedule was found selecting this machine.') + '</p><p><strong>Active schedules:</strong> ' + esc(', '.join(vm["enabled_jobs"]) or "None confirmed") + '<br><strong>Inactive schedules:</strong> ' + esc(', '.join(vm["disabled_jobs"]) or "None confirmed") + '</p><p class="hint">Selection does not prove that a backup succeeded. ' + report_help_link("backups", "What does this tell me?") + '</p></details>' + \
         '<details class="subsection"><summary>Memory and processing</summary><p>RAM assigned: <strong>' + human(vm["ram_bytes"]) + '</strong><br>RAM in use: <strong>' + human(vm["memory_used_bytes"]) + '</strong><br>Virtual CPUs assigned: <strong>' + esc(vm["vcpus"]) + '</strong></p>' + report_help_link("memory", "Explain memory") + ' · ' + report_help_link("cpu", "Explain virtual CPUs") + '</details>' + \
         '<details class="subsection"><summary>Data availability</summary>' + available_html + '</details>' + \
-        '<details class="subsection"><summary>IT reference for this VM</summary><p class="hint">Original disk identifiers, measurement sources and collection messages for troubleshooting.</p><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in raw) + '</ul></details>'
+        '<details class="subsection"><summary>IT Reference for this VM</summary><p class="hint">Original disk identifiers, measurement sources and collection messages for troubleshooting.</p><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in raw) + '</ul></details>'
 
 
 def utc_time(value):
@@ -2060,7 +2147,7 @@ def pbs_inventory_html(report):
             value=g.get(key)
             text = 'Root' if key=='namespace' and value=='' else utc_time(value) if key.endswith('_time') else human(value) if key.endswith('_bytes') else f'{value:.1f}' if key=='age_hours' and value is not None else display(value)
             cells.append('<td data-pbs-value="'+esc(value)+'" data-unknown="'+str(value is None).lower()+'">'+esc(text)+'</td>')
-        cells.append('<td><details><summary>Retention rules</summary><p>PBS policies are shown separately; disabled policies do not run. PVE job rules, if collected, are on PVE backup jobs. This is not a deletion prediction.</p><pre>'+esc(json.dumps(g.get('pbs_prune_policies'),indent=2))+'</pre></details></td>')
+        cells.append('<td><details><summary>Retention rules</summary><p>PBS policies are shown separately; disabled policies do not run. PVE job rules, if collected, are on PVE Backup Jobs. This is not a deletion prediction.</p><pre>'+esc(json.dumps(g.get('pbs_prune_policies'),indent=2))+'</pre></details></td>')
         rows.append('<tr>'+''.join(cells)+'</tr>')
     return '<section class="panel" id="pbs-inventory"><h2>Backup inventory</h2><p>Logical backup sizes are not physical PBS consumption. PVE ownership is unconfirmed; matching an ID alone is insufficient. Verification is not a restore test.</p><label>Search datastore, namespace, type, ID or status <input id="pbs-search" type="search"></label><p id="pbs-count" aria-live="polite"></p><div class="table-wrap"><table><thead><tr>'+''.join('<th><button type="button" data-pbs-col="'+str(i)+'">'+label+'</button></th>' for i,(key,label) in enumerate(columns))+'<th>Retention</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div><button type="button" id="pbs-prev">Previous</button> <button type="button" id="pbs-next">Next</button><p>50 groups per page. All collected records are in CSV/JSON. Search includes freshness and verification status.</p></section>'
 
@@ -2095,7 +2182,7 @@ def pbs_page_html(report):
     esc = lambda value: html.escape(display(value), quote=True)
     pbs = report.get("pbs", {})
     status = pbs.get("status", "not requested")
-    intro = '<p class="eyebrow">Separate backup server</p><h2 tabindex="-1">PBS backup storage</h2>'
+    intro = '<p class="eyebrow">Separate backup server</p><h2 tabindex="-1">PBS Backup Storage</h2>'
     if not pbs.get("requested"):
         return intro + '<section class="panel"><h2>PBS reporting was skipped</h2><p>It is off by default. Choose include at the optional PBS prompt or add <code>--pbs</code> next time to collect backup-server information. No PBS credentials are needed when skipped.</p><p>This report still includes the PVE inventory and review findings. PBS capacity and cleanup results are unavailable.</p></section>'
     out = [intro, '<p>PBS server: ' + esc(pbs.get('server')) + '</p>', '<p class="page-intro">Collection status: <strong>' + esc(status) + '</strong>. Capacity comes from PBS itself, not from adding VM disk sizes. ' + report_help_link("pbs", "Explain backup storage") + '</p>']
@@ -2125,7 +2212,7 @@ def pbs_page_html(report):
                 out_enabled = 'No' if str(combined.get('disable', 0)).lower() in ('1', 'true') else 'Yes'
                 rows.append('<tr><td>' + esc(key) + '</td><td>' + out_enabled + '</td><td>' + esc(combined.get('ns') or 'Root') + '</td><td>' + esc(combined.get('schedule')) + '</td><td>' + esc(retention_description({'prune-backups': rules})) + '</td><td>' + esc(cleanup_result(state)) + '<small>' + utc_time(state.get('last-run-endtime')) + '</small></td></tr>')
             out.append('<div class="table-wrap"><table><thead><tr><th>Prune job</th><th>Enabled</th><th>Namespace</th><th>Schedule</th><th>Keep rules</th><th>Last result</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
-        out.append('<p class="hint">Job rules can be limited to a namespace or depth, and snapshots may be protected. PVE jobs may also apply retention. Review all settings together rather than treating one rule as the full policy.</p></div><details class="subsection"><summary>IT reference for this datastore</summary><pre>' + esc(json.dumps({k: store.get(k) for k in ('datastore_retention', 'prune_config', 'prune_status', 'gc', 'recent_cleanup_tasks')}, indent=2)) + '</pre></details></section>')
+        out.append('<p class="hint">Job rules can be limited to a namespace or depth, and snapshots may be protected. PVE jobs may also apply retention. Review all settings together rather than treating one rule as the full policy.</p></div><details class="subsection"><summary>IT Reference for this datastore</summary><pre>' + esc(json.dumps({k: store.get(k) for k in ('datastore_retention', 'prune_config', 'prune_status', 'gc', 'recent_cleanup_tasks')}, indent=2)) + '</pre></details></section>')
     pve_ids = {str(v['vmid']) for v in report['vms']}
     out.append(pbs_inventory_html(report))
     out.append(pbs_extra_html(report))
@@ -2134,7 +2221,38 @@ def pbs_page_html(report):
     return ''.join(out)
 
 
+def measured_total_label(totals):
+    value = totals[1]
+    if value['complete_coverage']:
+        return human(value['total_bytes']) + ' · Complete'
+    groups = [r for r in totals[2:] if r['known_subtotal_bytes'] is not None]
+    if len(groups) == 1:
+        return human(groups[0]['known_subtotal_bytes']) + ' · Partial'
+    if groups:
+        return '; '.join(r['metric'].replace('Allocation subtotal: ', '') + ': ' + human(r['known_subtotal_bytes']) for r in groups)
+    return 'No Measurements Collected'
+
+
+def title_controls(markup):
+    def title(match):
+        label = re.sub(r'(^|\s)([a-z])', lambda m: m[1] + m[2].upper(), match[2])
+        return match[1] + label + match[3]
+    return re.sub(r'(<button\b[^>]*>|<a\b[^>]*class="button"[^>]*>)([^<]+)(</button>|</a>)', title, markup)
+
+
 def management_body(report):
+    markup = _management_body(report)
+    if report.get('scope', {}).get('pbs_only'):
+        return markup
+    counts = report['allocation_diagnostics']
+    note = ('<p class="management-note">Full collected scope. ' + str(counts['measured_disks']) +
+            ' of ' + str(counts['identified_disks']) + ' identified disks measured. ' +
+            html.escape(' '.join(counts['reasons'])) +
+            ' <a href="inventory.html#storage">View Missing Measurements</a></p>')
+    return markup.replace('<h2>Priority questions</h2>', note + '<h2>Priority questions</h2>')
+
+
+def _management_body(report):
     esc = lambda value: html.escape(display(value), quote=True)
     totals = report['storage_totals']
     if report.get('scope', {}).get('pbs_only'):
@@ -2152,11 +2270,15 @@ def management_body(report):
     top = [v for v in vms if v[metric] is not None][:5]
     top_rows = ''.join('<tr><td>' + esc(v['name']) + ' (#' + esc(v['vmid']) + ')</td><td>' + human(v[metric]) + '</td><td>' + power_state(v['status']) + '</td><td>' + ('Unknown' if v['backup'] == NA else v['backup']) + '</td></tr>' for v in top)
     capacity = '; '.join(s['store'] + ': ' + human(s['used_bytes']) + ' used, ' + human(s['available_bytes']) + ' available' for s in pbs.get('datastores', [])[:3]) or 'No PBS capacity data collected.'
-    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + human(totals[1]['total_bytes']) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage needs complete comparable data. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><p>Partial storage measurements: ' + esc('; '.join(str(v['vmid']) + ': ' + measurement_label(v) for v in vms if measurement_details(v)['measurement_status'] == 'partial') or 'None') + '</p><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
+    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management Summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + esc(measured_total_label(totals)) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage includes available disk readings. Partial totals exclude unreadable disks. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><p>Partial storage measurements: ' + esc('; '.join(str(v['vmid']) + ': ' + measurement_label(v) for v in vms if measurement_details(v)['measurement_status'] == 'partial') or 'None') + '</p><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
 
 
 def management_summary_html(report):
-    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo management summary</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><div class="print-toolbar"><button class="button" onclick="window.print()">Print / Save as PDF</button> <a href="inventory.html">Open full report</a></div>' + management_body(report) + '</main></body></html>'
+    return title_controls(_management_summary_html(report))
+
+
+def _management_summary_html(report):
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo management summary</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><div class="print-toolbar"><button class="button" onclick="window.print()">Print / Save As PDF</button> <a href="inventory.html">Open Full Report</a></div>' + management_body(report) + '</main></body></html>'
 
 
 def compare_inventory(report, previous):
@@ -2215,15 +2337,16 @@ def pbs_jobs_html(report):
     return ''.join(parts)
 
 
-def pbs_location_details(report, config, args, tracker):
-    host = config.get('pbs_ssh_host')
+def pbs_location_details(report, config, args, tracker, existing=None):
+    host = existing.host if existing else config.get('pbs_ssh_host')
     if not host or not report.get('pbs', {}).get('requested'):
         return
-    client = SSHClient(host, user=config.get('pbs_ssh_user', 'root'),
+    client = existing or SSHClient(host, user=config.get('pbs_ssh_user', 'root'),
         port=config.get('pbs_ssh_port'), identity=config.get('pbs_ssh_key'),
         timeout=args.pbs_timeout, batch=args.no_prompt, authentication='auto')
     try:
-        client.connect()
+        if not existing:
+            client.connect()
         client = ObservedClient(client, tracker)
         for store in report['pbs'].get('datastores', []):
             path = store.get('backing_scope')
@@ -2237,11 +2360,12 @@ def pbs_location_details(report, config, args, tracker):
     except (ReadError, ValueError, OSError) as exc:
         report['pbs']['warnings'].append('Optional PBS filesystem lookup unavailable: ' + str(exc))
     finally:
-        client.close()
+        if not existing:
+            client.close()
 
 
 def downloads_html():
-    files = [('Host inventory', 'hosts.csv'), ('Report changes', 'changes.csv'), ('VM spreadsheet', 'vms.csv'), ('Disk spreadsheet', 'disks.csv'),
+    files = [('Host inventory', 'hosts.csv'), ('VM spreadsheet', 'vms.csv'), ('Disk spreadsheet', 'disks.csv'),
              ('Full inventory', 'inventory.json'), ('Printable summary', 'management-summary.html'),
              ('PBS backup groups', 'pbs_groups.csv'), ('PBS snapshots', 'pbs_snapshots.csv')]
     return '<h2>Downloads</h2><p>These files cover the entire collected report, regardless of browser filters. Keep them alongside this HTML file.</p><section class="panel">' + ''.join('<p><a href="' + path + '">' + label + '</a></p>' for label, path in files) + '</section>'
@@ -2249,7 +2373,7 @@ def downloads_html():
 
 def hosts_page_html(report):
     esc = lambda value: html.escape(display(value), quote=True)
-    parts = ['<h2>PVE hosts</h2><p>Physical host readings at collection time. Assigned VM resources are separate from physical capacity. Missing readings do not establish that a host is offline.</p>']
+    parts = ['<h2>PVE Hosts</h2><p>Physical host readings at collection time. Assigned VM resources are separate from physical capacity. Missing readings do not establish that a host is offline.</p>']
     for host in report.get('hosts', []):
         info = host.get('details') or {}
         ram = info.get('memory') or {}
@@ -2266,6 +2390,10 @@ def hosts_page_html(report):
 
 
 def html_report(report, include_scopes=True):
+    return title_controls(_html_report(report, include_scopes))
+
+
+def _html_report(report, include_scopes=True):
     esc = lambda value: html.escape(display(value), quote=True)
     vms, totals, diagnostic = report["vms"], report["storage_totals"], report["allocation_diagnostics"]
     count = len(vms)
@@ -2279,9 +2407,9 @@ def html_report(report, include_scopes=True):
         date = report["generated_at"]
     method_label = lambda method: {"file allocated bytes": "Disk-file measurements", "ZFS usedbydataset": "ZFS storage measurements", "LVM-thin mapped bytes (active volumes)": "Active LVM-thin mapped data", "Ceph RBD image allocated bytes": "Ceph RBD disk allocation"}.get(method, "Other storage measurements")
     card_data = [
-        ("Virtual machines reviewed", str(count), f"Across {len(nodes)} host servers", "Includes " + str(sum(v["template"] for v in vms)) + " saved machine templates. Only machines this account can view are included.", "machines"),
+        ("Virtual Machines reviewed", str(count), f"Across {len(nodes)} host servers", "Includes " + str(sum(v["template"] for v in vms)) + " saved machine templates. Only machines this account can view are included.", "machines"),
         ("Assigned disk space", human(totals[0]["total_bytes"]), "All disk sizes available" if totals[0]["complete_coverage"] else "Partial data; known space: " + human(totals[0]["known_subtotal_bytes"]), "Disk space made available to the machines, including space they have not filled.", "assigned"),
-        ("Measured storage used", human(totals[1]["total_bytes"]), f"{measured} of {identified} identified disks measured", "Space reported as used by VM disks. N/A means a full total is unavailable; see Storage for measured subtotals and missing disks. Guest tools are not required.", "measured"),
+        ("Measured storage used", esc(measured_total_label(totals)), f"{measured} of {identified} identified disks measured", "Space reported as used by VM disks. Partial totals include the disks successfully measured; see Storage for missing disks and separate measurement types. Guest tools are not required.", "measured"),
         ("Scheduled for backup", f"{yes} of {count}", f"{no} not selected · {unknown} unknown", "Machines selected by an active PVE backup schedule. Successful backups have not been checked.", "backups"),
     ]
     cards = ''.join('<article class="card' + (' primary' if i == 1 else '') + '"><div class="label">' + esc(label) + '</div><div class="value">' + esc(value) + '</div><span class="badge">' + esc(caption) + '</span><p>' + esc(note) + '</p>' + report_help_link(topic, "What does this mean?") + '</article>' for i, (label, value, caption, note, topic) in enumerate(card_data))
@@ -2297,7 +2425,7 @@ def html_report(report, include_scopes=True):
         review.append(f"{no} machines are not selected by the active backup schedules checked here. Confirm their backup arrangements with IT; they may have manual or other backups.")
     if unknown:
         review.append(f"Backup scheduling could not be confirmed for {unknown} machines. Ask IT to check access to the schedule settings.")
-    overview = '<p class="callout">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | ProxInfo ' + VERSION + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><div class="section-head"><div><p class="eyebrow">Summary</p><h2 tabindex="-1">Storage and backup review</h2></div></div><p class="page-intro">A virtual machine is a computer created in software and run on a physical server. This report helps you decide which machines deserve a closer look. ' + report_help_link("machines", "New to virtual machines?") + '</p><div class="cards">' + cards + '</div><div class="two-col"><section class="panel"><p class="eyebrow">Where to start</p><h2>Items to review</h2><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in review) + '</ul><p><a href="#storage">See storage measurements</a> · <a href="#machines">Review the machines</a></p><div class="callout">PBS backup storage was not measured. ' + report_help_link("pbs", "How does this relate to the full backup server?") + '</div></section><section class="panel"><p class="eyebrow">Largest first</p><h2>10 largest virtual machines</h2><p class="hint">Ranked by ' + rank_label + '. This is a starting point for review, not a recommendation to remove backups.</p><ol class="top-list">' + bars + '</ol></section></div>'
+    overview = '<p class="callout">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | ProxInfo ' + VERSION + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><div class="section-head"><div><p class="eyebrow">Summary</p><h2 tabindex="-1">Storage and backup review</h2></div></div><p class="page-intro">A virtual machine is a computer created in software and run on a physical server. This report helps you decide which machines deserve a closer look. ' + report_help_link("machines", "New to virtual machines?") + '</p><div class="cards">' + cards + '</div><div class="two-col"><section class="panel"><p class="eyebrow">Where to start</p><h2>Items to review</h2><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in review) + '</ul><p><a href="#storage">See storage measurements</a> · <a href="#machines">Review the machines</a></p><div class="callout">PBS Backup Storage was not measured. ' + report_help_link("pbs", "How does this relate to the full backup server?") + '</div></section><section class="panel"><p class="eyebrow">Largest first</p><h2>10 largest virtual machines</h2><p class="hint">Ranked by ' + rank_label + '. This is a starting point for review, not a recommendation to remove backups.</p><ol class="top-list">' + bars + '</ol></section></div>'
     gaps = []
     if diagnostic["missing_config_vmids"]:
         gaps.append(f"Disk settings could not be read for {len(diagnostic['missing_config_vmids'])} machines.")
@@ -2311,7 +2439,7 @@ def html_report(report, include_scopes=True):
         gaps.append("All identified disks have comparable usage measurements." if diagnostic["complete"] else "No complete set of supported disk usage measurements was available.")
     subtotals = ''.join('<div class="subtotal"><span>' + esc(method_label(t["metric"].removeprefix("Allocation subtotal: "))) + ' · ' + str(t["measured_volumes"]) + ' disks</span><strong>' + human(t["known_subtotal_bytes"]) + '</strong></div>' for t in totals[2:]) or '<p class="muted">No supported usage measurements were returned. This does not mean the machines use zero space.</p>'
     missing = ''.join('<article class="disk-detail"><h3>' + esc(v["name"]) + ' · VM ' + esc(v["vmid"]) + '</h3><ul class="reason-list">' + ''.join('<li>' + esc(r) + '</li>' for r in allocation_vm_reason(v)) + '</ul></article>' for v in vms if v["actual_bytes"] is None) or '<p>No machines are missing their table-level storage-used measurement.</p>'
-    storage = '<p class="eyebrow">What could be measured</p><h2 tabindex="-1">Storage measurements</h2><p class="page-intro">Assigned disk size and space actually used are different numbers. ' + report_help_link("measured", "Explain the difference") + '</p><section class="panel"><div class="section-head"><h2>' + ('The full measured total is available' if diagnostic["complete"] else 'Why the full storage-used total is N/A') + '</h2><span class="badge">' + str(measured) + ' of ' + str(identified) + ' disks</span></div><p>We show a full total only when all disks can be identified, measured and compared safely.</p><div class="coverage" role="meter" aria-label="Identified disks with a storage-used measurement" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + str(percent) + '"><span style="width:' + str(percent) + '%"></span></div><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in gaps) + '</ul>' + subtotals + '<p class="hint">These amounts cover only the disks listed for each measurement type. Do not add them to the full total again. ' + report_help_link("missing", "What does N/A mean?") + '</p><button id="show-missing" class="button" type="button">Show machines with unavailable usage</button></section><section class="panel"><h2>Machines with unavailable usage</h2><p class="hint">These are gaps in what this report could measure, not proof that a machine or its storage has failed.</p>' + missing + '</section>'
+    storage = '<p class="eyebrow">What could be measured</p><h2 tabindex="-1">Storage measurements</h2><p class="page-intro">Assigned disk size and space actually used are different numbers. ' + report_help_link("measured", "Explain the difference") + '</p><section class="panel"><div class="section-head"><h2>' + ('The full measured total is available' if diagnostic["complete"] else 'Understanding Partial Storage Totals') + '</h2><span class="badge">' + str(measured) + ' of ' + str(identified) + ' disks</span></div><p>Known measurements are included even when some disks could not be measured. Complete means all disk identities and comparable measurements were available.</p><div class="coverage" role="meter" aria-label="Identified disks with a storage-used measurement" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + str(percent) + '"><span style="width:' + str(percent) + '%"></span></div><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in gaps) + '</ul>' + subtotals + '<p class="hint">These amounts cover only the disks listed for each measurement type. Do not add them to the full total again. ' + report_help_link("missing", "What does N/A mean?") + '</p><button id="show-missing" class="button" type="button">View Missing Measurements</button></section><section class="panel"><h2>Machines with unavailable usage</h2><p class="hint">These are gaps in what this report could measure, not proof that a machine or its storage has failed.</p>' + missing + '</section>'
     headings = [("VM ID", "machines"), ("Name", "machines"), ("PVE node", "hosts"), ("Power", "power"), ("Labels", "labels"), ("Assigned disk space", "assigned"), ("Storage used", "measured"), ("RAM assigned", "memory"), ("RAM in use", "memory"), ("vCPUs assigned", "cpu"), ("Scheduled for backup", "backups"), ("VM information", None)]
     headers = ''.join('<th scope="col">' + ('<button type="button" data-col="' + str(i) + '">' + esc(label) + '</button> ' + report_help_link(topic, "?", title="Explain " + label.lower()) if topic else esc(label)) + '</th>' for i, (label, topic) in enumerate(headings))
     rows = []
@@ -2333,13 +2461,13 @@ def html_report(report, include_scopes=True):
                 content += '<small>' + report_help_link("missing", "Why unavailable?") + '</small>'
             unavailable = value is None or (index in (3, 10) and value == "Unknown")
             cells.append('<td data-partial="' + str(index == 6 and measurement_details(vm)['measurement_status'] == 'partial').lower() + '" data-value="' + esc(value) + '" data-missing="' + str(unavailable).lower() + '">' + content + '</td>')
-        cells.append('<td><details class="vm-details"><summary>View VM information</summary>' + vm_information_html(vm) + '</details></td>')
+        cells.append('<td><details class="vm-details"><summary>View VM Information</summary>' + vm_information_html(vm) + '</details></td>')
         disk_records = [dict(identity=d["identity"], capacity=str(d["capacity_bytes"]) if d["capacity_bytes"] is not None else None, used=str(d["actual_bytes"]) if d["actual_bytes"] is not None else None, method=d["actual_method"]) for d in unique_disks(vm["disks"])]
         search = ' '.join(display(vm[key]) for key in ("vmid", "name", "node", "tags")).lower()
         klass = ' class="top"' if vm["vmid"] in report["top_vmids"] else ''
         rows.append('<tr' + klass + ' data-search="' + esc(search) + '" data-node="' + esc(vm["node"]) + '" data-config-available="' + str(vm["config_available"]).lower() + '" data-disks="' + esc(json.dumps(disk_records)) + '" data-missing-allocation="' + str(vm["actual_bytes"] is None).lower() + '">' + ''.join(cells) + '</tr>')
-    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + human(totals[1]["total_bytes"]) + '</td><td id="table-ram-total">' + human(complete_sum([v['ram_bytes'] for v in vms])) + '</td><td colspan="4"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
-    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources" checked>Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="true"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">Totals update when you filter. RAM assigned includes the displayed stopped machines and templates; it is not host memory usage. RAM in use is a snapshot at collection time. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
+    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + esc(measured_total_label(totals)) + '</td><td id="table-ram-total">' + human(complete_sum([v['ram_bytes'] for v in vms])) + '</td><td colspan="4"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
+    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual Machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources" checked>Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="true"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">Totals update when you filter. RAM assigned includes the displayed stopped machines and templates; it is not host memory usage. RAM in use is a snapshot at collection time. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
     jobs = report["jobs"]
     if jobs is None:
         job_table = '<p>Backup schedule settings could not be read. Ask IT to review access to these settings.</p>'
@@ -2358,21 +2486,23 @@ def html_report(report, include_scopes=True):
     glossary = ''.join('<article id="help-' + topic + '" class="glossary-entry"><h3>' + esc(title) + '</h3><p>' + esc(body) + '</p></article>' for topic, (title, body) in REPORT_HELP.items())
     help_page = '<p class="eyebrow">Plain-language guide</p><h2 tabindex="-1">Understanding the report</h2><p class="page-intro">You do not need to know Proxmox to read this report. Use the Explain and ? links anywhere for help with a specific term.</p><section class="panel"><div class="guide-grid">' + ''.join('<article><h3>' + esc(title) + '</h3><p>' + esc(body) + '</p>' + report_help_link(topic, "Read the explanation") + '</article>' for topic, title, body in quick_guide) + '</div></section><section class="panel"><details id="glossary-details" open><summary>All definitions</summary><div class="guide-grid">' + glossary + '</div></details></section>'
     raw_summary = ''.join('<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>' for k, v in report["summary"].items())
-    technical = '<details><summary>Run details and slowest queries</summary><pre>' + esc(run_description(report)) + '</pre></details><p class="eyebrow">For the IT team</p><h2 tabindex="-1">IT reference</h2><p class="page-intro">Original metrics, collection messages and measurement limits for troubleshooting. Manager-friendly definitions are on the Help page.</p><section class="panel technical"><details><summary>All resource totals and measurement counts</summary><dl>' + raw_summary + '</dl></details><details class="subsection"><summary>Original collection messages · ' + str(len(report["warnings"])) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in report["warnings"]) or '<li>No collection messages were recorded.</li>') + '</ul></details><details class="subsection"><summary>Measurement rules and limitations</summary><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in report["limitations"]) + '</ul></details><p class="meta">PVE version: ' + esc(json.dumps(report["pve_version"])) + '<br>Collection method: ' + esc(report.get("access_mode", "local")) + '</p></section>'
+    technical = '<details><summary>Run details and slowest queries</summary><pre>' + esc(run_description(report)) + '</pre></details><p class="eyebrow">For the IT team</p><h2 tabindex="-1">IT Reference</h2><p class="page-intro">Original metrics, collection messages and measurement limits for troubleshooting. Manager-friendly definitions are on the Help page.</p><section class="panel technical"><details><summary>All resource totals and measurement counts</summary><dl>' + raw_summary + '</dl></details><details class="subsection"><summary>Original collection messages · ' + str(len(report["warnings"])) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in report["warnings"]) or '<li>No collection messages were recorded.</li>') + '</ul></details><details class="subsection"><summary>Measurement rules and limitations</summary><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in report["limitations"]) + '</ul></details><p class="meta">PVE version: ' + esc(json.dumps(report["pve_version"])) + '<br>Collection method: ' + esc(report.get("access_mode", "local")) + '</p></section>'
     if report.get("access_mode") == "demo":
         overview = '<p class="callout"><strong>Example report:</strong> all machine names and numbers on these pages are synthetic preview data.</p>' + overview
     pbs_status = report.get('pbs', {}).get('status', 'not requested')
-    overview = overview.replace('PBS backup storage was not measured.', 'PBS reporting: ' + esc(pbs_status) + '. <a href="#pbs">View backup-server information</a>.')
+    overview = overview.replace('PBS Backup Storage was not measured.', 'PBS reporting: ' + esc(pbs_status) + '. <a href="#pbs">View backup-server information</a>.')
     overview += '<section class="panel"><h2>Collection status</h2><p>Hosts below include nodes with no visible VMs. A missing storage reading is not proof of a host outage.</p>' + record_table([dict(node=h['node'], status=h.get('status'), host_read='Available' if h.get('details') is not None else 'Unavailable', storage_read='Available' if h.get('storage') is not None else 'Unavailable') for h in report.get('hosts', [])], [('node','Host'),('status','Reported state'),('host_read','Host readings'),('storage_read','Storage readings')]) + '</section>'
-    overview += '<section class="panel"><h2>Follow-up and handoff</h2><p>' + str(len(report.get('review_items', []))) + ' findings are listed for review. No changes are made automatically.</p><p><a class="button" href="#review">Open review list</a> <a class="button" href="#management">Open management summary</a></p></section>'
+    overview += '<section class="panel"><h2>Follow-up and handoff</h2><p>' + str(len(report.get('review_items', []))) + ' findings are listed for review. No changes are made automatically.</p><p><a class="button" href="#review">Open Needs Attention</a> <a class="button" href="#management">Open Management Summary</a></p></section>'
+    if not diagnostic['complete']:
+        overview += '<p><a class="button" href="#storage">View Missing Measurements</a></p>'
     storage += breakdown_page_html(report)
-    management = '<p class="eyebrow">A short handoff</p><h2 tabindex="-1">Management summary</h2><div class="print-toolbar"><a class="button" href="management-summary.html" target="_blank" rel="noopener">Open print / PDF view</a><p class="hint">The separate summary has a Print / Save as PDF button. It includes the first five findings and largest machines. Longer summaries flow across pages; select Letter or A4 in the print dialog. The full report retains all records.</p></div>' + management_body(report)
+    management = '<p class="eyebrow">A short handoff</p><h2 tabindex="-1">Management Summary</h2><div class="print-toolbar"><a class="button" href="management-summary.html" target="_blank" rel="noopener">Open Print / PDF View</a><p class="hint">The separate summary has a Print / Save As PDF button. It includes the first five findings and largest machines. Longer summaries flow across pages; select Letter or A4 in the print dialog. The full report retains all records.</p></div>' + management_body(report)
     if report.get('scope', {}).get('pbs_only'):
-        overview = '<section class="panel"><h2>PBS-only report</h2><p>PVE inventory and backup ownership matching were not requested. Open PBS backup storage for capacity, cleanup, retention, freshness and verification information.</p><a href="#pbs">Open PBS report</a></section>'
-    views = [("overview", "Summary", overview), ("review", "Review list", review_page_html(report)),
-             ("changes", "Changes", changes_html(report)), ("hosts", "PVE hosts", hosts_page_html(report)), ("downloads", "Downloads", downloads_html()), ("machines", "Virtual machines", machines), ("storage", "Storage", storage),
-             ("backups", "PVE backup jobs", backups), ("pbs", "PBS backup storage", pbs_page_html(report) if include_scopes else ""),
-             ("management", "Management summary", management), ("help", "Help", help_page), ("technical", "IT reference", technical)]
+        overview = '<section class="panel"><h2>PBS-only report</h2><p>PVE inventory and backup ownership matching were not requested. Open PBS Backup Storage for capacity, cleanup, retention, freshness and verification information.</p><a href="#pbs">Open PBS report</a></section>'
+    views = [("overview", "Summary", overview), ("review", "Needs Attention", review_page_html(report)),
+             ("hosts", "PVE Hosts", hosts_page_html(report)), ("machines", "Virtual Machines", machines), ("storage", "Storage", storage),
+             ("backups", "PVE Backup Jobs", backups), ("pbs", "PBS Backup Storage", pbs_page_html(report) if include_scopes else ""),
+             ("management", "Management Summary", management), ("downloads", "Downloads", downloads_html()), ("help", "Help", help_page), ("technical", "IT Reference", technical)]
     scope_views = {}
     if include_scopes and not report.get('scope', {}).get('pbs_only'):
         for node in nodes:
@@ -2387,10 +2517,10 @@ def html_report(report, include_scopes=True):
             rendered = html_report(selected, include_scopes=False)
             scope_views[node] = {key:content for key,content in re.findall(r'<section class="report-page" id="page-([^" ]+)" data-page="[^" ]+">(.*?)</section>(?=<section class="report-page"|<footer)', rendered, re.S) if key in ('overview','hosts','review','storage')}
     scope_data = json.dumps(scope_views).replace('<', '\\u003c')
-    scope_control = '<label class="scope-control">PVE view: <select id="global-node-filter"><option value="">All collected nodes</option>' + ''.join('<option>'+html.escape(n)+'</option>' for n in nodes) + '</select></label><p id="global-scope-note" class="hint">PVE views show all collected nodes. PBS and exported files retain their own full collected scope.</p>' if include_scopes and nodes else ''
+    scope_control = '<label class="scope-control">PVE view: <select id="global-node-filter"><option value="">All collected nodes</option>' + ''.join('<option>'+html.escape(n)+'</option>' for n in nodes) + '</select></label><p id="global-scope-note" class="hint">PVE views show all collected nodes. Management Summary, print, PBS and exported files retain their own full collected scope.</p>' if include_scopes and nodes else ''
     nav = ''.join('<a href="#' + key + '" data-page-link="' + key + '">' + label + '</a>' for key, label, _ in views if not report.get('scope',{}).get('pbs_only') or key not in ('machines','storage','backups','hosts'))
     pages = ''.join('<section class="report-page" id="page-' + key + '" data-page="' + key + '">' + content + '</section>' for key, _, content in views)
-    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Environment overview</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + scope_control + pages + '<script type="application/json" id="node-view-data">' + scope_data + '</script><footer class="footer"><span>ProxInfo · report layout 4</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Environment overview</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark Mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + scope_control + pages + '<script type="application/json" id="node-view-data">' + scope_data + '</script><footer class="footer"><span>ProxInfo · report layout 4</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
 
 
 def run_description(report):
@@ -2480,7 +2610,7 @@ def redact_diagnostics(value, secrets=()):
         value = value.replace(secret, '[REDACTED]')
     value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[REDACTED KEY]', value, flags=re.S)
     value = re.sub(r'(?i)(?:PVEAPIToken|PBSAPIToken)=[^\s\"\'<>]+', '[REDACTED TOKEN]', value)
-    value = re.sub(r'(?i)(authorization\s*[:=]\s*)[^\r\n]+', r'\1[REDACTED]', value)
+    value = re.sub(r'(?i)((?:authorization|cookie|PBSAuthCookie|CSRFPreventionToken|ticket|tfa-challenge)\s*[:=]\s*)[^\r\n]+', r'\1[REDACTED]', value)
     value = re.sub(r'(?i)((?:password|token_secret|secret)\s*[:=]\s*)[^\s,;]+', r'\1[REDACTED]', value)
     return re.sub(r'(https?://)[^/\s@]+@', r'\1[REDACTED]@', value)
 
@@ -2571,6 +2701,14 @@ def main(argv=None):
     parser.add_argument("--pbs-fresh-hours", type=float, help="Optional backup age expectation in hours")
     parser.add_argument("--pbs-history", action="store_true", help="Save local capacity history under --output-root")
     parser.add_argument("--pbs-url", help="PBS HTTPS URL; credentials use PBS_TOKEN_ID / PBS_TOKEN_SECRET")
+    parser.add_argument('--pbs-auth', choices=('token', 'password', 'ssh'), help='PBS sign-in method; PBS remains optional')
+    parser.add_argument('--pbs-ssh-host', help='PBS SSH hostname, IP or configured alias')
+    parser.add_argument('--pbs-ssh-user', help='PBS system account for SSH')
+    parser.add_argument('--pbs-ssh-key', help='Local PBS SSH private key path')
+    parser.add_argument('--pbs-ssh-auth', choices=('password', 'key', 'auto'), help='PBS SSH authentication method')
+    parser.add_argument('--pbs-ssh-port', type=int, help='Override PBS SSH port; otherwise honor SSH configuration')
+    parser.add_argument('--pbs-ca-file', help='Trusted PBS CA certificate for HTTPS')
+    parser.add_argument('--pbs-username', help='PBS web account including realm (password is prompted or supplied separately)')
     parser.add_argument("--pbs-store", action="append", help="Only inspect this PBS datastore (repeat for more); default all visible")
     parser.add_argument("--large-vm-gib", type=float, default=500, help="Assigned-size review threshold in GiB (default 500)")
     parser.add_argument("--pbs-warning-percent", type=float, default=90, help="PBS filesystem capacity review threshold (default 90 percent)")
@@ -2668,7 +2806,14 @@ def main(argv=None):
         try:
             pbs_config = None if tracker.cancelled or tracker.expired else pbs_settings(args, config)
             if pbs_config is not None:
-                report["pbs"] = PBSCollector(ObservedClient(PBSClient(**pbs_config), tracker), args.pbs_store, args.pbs_namespace, args.pbs_task_days, args.pbs_task_limit, args.pbs_fresh_hours).collect()
+                pbs_client = PBSClient(**pbs_config)
+                try:
+                    report["pbs"] = PBSCollector(ObservedClient(pbs_client, tracker), args.pbs_store, args.pbs_namespace, args.pbs_task_days, args.pbs_task_limit, args.pbs_fresh_hours).collect()
+                    if getattr(pbs_client, 'ssh', None):
+                        pbs_location_details(report, config, args, tracker, existing=pbs_client.ssh)
+                finally:
+                    if hasattr(pbs_client, 'close'):
+                        pbs_client.close()
         except (ReadError, OSError, ValueError, TypeError, EOFError) as exc:
             report["pbs"] = dict(requested=True, status="unavailable", datastores=[], groups=[], snapshots=[],
                                  warnings=["PBS reporting could not be completed: " + str(exc)[:600]])
@@ -2723,7 +2868,8 @@ def main(argv=None):
                 report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
                 report['run']['status'] = 'finished with history unavailable'
         if not tracker.cancelled and not tracker.expired:
-            pbs_location_details(report, config, args, tracker)
+            if (pbs_config or {}).get('auth') != 'ssh':
+                pbs_location_details(report, config, args, tracker)
         report['changes'] = compare_inventory(report, args.previous_report)
         report['restore_tests'] = []
         if args.restore_tests:

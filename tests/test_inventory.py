@@ -245,7 +245,7 @@ class ExportAndTransportTests(unittest.TestCase):
             self.assertIn('id="help-' + topic + '"', markup)
         self.assertIn('id="explanation-dialog"', markup)
         details = inv.vm_information_html(report["vms"][0])
-        for title in ("Disks and storage", "Space inside the VM", "Backup schedules", "Data availability", "IT reference for this VM"):
+        for title in ("Disks and storage", "Space inside the VM", "Backup schedules", "Data availability", "IT Reference for this VM"):
             self.assertIn('<summary>' + title + '</summary>', details)
         self.assertNotIn("Disks, filesystems, reasons", markup)
 
@@ -256,7 +256,7 @@ class ExportAndTransportTests(unittest.TestCase):
         inv.sort_report(report, "configured")
         markup = inv.html_report(report)
         self.assertIn('<td id="table-assigned-total">150.00 GiB</td>', markup)
-        self.assertIn('<td id="table-used-total">20.00 GiB</td>', markup)
+        self.assertIn('<td id="table-used-total">20.00 GiB · Complete</td>', markup)
         records = [json.loads(html.unescape(m)) for m in re.findall(r'data-disks="([^"]+)"', markup)]
         self.assertEqual(len(records[0]), 2)  # repeated attachment is not counted twice
         self.assertEqual(records[0][0]["identity"], records[1][0]["identity"])

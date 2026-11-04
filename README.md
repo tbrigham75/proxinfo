@@ -1,5 +1,90 @@
 # ProxInfo environment inventory
 
+## PBS sign-in and measured totals
+
+Run manually from WSL/Ubuntu using `python3 pve_inventory.py --ssh --pbs`.
+The PBS connection question comes before PBS credentials: choose `password`
+for a PBS web account, `token` for an API token, or `ssh` for system login.
+SSH then offers password, key, or configured authentication. PBS stays off
+unless requested; complete existing token configurations continue to work.
+
+Web-account example:
+
+```bash
+python3 pve_inventory.py --pbs-only --pbs-auth password --pbs-url https://pbs.example:8007
+```
+
+Enter the account including its realm, such as `inventory@pbs`. Password entry
+is hidden. Supply a trusted CA with `PBS_CA_FILE` or `pbs_ca_file` in your config
+if your computer does not trust the PBS certificate. TLS verification stays on.
+Interactive TOTP challenges are supported; browser/security-key sign-in requires
+an API token instead. Sessions renew after an hour; rejected sessions are reported
+without repeated password prompts. No password or ticket is saved to a report.
+
+SSH example:
+
+```bash
+python3 pve_inventory.py --pbs-only --pbs-auth ssh
+```
+
+Python and output files stay on your machine. PBS must already have
+`proxmox-backup-debug`; the script runs only approved `api get` queries and
+optional `findmnt` reads. Use root or an administrator-configured restricted sudo
+policy (`pbs_ssh_sudo: true`). A PBS web account alone does not grant SSH access.
+The program does not install tools or change sudo permissions. API password and
+token users need the audit permissions documented below; they do not need root.
+
+For scheduled SSH collection, place these non-secret settings in a JSON file:
+
+```json
+{
+  "pbs_auth": "ssh",
+  "pbs_url": "https://192.0.2.40:8007",
+  "pbs_ssh_host": "192.0.2.40",
+  "pbs_ssh_user": "root",
+  "pbs_ssh_auth": "key",
+  "pbs_ssh_key": "/root/.ssh/id_ed25519"
+}
+```
+
+```bash
+python3 pve_inventory.py --cron --pbs-only --config /root/proxinfo.json --output-root /root/pve-report
+```
+
+Establish SSH host trust beforehand. Cron never prompts. SSH password mode is
+rejected for unattended runs. API tokens are also suitable for cron. HTTPS
+password credentials may be supplied through `PBS_USERNAME`/`PBS_PASSWORD` or
+protected config keys `pbs_username`/`pbs_password`, but interactive MFA cannot
+run in cron. Do not put secrets in command arguments or commit credential files.
+
+PBS settings also accept environment variables: `PBS_AUTH`, `PBS_URL`,
+`PBS_SSH_HOST`, `PBS_SSH_USER`, `PBS_SSH_KEY`, `PBS_SSH_AUTH`, `PBS_SSH_PORT`,
+`PBS_CA_FILE`, and the existing `PBS_TOKEN_ID`/`PBS_TOKEN_SECRET`. SSH port uses
+your SSH configuration or port 22; there is no port prompt. Set `pbs_url` to the
+same server identity when switching transports to retain matching/history scope;
+aliases are not automatically assumed to identify the same server.
+
+Summary, Management Summary, and the Virtual Machines footer now show known
+measured amounts with **Complete** or **Partial** status. Unreadable disks do not
+hide measurements from other disks. Shared disk identities count once; conflicting
+observations are excluded. Incompatible measurement types have separate numeric
+subtotals. A measured zero is valid; no readings is not zero. Complete-total JSON
+fields keep their original meaning, with known subtotal fields for partial data.
+
+Summary follows the node selection; the VM footer follows its node/search filters.
+Management Summary, print, and downloaded files cover the full collected scope.
+Compare totals at the same scope. Assigned capacity, storage allocation, guest
+filesystem usage, and PBS usage remain distinct.
+
+Navigation is now Summary, Needs Attention, PVE Hosts, Virtual Machines, Storage,
+PVE Backup Jobs, PBS Backup Storage, Management Summary, Downloads, Help, IT Reference.
+The Changes web page was removed; optional `--previous-report` comparison exports
+remain supported. Buttons use capitalized words while preserving acronyms.
+
+Before relying on a new PBS connection in production, run one datastore manually,
+compare capacity and visible backup counts with PBS, then test the same settings
+with `--no-prompt`. Automated tests use simulated servers, not your live PBS.
+
 ## Environment overview additions (1.4.0)
 
 Run the updated script normally; no new options are required for the VM table, host overview or downloads:
@@ -12,7 +97,7 @@ RAM assigned, RAM in use and assigned vCPUs are visible by default. RAM usage is
 
 **PVE view** selects a node across Summary, PVE hosts, Virtual machines, Storage and Review list. Search and missing-usage filters continue to affect the VM table. PBS, backup-job definitions and downloadable files retain their full collected scope, as indicated on screen. VM information opens in a separate panel so it does not widen table rows. Shared storage references remain deduplicated within the selected view.
 
-**PVE hosts** shows host status, discovered IP, PVE version, uptime, CPU details, physical memory and storage-location capacity. New GET reads are `/cluster/status`, `/nodes/N/status` and `/nodes/N/storage`; node audit and storage audit visibility are needed. Offline hosts are retained without querying their status/storage. Regular standalone CLI mode currently leaves this added host-detail page unavailable; the original VM inventory remains usable. Storage capacities can overlap across locations and hosts and are never summed into a claimed physical cluster total.
+**PVE Hosts** shows host status, discovered IP, PVE version, uptime, CPU details, physical memory and storage-location capacity. New GET reads are `/cluster/status`, `/nodes/N/status` and `/nodes/N/storage`; node audit and storage audit visibility are needed. Offline hosts are retained without querying their status/storage. Regular standalone CLI mode currently leaves this added host-detail page unavailable; the original VM inventory remains usable. Storage capacities can overlap across locations and hosts and are never summed into a claimed physical cluster total.
 
 **Downloads** links to existing CSV/JSON/print files plus `hosts.csv` and `changes.csv`. Keep the exported files together. Collection status summarizes which host and storage reads returned data; that is not an overall infrastructure health certification.
 
@@ -125,13 +210,13 @@ From WSL, open the output folder in Windows Explorer:
 explorer.exe ./pve-report
 ```
 
-Double-click `inventory.html`. The top navigation switches between **Summary**, **Review list**, **Changes**, **PVE hosts**, **Downloads**, **Virtual machines**, **Storage**, **PVE backup jobs**, **PBS backup storage**, **Management summary**, **Help**, and **IT reference**. Each is its own report view. The main report remains one offline HTML file; the printable management summary is also exported separately. No web server or external assets are required. A link ending in `#machines`, for example, opens the Virtual machines view directly.
+Double-click `inventory.html`. The top navigation switches between **Summary**, **Needs Attention**, **PVE Hosts**, **Downloads**, **Virtual Machines**, **Storage**, **PVE backup jobs**, **PBS backup storage**, **Management Summary**, **Help**, and **IT reference**. Each is its own report view. The main report remains one offline HTML file; the printable management summary is also exported separately. No web server or external assets are required. A link ending in `#machines`, for example, opens the Virtual machines view directly.
 
 The **Summary** uses plain-language cards: machines reviewed, assigned disk space, measured storage used and machines scheduled for backup. **Explain**, **What does this mean?**, and **?** links open readable explanations without leaving your place. Use **Help** for a short guide and all definitions. Original collection errors, measurement rules and technical totals are kept in **IT reference** for the IT team.
 
-In **Virtual machines**, search by name, ID, host server or label. Filter by host server or show only machines whose usage could not be measured. **Power** shows On, Off or Unknown. Click column headings to sort, or their **?** links for definitions. RAM and CPU columns are shown by default. Uncheck **Show memory & CPUs** for a narrower view.
+In **Virtual Machines**, search by name, ID, host server or label. Filter by host server or show only machines whose usage could not be measured. **Power** shows On, Off or Unknown. Click column headings to sort, or their **?** links for definitions. RAM and CPU columns are shown by default. Uncheck **Show memory & CPUs** for a narrower view.
 
-The storage-total row **below the VM rows** updates for the machines currently shown. It keeps **assigned disk space** separate from **storage used**, counts a shared disk ID once, and leaves an incomplete or incompatible full total as **N/A**. Known partial amounts and an explanation are shown when available. Filtering can therefore give a complete total for a readable subset even when the whole report has missing data. These are VM disk totals, not PBS backup usage; shared data and other storage overhead prevent treating them as a unique physical-storage footprint.
+The storage-total row **below the VM rows** updates for the machines currently shown. It keeps **assigned disk space** separate from **storage used**, counts a shared disk ID once, and shows known measured amounts with coverage, separating incompatible measurement types. Known partial amounts and an explanation are shown when available. Filtering can therefore give a complete total for a readable subset even when the whole report has missing data. These are VM disk totals, not PBS backup usage; shared data and other storage overhead prevent treating them as a unique physical-storage footprint.
 
 Open **View VM information** for separate sections: **Disks and storage**, **Space inside the VM**, **Backup schedules**, **Memory and processing**, **Data availability**, and **IT reference for this VM**. Data-collection problems are explained separately from the disk and drive information. **N/A · why?** in the Storage used column gives a specific explanation, and **Storage measurements** explains why a full total may be unavailable.
 
@@ -356,7 +441,7 @@ Environment variables override corresponding JSON fields (`url`, `token_id`, `to
 
 ## Review list, storage breakdowns and management handoff
 
-**Review list** contains findings with the machine/datastore, evidence and a suggested follow-up. The rules flag large assigned disk space, large machines currently off, disks marked `backup=0`, no enabled PVE backup job, unreadable settings, incomplete measurements, PBS capacity at the review threshold and reported prune/GC failures. An off machine is not assumed unused. A missing PVE job is not proof that no backups exist. These are review prompts; nothing is excluded, changed or deleted.
+**Needs Attention** contains findings with the machine/datastore, evidence and a suggested follow-up. The rules flag large assigned disk space, large machines currently off, disks marked `backup=0`, no enabled PVE backup job, unreadable settings, incomplete measurements, PBS capacity at the review threshold and reported prune/GC failures. An off machine is not assumed unused. A missing PVE job is not proof that no backups exist. These are review prompts; nothing is excluded, changed or deleted.
 
 Defaults are **500 GiB** assigned space for a large machine and **90%** used filesystem capacity for a PBS capacity review. Override them explicitly:
 
@@ -366,7 +451,7 @@ python3 pve_inventory.py --large-vm-gib 750 --pbs-warning-percent 85
 
 On **Storage**, the host breakdown counts **local disks on each host**, then lists **shared disks in a separate cluster-wide row**. The storage-location breakdown separates identically named local storage on different hosts, while counting a shared volume ID once. Machine counts may repeat when a VM has disks in several locations. These are attached-disk totals, not pool capacities. Missing settings prevent a full total; known subtotals remain labeled. Do not add the host table to the location table: they are two views of the same disks.
 
-**Management summary** gives a short handoff with key totals, up to five findings, five largest machines, and up to three PBS datastore capacity entries. Open **Print / PDF view**, or open `management-summary.html` directly, then use **Print / Save as PDF** in that file. The summary flows across pages as needed. Choose Letter or A4 in your browser print dialog; table headings repeat and rows stay together where possible. All findings, machines and stores remain in the full report and CSV files. Keep `management-summary.html` beside `inventory.html` to use its link back to the full report.
+**Management Summary** gives a short handoff with key totals, up to five findings, five largest machines, and up to three PBS datastore capacity entries. Open **Print / PDF view**, or open `management-summary.html` directly, then use **Print / Save as PDF** in that file. The summary flows across pages as needed. Choose Letter or A4 in your browser print dialog; table headings repeat and rows stay together where possible. All findings, machines and stores remain in the full report and CSV files. Keep `management-summary.html` beside `inventory.html` to use its link back to the full report.
 
 Additional exports:
 
