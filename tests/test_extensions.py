@@ -19,6 +19,7 @@ class FakePBS:
         base = '/admin/datastore/store'
         self.data = {
             '/version': {'version': '4.0'}, '/admin/datastore': [{'store': 'store'}],
+            '/config/verify': [], '/admin/verify': [],
             '/config/prune': [{'id': 'daily', 'store': 'store', 'schedule': 'daily', 'keep-last': 7}],
             '/admin/prune': [{'id': 'daily', 'store': 'store', 'last-run-state': 'error: test failure', 'last-run-endtime': 300}],
             '/config/datastore/store': {'name': 'store', 'gc-schedule': 'daily', 'keep-last': 10, 'path': '/not/exported'},
@@ -168,7 +169,7 @@ class PBSReportingTests(unittest.TestCase):
                     client.get(path)
 
     def test_failed_pbs_does_not_prevent_pve_report(self):
-        with tempfile.TemporaryDirectory() as tmp, patch('pve_inventory.Client', return_value=FakeClient()), \
+        with tempfile.TemporaryDirectory() as tmp, patch('pve_inventory.Client', return_value=FakeClient()), patch('pve_inventory.shutil.which', return_value='pvesh'), \
              patch('pve_inventory.PBSClient', side_effect=inv.ReadError('PBS unavailable')), \
              patch('sys.stdout', new=io.StringIO()), patch('sys.stderr', new=io.StringIO()):
             code = inv.main(['--mode', 'local', '--environment', 'cluster', '--pbs', '--no-prompt', '--output-dir', tmp])

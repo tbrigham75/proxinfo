@@ -495,7 +495,7 @@ class SSHTests(unittest.TestCase):
     def test_connection_prompts_and_unattended_credentials(self):
         args = SimpleNamespace(no_prompt=False, ssh_host=None, ssh_user=None, ssh_port=None,
                                ssh_key=None, timeout=20, ssh_auth_timeout=120, ssh_sudo=False)
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["pve", "", "2222", ""]):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["", "pve", "", "2222"]):
             settings = inv.ssh_settings(args, lambda name: None)
         self.assertEqual(settings["host"], "pve")
         self.assertEqual(settings["user"], "root")
@@ -592,7 +592,7 @@ class StandaloneAndPromptTests(unittest.TestCase):
 
     def test_main_writes_reports_when_actual_sort_falls_back(self):
         client = FakeClient({"/nodes/b/qemu/101/config": inv.ReadError("unreachable")})
-        with tempfile.TemporaryDirectory() as tmp, patch("pve_inventory.Client", return_value=client), \
+        with tempfile.TemporaryDirectory() as tmp, patch("pve_inventory.Client", return_value=client), patch("pve_inventory.shutil.which", return_value="pvesh"), \
              patch("pve_inventory.detect_environment", return_value=None), \
              patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
             code = inv.main(["--mode", "local", "--environment", "cluster", "--no-prompt",

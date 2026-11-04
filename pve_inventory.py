@@ -17,8 +17,170 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import threading
+import uuid
+import sqlite3
+from contextlib import closing
+from collections import Counter
 from datetime import datetime, timezone
 from urllib import error, parse, request
+
+
+VERSION = "1.3.0"
+
+
+class CronBusy(Exception):
+    pass
+
+
+class CronLock:
+    """Kernel releases the lock on process exit; the lock file is never unlinked."""
+    def __init__(self, path):
+        try:
+            import fcntl
+        except ImportError:
+            raise ValueError("Cron mode requires Linux/POSIX; use WSL instead of native Windows") from None
+        self.fcntl = fcntl
+        self.stream = os.fdopen(os.open(path, os.O_CREAT | os.O_RDWR, 0o600), "a+")
+        try:
+            fcntl.flock(self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.stream.close()
+            raise CronBusy("Another run is active for this output root; skipped") from None
+        except BaseException:
+            self.stream.close()
+            raise
+
+    def close(self):
+        self.stream.close()
+
+
+def atomic_text(path, text):
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(text)
+        except BaseException:
+            stream.close()
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+class RunTracker:
+    """Local observations only; heartbeat never issues a remote request."""
+    def __init__(self, directory, progress="auto", max_runtime=None):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.run_id = uuid.uuid4().hex
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.started = time.monotonic()
+        self.progress = progress
+        self.max_runtime = max_runtime
+        self.cancelled = False
+        self.expired = False
+        self.queries = []
+        self.log = (self.directory / "collection.log").open("x", encoding="utf-8")
+        self.stream = (self.directory / "query_timings.csv").open("x", newline="", encoding="utf-8-sig")
+        self.writer = csv.DictWriter(self.stream, fieldnames=["run_id", "operation", "started_at", "elapsed_seconds", "outcome"])
+        self.writer.writeheader()
+        self.stream.flush()
+        self.message("ProxInfo " + VERSION + " | run " + self.run_id)
+
+    def message(self, text):
+        text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", str(text))
+        self.log.write(datetime.now(timezone.utc).isoformat() + " " + text + "\n")
+        self.log.flush()
+        if self.progress != "off":
+            print(text, file=sys.stderr, flush=True)
+
+    def query(self, operation, call, timeout=None):
+        if self.max_runtime is not None and time.monotonic() - self.started >= self.max_runtime:
+            self.expired = True
+        if self.cancelled or self.expired:
+            raise ReadError("Not queried: collection cancelled or overall time limit reached")
+        start = time.monotonic()
+        stamp = datetime.now(timezone.utc).isoformat()
+        stop = threading.Event()
+        self.message("Reading " + operation + (f" | timeout {timeout:g}s" if timeout is not None else ""))
+        def heartbeat():
+            while not stop.wait(5):
+                self.message(f"Waiting: {operation} | {time.monotonic()-start:.0f}s elapsed" + (f" | timeout {timeout:g}s" if timeout is not None else ""))
+        worker = threading.Thread(target=heartbeat, daemon=True)
+        worker.start()
+        outcome = "success"
+        try:
+            return call()
+        except KeyboardInterrupt:
+            self.cancelled = True
+            outcome = "cancelled"
+            raise ReadError("Cancelled during query; remaining measurements were not requested") from None
+        except Exception as exc:
+            reason = str(exc).lower()
+            outcome = ("timeout" if "timeout" in reason or "timed out" in reason else
+                       "access denied" if "403" in reason or "permission denied" in reason else "failed")
+            raise
+        finally:
+            stop.set()
+            worker.join()
+            row = dict(run_id=self.run_id, operation=operation, started_at=stamp,
+                       elapsed_seconds=round(time.monotonic()-start, 3), outcome=outcome)
+            self.queries.append(row)
+            self.writer.writerow({k: csv_cell(v) for k,v in row.items()})
+            self.stream.flush()
+            self.message(f"{outcome}: {operation} | {row['elapsed_seconds']}s")
+
+    def metadata(self):
+        groups = Counter()
+        for query in self.queries:
+            if query['outcome'] != 'success':
+                node = re.search(r"/nodes/([^/]+)", query['operation'])
+                storage = re.search(r"/storage/([^/]+)", query['operation'])
+                groups[(node[1] if node else 'general') + '/' + (storage[1] if storage else 'general') + ': ' + query['outcome']] += 1
+        return dict(failures_by_node_storage=dict(groups), version=VERSION, run_id=self.run_id, started_at=self.started_at,
+                    finished_at=datetime.now(timezone.utc).isoformat(), elapsed_seconds=round(time.monotonic()-self.started, 3),
+                    cancelled=self.cancelled, time_limit_reached=self.expired,
+                    query_outcomes=dict(Counter(q['outcome'] for q in self.queries)),
+                    slowest_queries=sorted(self.queries, key=lambda q:q['elapsed_seconds'], reverse=True)[:10])
+
+    def close(self):
+        self.log.close()
+        self.stream.close()
+
+
+class ObservedClient:
+    def __init__(self, client, tracker):
+        object.__setattr__(self, "client", client)
+        object.__setattr__(self, "tracker", tracker)
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.client, name, value)
+
+    def observed(self, name, call):
+        clients = [self.client] + ([self.client.pvesh] if hasattr(self.client, "pvesh") else [])
+        previous = [(c,c.timeout) for c in clients if hasattr(c,"timeout")]
+        if self.tracker.max_runtime is not None:
+            remaining = max(0.01, self.tracker.max_runtime - (time.monotonic()-self.tracker.started))
+            for c, timeout in previous:
+                c.timeout = min(timeout, remaining)
+        try:
+            return self.tracker.query(name, call, getattr(self.client, "timeout", None))
+        finally:
+            for c, timeout in previous:
+                c.timeout = timeout
+
+    def get(self, path, **params):
+        return self.observed("GET " + path, lambda: self.client.get(path, **params))
+
+    def thin_status(self, node):
+        return self.observed("LVM-thin counters on " + node, lambda: self.client.thin_status(node))
 
 
 NA = "N/A"
@@ -296,15 +458,15 @@ def ssh_settings(args, setting):
     identity = args.ssh_key or setting("ssh_key")
     authentication = getattr(args, "ssh_auth", None) or setting("ssh_auth") or ("key" if identity else "auto")
     if interactive:
+        if authentication == "auto":
+            print("Choose how to sign in. Password uses your PVE SSH account password; key uses an existing SSH key file.", file=sys.stderr)
+            authentication = prompt_choice("SSH sign-in method", ("password", "key", "auto"), "password")
         if not host:
             host = input("PVE SSH hostname or IP address: ").strip()
         if not args.ssh_user and not setting("ssh_user"):
             user = input(f"SSH username [{user}]: ").strip() or user
         if not port:
             port = input("SSH port [SSH config default, normally 22]: ").strip() or None
-        if authentication == "auto":
-            print("Choose how to sign in. Password uses your PVE SSH account password; key uses an existing SSH key file.", file=sys.stderr)
-            authentication = prompt_choice("SSH sign-in method", ("password", "key", "auto"), "password")
         if authentication == "key" and not identity:
             identity = input("SSH key file on this computer [Enter to use your existing default SSH keys]: ").strip() or None
         if authentication == "password":
@@ -349,7 +511,7 @@ class PBSClient:
 
     def get(self, path, **params):
         paths = (r"/version", r"/admin/datastore", r"/config/datastore/[^/]+", r"/config/prune",
-                 r"/admin/prune", r"/nodes/localhost/tasks",
+                 r"/admin/prune", r"/config/verify", r"/admin/verify", r"/nodes/localhost/tasks",
                  r"/admin/datastore/[^/]+/(?:status|namespace|groups|snapshots|gc)")
         if not any(re.fullmatch(pattern, path) for pattern in paths):
             raise ValueError("Not an approved PBS inventory GET path: " + path)
@@ -379,7 +541,7 @@ def pbs_settings(args, config):
     if not requested:
         return None
     values = dict(url=args.pbs_url or setting("url"), token_id=setting("token_id"),
-                  token_secret=setting("token_secret"), ca_file=setting("ca_file"), timeout=args.timeout)
+                  token_secret=setting("token_secret"), ca_file=setting("ca_file"), timeout=getattr(args, "pbs_timeout", 60))
     if interactive:
         print("PBS is a separate backup server. Use a read-only API token created in its web interface; no backups will be changed.", file=sys.stderr)
         if not values["url"]:
@@ -394,9 +556,68 @@ def pbs_settings(args, config):
     return values
 
 
+def verification_state(value):
+    if not isinstance(value, dict):
+        return "unavailable"
+    state = value.get('state')
+    return {'ok': 'passed', 'failed': 'failed', 'none': 'not verified'}.get(state, 'unavailable')
+
+
+def pbs_relationships(report, instance, overrides):
+    pbs=report['pbs']
+    hostname=parse.urlsplit(instance).hostname
+    destinations=[d for d in report.get('pbs_destinations',[]) if d.get('server')==hostname]
+    vmids={str(v['vmid']):v for v in report['vms']}
+    for group in pbs['groups']:
+        group['matching_pve']='PVE matching not requested' if report.get('scope',{}).get('pbs_only') else 'No confirmed match in this PVE inventory'
+        for rule in overrides:
+            if not isinstance(rule,dict) or not isinstance(rule.get('hours'),(float,int)) or not 0 < rule['hours'] < float('inf'):
+                raise ValueError('pbs_freshness_overrides entries need positive finite hours')
+            if all(rule.get(k,group[k])==group[k] for k in ('store','namespace','backup_type','backup_id')):
+                group['freshness']='unavailable' if group['age_hours'] is None else 'older than expected' if group['age_hours']>rule['hours'] else 'within expectation'
+        if group['backup_type']=='vm' and group['backup_id'] in vmids and any(d['datastore']==group['store'] and (d.get('namespace') or '')==group['namespace'] for d in destinations):
+            group['matching_pve']='Destination and VM ID match current inventory; cluster ownership remains unconfirmed'
+        group['review_reasons']=[]
+        if group['freshness']=='older than expected':
+            group['review_reasons'].append('Latest visible backup is older than the configured expectation')
+        if group['verification_state']=='failed':
+            group['review_reasons'].append('Latest snapshot has a recorded verification failure')
+    pbs['backup_coverage']=[]
+    jobs={str(j['id']):j for j in report.get('jobs') or []}
+    for vm in report['vms']:
+        for jobid in vm['enabled_jobs']:
+            job=jobs.get(jobid,{})
+            for dest in destinations:
+                if job.get('storage') != dest['storage']:
+                    continue
+                store=next((d for d in pbs['datastores'] if d['store']==dest['datastore']),None)
+                namespace=dest.get('namespace') or ''
+                checked=bool(store and store['inventory_complete'] and namespace in store['namespaces'])
+                found=any(g['store']==dest['datastore'] and g['namespace']==namespace and g['backup_type']=='vm' and g['backup_id']==str(vm['vmid']) for g in pbs['groups'])
+                pbs['backup_coverage'].append(dict(vmid=vm['vmid'], job=jobid, datastore=dest['datastore'], namespace=namespace,
+                    status='Matching group visible; ownership unconfirmed' if found else 'No matching group visible in checked namespace; permissions may hide backups' if checked else 'Destination coverage unavailable'))
+
+
+def pbs_history(report, root, instance):
+    root.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(root / 'pbs-history.sqlite3', timeout=10)) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS readings (run TEXT, scope TEXT, stamp TEXT, used INTEGER, available INTEGER, PRIMARY KEY(run,scope))')
+        for store in report['pbs']['datastores']:
+            scope = json.dumps([instance,store['store'],store.get('backend_type'),store.get('backing_scope'),store['total_bytes']])
+            if store['used_bytes'] is not None and store['available_bytes'] is not None:
+                db.execute('INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?)', (report['run']['run_id'],scope,report['generated_at'],store['used_bytes'],store['available_bytes']))
+            rows = db.execute('SELECT stamp,used,available FROM readings WHERE scope=? ORDER BY stamp DESC LIMIT 90',(scope,)).fetchall()[::-1]
+            store['capacity_history'] = [dict(time=r[0],used_bytes=r[1],available_bytes=r[2]) for r in rows]
+            store['change_since_previous_bytes'] = rows[-1][1]-rows[-2][1] if len(rows)>1 and rows[-1][0]==report['generated_at'] else None
+
+        db.commit()
+
 class PBSCollector:
-    def __init__(self, client, stores=None):
+    def __init__(self, client, stores=None, namespaces=None, task_days=14, task_limit=1000, fresh_hours=None):
         self.client, self.stores, self.warnings = client, stores, []
+        self.selected_namespaces = namespaces
+        self.task_days, self.task_limit, self.fresh_hours = task_days, task_limit, fresh_hours
+        self.checks = []
 
     def read(self, path, expected=None, **params):
         try:
@@ -405,8 +626,13 @@ class PBSCollector:
                 raise ReadError("Unexpected response format")
             if expected is list and any(not isinstance(item, dict) for item in result):
                 raise ReadError("Unexpected non-object record in PBS response")
+            self.checks.append(dict(path=path, status="available"))
             return result
         except ReadError as exc:
+            detail = str(exc)
+            state = ("permission denied" if "403" in detail else "authentication failed" if "401" in detail else
+                     "unsupported or unavailable endpoint" if "404" in detail else "timed out" if "timed out" in detail or "timeout" in detail.lower() else "unavailable")
+            self.checks.append(dict(path=path, status=state))
             self.warnings.append(f"GET {path}: {exc}")
             return None
 
@@ -415,6 +641,8 @@ class PBSCollector:
         visible = self.read("/admin/datastore", list)
         prune_config = self.read("/config/prune", list)
         prune_status = self.read("/admin/prune", list)
+        verify_config = self.read("/config/verify", list)
+        verify_status = self.read("/admin/verify", list)
         names = self.stores if self.stores else [s["store"] for s in visible or [] if isinstance(s, dict) and s.get("store")]
         results, all_groups, all_snapshots = [], [], []
         for store in dict.fromkeys(names):
@@ -423,7 +651,19 @@ class PBSCollector:
             capacity = self.read(base + "/status", dict)
             config = self.read("/config/datastore/" + segment(store), dict)
             gc = self.read(base + "/gc", dict)
-            tasks = self.read("/nodes/localhost/tasks", list, store=store, limit=50)
+            tasks, task_complete = [], False
+            since = int(time.time() - self.task_days * 86400)
+            while len(tasks) < self.task_limit:
+                batch = self.read("/nodes/localhost/tasks", list, store=store, start=len(tasks), limit=min(100, self.task_limit-len(tasks)), since=since)
+                if batch is None:
+                    break
+                remaining = min(100, self.task_limit-len(tasks))
+                tasks.extend(batch[:remaining])
+                if len(batch) < remaining:
+                    task_complete = True
+                    break
+            if not task_complete:
+                self.warnings.append(f"PBS {store}: task history limited or unavailable; no absence-of-cleanup conclusion is possible")
             namespaces = self.read(base + "/namespace", list, **{"max-depth": 7})
             scope = {""}
             for ns in namespaces or []:
@@ -435,6 +675,11 @@ class PBSCollector:
             if namespaces is not None and any(not isinstance(ns.get("ns"), str) for ns in namespaces):
                 inventory_complete = False
                 self.warnings.append(f"PBS {store}: unrecognized namespace records; inventory scope is incomplete")
+            if self.selected_namespaces is not None:
+                requested = {"" if n == "/" else n for n in self.selected_namespaces}
+                for missing in requested - scope:
+                    self.warnings.append(f"PBS {store}: namespace {missing or '/'} not visible")
+                scope &= requested
             for ns in sorted(scope):
                 params = {"ns": ns} if ns else {}
                 groups = self.read(base + "/groups", list, **params)
@@ -449,15 +694,15 @@ class PBSCollector:
                         inventory_complete = False
                         continue
                     key = (str(snap["backup-type"]), str(snap["backup-id"]))
-                    time = number(snap.get("backup-time"))
-                    if time is None:
+                    snapshot_time = number(snap.get("backup-time"))
+                    if snapshot_time is None:
                         inventory_complete = False
                         continue
                     normalized = dict(store=store, namespace=ns, backup_type=key[0], backup_id=key[1],
-                                      backup_time=time, logical_bytes=number(snap.get("size")),
+                                      backup_time=snapshot_time, logical_bytes=number(snap.get("size")),
                                       protected=snap.get("protected"), verification=snap.get("verification"))
-                    if time not in snap_map.setdefault(key, {}):
-                        snap_map[key][time] = normalized
+                    if snapshot_time not in snap_map.setdefault(key, {}):
+                        snap_map[key][snapshot_time] = normalized
                         all_snapshots.append(normalized)
                         snapshot_count += 1
                 group_map = {(str(g["backup-type"]), str(g["backup-id"])): g for g in groups or []
@@ -474,12 +719,51 @@ class PBSCollector:
                     all_groups.append(dict(store=store, namespace=ns, backup_type=key[0], backup_id=key[1],
                         snapshot_count=count, count_source="PBS group backup-count" if number(group.get("backup-count")) is not None else "listed snapshots" if snapshots is not None else "unavailable",
                         latest_backup_time=latest["backup_time"] if latest else number(group.get("last-backup")),
-                        latest_logical_bytes=latest["logical_bytes"] if latest else None))
+                        latest_logical_bytes=latest["logical_bytes"] if latest else None,
+                        oldest_backup_time=min((s['backup_time'] for s in snaps), default=None),
+                        protected_count=sum(s['protected'] is True or s['protected'] == 1 for s in snaps) if snapshots is not None and all(s['protected'] is not None for s in snaps) else None,
+                        age_hours=max(0, (time.time()-latest['backup_time'])/3600) if latest else None,
+                        freshness=("older than expected" if latest and self.fresh_hours is not None and time.time()-latest['backup_time'] > self.fresh_hours*3600 else "within expectation" if latest and self.fresh_hours is not None else "no expectation configured"),
+                        verification_state=verification_state(latest.get('verification') if latest else None),
+                        older_verification_failures=sum(verification_state(s.get('verification')) == 'failed' for s in snaps if s is not latest),
+                        matching_pve="Not confirmed; VM ID alone is insufficient"))
                     group_count += 1
+            for group in [g for g in all_groups if g['store'] == store]:
+                policies=[]
+                for job in prune_config or []:
+                    parent=job.get('ns','')
+                    namespace=group['namespace']
+                    if job.get('store') != store or not (namespace==parent or namespace.startswith(parent+'/') or not parent):
+                        continue
+                    depth=len(namespace.split('/'))-len(parent.split('/')) if parent else len(namespace.split('/')) if namespace else 0
+                    if job.get('max-depth') is not None and depth > int(job['max-depth']):
+                        continue
+                    policies.append(dict(id=job.get('id'), disabled=job.get('disable',False), namespace=parent,
+                        max_depth=job.get('max-depth'), schedule=job.get('schedule'),
+                        rules={k:v for k,v in job.items() if k.startswith('keep-')}))
+                group['pbs_prune_policies'] = policies if prune_config is not None else None
             safe_config = {key: value for key, value in (config or {}).items()
                            if key.startswith("keep-") or key in ("gc-schedule", "prune-schedule")}
             recent_cleanup = [task for task in tasks or [] if isinstance(task, dict) and str(task.get("worker_type", task.get("worker-type", ""))).replace("-", "_") in ("prune", "prunejob", "garbage_collection")]
-            results.append(dict(store=store, total_bytes=number((capacity or {}).get("total")),
+            backend = (config or {}).get('backend', {'type': 'local'})
+            backend_type = backend.get('type', 'unknown') if isinstance(backend, dict) else str(backend)
+            local_capacity = config is not None and backend_type == 'local'
+            if not local_capacity:
+                self.warnings.append(f"PBS {store}: backend capacity semantics not validated or configuration unreadable; full capacity omitted")
+            latest_cleanup = {}
+            for kind in ('prune', 'prunejob', 'garbage_collection'):
+                matching = [t for t in recent_cleanup if str(t.get('worker_type',t.get('worker-type',''))).replace('-','_') == kind]
+                matching.sort(key=lambda t:number(t.get('starttime')) or number(t.get('endtime')) or 0, reverse=True)
+                latest_cleanup[kind] = dict(latest_attempt=matching[0] if matching else None,
+                    latest_success=next((t for t in matching if t.get('status') == 'OK' and t.get('endtime') is not None), None))
+            if not local_capacity:
+                capacity = None
+            results.append(dict(backend_type=backend_type, backing_scope=(config or {}).get('path'),
+                task_history=dict(since=since, records=len(tasks), complete_within_visible_scope=task_complete, limit=self.task_limit),
+                cleanup_history=latest_cleanup,
+                verification_jobs=[j for j in verify_status or [] if j.get("store")==store] if verify_status is not None else None,
+                verification_config=[j for j in verify_config or [] if j.get("store")==store] if verify_config is not None else None,
+                store=store, total_bytes=number((capacity or {}).get("total")),
                 used_bytes=number((capacity or {}).get("used")), available_bytes=number((capacity or {}).get("avail")),
                 capacity_scope="Underlying filesystem reported by PBS; may include other data or be shared with another datastore. Do not sum datastore capacities.",
                 namespaces=sorted(scope), namespace_enumeration_available=namespaces is not None,
@@ -489,7 +773,7 @@ class PBSCollector:
                 prune_status=[j for j in prune_status or [] if j.get("store") == store] if prune_status is not None else None,
                 gc=gc, recent_cleanup_tasks=recent_cleanup if tasks is not None else None))
         return dict(requested=True, status="collected" if results and not self.warnings else "partial" if results else "unavailable",
-                    version=version, datastores=results, groups=all_groups, snapshots=all_snapshots, warnings=self.warnings,
+                    version=version, checks=self.checks, datastores=results, groups=all_groups, snapshots=all_snapshots, warnings=self.warnings,
                     scope_note="Visible PBS datastores/namespaces only. Permissions can hide objects. VM IDs can be reused by other clusters; a matching ID is not proof of ownership. Snapshot archive sizes are logical referenced data, not unique physical PBS usage.")
 
 
@@ -680,6 +964,8 @@ def prompt_choice(prompt, choices, default):
         except EOFError:
             return default
         answer = answer or default
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            answer = choices[int(answer)-1]
         if answer in choices:
             return answer
         print("Choose one of: " + ", ".join(choices), file=sys.stderr)
@@ -690,14 +976,16 @@ def startup_options(args):
     interactive = not args.no_prompt and sys.stdin.isatty()
     environment = args.environment
     mode = args.mode
+    if mode is not None and interactive:
+        print(f"Connection method: {mode} — selected by command-line option. Omit --mode for guided selection.", file=sys.stderr)
     if mode is None:
         default = "local" if shutil.which("pvesh") else "cli" if detected == "standalone" else "ssh"
         if interactive:
             print("How would you like to connect?\n"
-                  "  ssh   — Log in to PVE using your account password or an SSH key (from WSL/Ubuntu).\n"
-                  "  api   — Paste a Token ID and Secret created in the PVE web interface.\n"
-                  "  local — Run on PVE itself using pvesh.\n"
-                  "  cli   — Run on a standalone PVE host using qm/pvesm.", file=sys.stderr)
+                  "  1. ssh   — Log in to PVE using your account password or an SSH key (from WSL/Ubuntu).\n"
+                  "  2. api   — Paste a Token ID and Secret created in the PVE web interface.\n"
+                  "  3. local — Run on PVE itself using pvesh.\n"
+                  "  4. cli   — Run on a standalone PVE host using qm/pvesm.", file=sys.stderr)
             mode = prompt_choice("Connection method", ("ssh", "api", "local", "cli"), default)
         else:
             mode = default
@@ -719,8 +1007,11 @@ def startup_options(args):
 
 
 class Collector:
-    def __init__(self, client, guest_agent=True):
+    def __init__(self, client, guest_agent=True, storage_timeout=60, vmids=None, selected_nodes=None):
         self.client = client
+        self.vmids = set(vmids or [])
+        self.selected_nodes = set(selected_nodes or [])
+        self.storage_timeout = storage_timeout
         self.guest_agent = guest_agent
         self.warnings = []
         self.volume_cache = {}
@@ -734,6 +1025,20 @@ class Collector:
             message = f"GET {path}: {exc}"
             self.warnings.append(message)
             return None, message
+
+    def storage_read(self, operation, context):
+        """Allow slow storage measurements a separate budget; never retry a timed-out remote process."""
+        clients = [self.client] + ([self.client.pvesh] if hasattr(self.client, "pvesh") else [])
+        previous = [(client, client.timeout) for client in clients if hasattr(client, "timeout")]
+        for client, _ in previous:
+            client.timeout = self.storage_timeout
+        try:
+            return operation()
+        except (ReadError, OSError, subprocess.TimeoutExpired) as exc:
+            raise ReadError(f"{context}; storage query budget {self.storage_timeout:g}s: {exc}") from None
+        finally:
+            for client, timeout in previous:
+                client.timeout = timeout
 
     def volume(self, node, storage, volume, config):
         # Identity is known only when storage configuration is visible.
@@ -749,7 +1054,7 @@ class Collector:
                 try:
                     if node not in self.thin_cache:
                         try:
-                            self.thin_cache[node] = (self.client.thin_status(node), None)
+                            self.thin_cache[node] = (self.storage_read(lambda: self.client.thin_status(node), f"Node {node}, LVM-thin counters"), None)
                         except (ReadError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
                             self.thin_cache[node] = ({}, str(exc))
                     mappings, failure = self.thin_cache[node]
@@ -767,7 +1072,12 @@ class Collector:
             if config.get("type") == "rbd" and (self.pve_major is None or self.pve_major < 8):
                 return identity, None, "N/A: Ceph RBD API allocation semantics are validated for PVE 8+ only; version unavailable or older"
             path = f"/nodes/{segment(node)}/storage/{segment(storage)}/content/{segment(volume)}"
-            info, err = self.read(path)
+            try:
+                info = self.storage_read(lambda: self.client.get(path), f"Node {node}, storage {storage}, volume {volume}, GET {path}")
+                err = None
+            except ReadError as exc:
+                info, err = None, str(exc)
+                self.warnings.append(err)
             used = number((info or {}).get("used"))
             source = (info or {}).get("_allocation_source", path + " used")
             reason = f"{method}; source {source}" if used is not None else f"N/A: {err or 'volume API did not return used bytes'}"
@@ -832,6 +1142,16 @@ class Collector:
         resources, err = self.read("/cluster/resources", type="vm")
         if err or not isinstance(resources, list):
             raise ReadError(err or "Cluster resources response was not a list; inventory cannot proceed")
+        visible = [r for r in resources if r.get("type") == "qemu"]
+        selected = [r for r in visible if (not self.vmids or r["vmid"] in self.vmids)
+                    and (not self.selected_nodes or r["node"] in self.selected_nodes)]
+        unmatched = self.vmids - {r["vmid"] for r in selected}
+        unknown_nodes = self.selected_nodes - {r["node"] for r in selected}
+        if unmatched or unknown_nodes:
+            self.warnings.append(f"Selection not visible or does not match: VM IDs {sorted(unmatched)}, nodes {sorted(unknown_nodes)}")
+        if (self.vmids or self.selected_nodes) and not selected:
+            raise ReadError("No visible VMs match the selection; full inventory was not substituted")
+        resources = selected + [r for r in resources if r.get("type") != "qemu"]
         nodes, _ = self.read("/nodes")
         node_status = {item["node"]: item.get("status") for item in nodes or []}
         storage_list, _ = self.read("/storage")
@@ -848,11 +1168,17 @@ class Collector:
             job_members[job_id] = (None if member_err else
                                    {str(child["id"]) for child in data["children"]})
         vms = []
+        processed = 0
         for resource in resources:
             if resource.get("type") != "qemu":
                 continue
             vmid, node = resource["vmid"], resource["node"]
-            print(f"Reading VM {vmid} on {node}...", file=sys.stderr)
+            processed += 1
+            tracker = getattr(self.client, "tracker", None)
+            if tracker:
+                tracker.message(f"VM {processed}/{len(selected)}: {vmid} on {node}")
+            else:
+                print(f"Reading VM {vmid} on {node}...", file=sys.stderr)
             path = f"/nodes/{segment(node)}/qemu/{vmid}"
             notes = []
             if node_status.get(node) == "offline":
@@ -923,6 +1249,8 @@ class Collector:
                             config_available=config_ok, notes=[n for n in notes if n]))
         return dict(generated_at=datetime.now(timezone.utc).isoformat(), pve_version=version,
                     vms=vms, nodes=nodes, jobs=jobs, warnings=self.warnings,
+                    pbs_destinations=[{k:st.get(k) for k in ("storage","server","datastore","namespace")} for st in storages.values() if st.get("type")=="pbs"],
+                    scope=dict(targeted=bool(self.vmids or self.selected_nodes), vmids=sorted(self.vmids), nodes=sorted(self.selected_nodes), discovered=len(visible), selected=len(selected)),
                     skipped_containers=(None if getattr(self.client, "container_count_unknown", False) else
                                         sum(r.get("type") == "lxc" for r in resources)),
                     limitations=list(LIMITATIONS))
@@ -1066,6 +1394,10 @@ def review_items(report):
                 if state and ("error" in state.lower() or "fail" in state.lower()):
                     add("pbs-cleanup-failure", target, kind + " reported a failure", state,
                         "Ask IT to inspect the task log and resolve the cause before considering cleanup changes.", "Cleanup")
+    for group in report.get('pbs',{}).get('groups',[]):
+        for reason in group.get('review_reasons',[]):
+            add('pbs-backup-review', dict(name=group['store']+'/'+group['namespace']+'/'+group['backup_type']+'/'+group['backup_id'],node='PBS'), reason,
+                'Based on visible snapshot metadata', 'Review the group in PBS. No verification or restore was started.', 'Backup')
     return result
 
 
@@ -1192,7 +1524,7 @@ def job_text(job):
 
 
 def terminal_report(report):
-    lines = ["PVE VM INVENTORY", f"Generated: {report['generated_at']}",
+    lines = ["PBS INVENTORY" if report.get("scope",{}).get("pbs_only") else "PVE VM INVENTORY", run_description(report), f"Generated: {report['generated_at']}",
              f"Environment: {report.get('environment', 'cluster')}; access: {report.get('access_mode', 'local')}",
              f"PVE version: {json.dumps(report['pve_version'], ensure_ascii=False)}",
              f"Largest first by {report['sort_metric']} bytes; * = top 10 measured VMs", ""]
@@ -1289,7 +1621,9 @@ HTML_STYLE += r'''
 @media print{.nav,dialog{display:none}.report-page[hidden]{display:none!important}}
 .management-sheet{max-width:900px;margin:20px auto;padding:28px;background:white;color:#18273b;border:1px solid #dce4ed;border-radius:12px;font-size:13px;line-height:1.45}.management-sheet h1{font-size:27px}.management-sheet h2{font-size:17px;margin:18px 0 8px}.management-sheet table{font-size:12px}.management-sheet th{background:#edf2f7;color:#18273b}.management-sheet th,.management-sheet td{padding:7px;border-color:#dce4ed}.management-sheet .meta,.management-note{font-size:11px;color:#526377}.management-sheet li{margin:7px 0}.management-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}.management-metrics div{border:1px solid #dce4ed;border-radius:8px;padding:12px}.management-metrics strong,.management-metrics span{display:block}.management-metrics strong{font-size:23px}.management-metrics span{font-size:11px;color:#526377}.print-toolbar{margin:18px 0}pre{max-width:100%;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}code{overflow-wrap:anywhere}
 @media(max-width:600px){.management-metrics{grid-template-columns:repeat(2,1fr)}.management-sheet{padding:16px}}
-@page{size:A4;margin:12mm}
+@page{size:auto;margin:12mm}
+.selected-vm{outline:2px solid var(--accent);outline-offset:-2px}
+@media print{.management-sheet h2{break-after:avoid}.management-sheet tr,.management-sheet li{break-inside:avoid}.management-sheet thead{display:table-header-group}.management-sheet th{position:static}.management-sheet td{white-space:normal!important;overflow-wrap:anywhere}.management-sheet p{orphans:3;widows:3}}
 @media print{.print-toolbar{display:none}.management-sheet{max-width:none;border:0;border-radius:0;padding:0;margin:0;font-size:10pt;line-height:1.25;break-inside:auto}.management-sheet h1{font-size:18pt}.management-sheet h2{font-size:12pt;margin:12px 0 6px}.management-sheet table{font-size:9pt}.management-sheet .meta,.management-note{font-size:8.5pt}.management-sheet li{margin:5px 0}.management-metrics{gap:8px;margin:12px 0}.management-metrics div{padding:8px}.management-metrics strong{font-size:20px}.management-sheet th,.management-sheet td{padding:5px}}
 '''
 
@@ -1306,7 +1640,7 @@ document.querySelectorAll('button[data-col]').forEach(button=>{
   const col=Number(button.dataset.col),asc=button.dataset.direction!=='asc',rows=Array.from(body.rows);
   rows.sort((a,b)=>{const ac=a.cells[col],bc=b.cells[col],am=ac.dataset.missing==='true',bm=bc.dataset.missing==='true';
    if(am!==bm)return am?1:-1;if(am)return 0;
-   const x=ac.dataset.value,y=bc.dataset.value,diff=numeric.has(col)?Number(x)-Number(y):x.localeCompare(y);return asc?diff:-diff;});
+   const x=ac.dataset.value,y=bc.dataset.value,diff=numeric.has(col)?Number(x)-Number(y):x.localeCompare(y,undefined,{numeric:true,sensitivity:"base"});return asc?diff:-diff;});
   table.querySelectorAll('th').forEach(h=>h.removeAttribute('aria-sort'));button.closest('th').setAttribute('aria-sort',asc?'ascending':'descending');button.dataset.direction=asc?'asc':'desc';body.append(...rows);
  });
 });
@@ -1325,15 +1659,23 @@ function updateStorageTotals(rows){const label=document.querySelector('#table-to
  let assignedKnown=0n,usedKnown=0n,sizes=0,measurements=0;const methods=new Set();disks.forEach(d=>{if(d.capacity!==null){assignedKnown+=BigInt(d.capacity);sizes++;}if(d.used!==null&&d.method){usedKnown+=BigInt(d.used);measurements++;methods.add(d.method);}});
  const fullSizes=!missingConfig&&!unknownIdentity&&sizes===disks.size,fullUsage=disks.size>0&&!missingConfig&&!unknownIdentity&&measurements===disks.size&&methods.size===1;
  assigned.textContent=fullSizes?humanBytes(assignedKnown):'N/A';used.textContent=fullUsage?humanBytes(usedKnown):'N/A';
- const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig||unknownIdentity)messages.push('Some disk settings or storage locations are unavailable.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
+ const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');const partial=new Map();disks.forEach(d=>{if(d.used!==null&&d.method)partial.set(d.method,(partial.get(d.method)||0n)+BigInt(d.used));});if(!fullUsage)partial.forEach((amount,method)=>messages.push('Measured subtotal ('+method+'): '+humanBytes(amount)+'.'));messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig||unknownIdentity)messages.push('Some disk settings or storage locations are unavailable.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
 }
 const search=document.querySelector('#search'),nodeFilter=document.querySelector('#node-filter'),missingOnly=document.querySelector('#missing-only'),resultCount=document.querySelector('#result-count');
-function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const match=row.dataset.search.includes(search.value.toLowerCase().trim())&&(!nodeFilter.value||row.dataset.node===nodeFilter.value)&&(!missingOnly.checked||row.dataset.missingAllocation==='true');row.hidden=!match;if(match)shown.push(row);});resultCount.textContent=`${shown.length} of ${body.rows.length} machines shown`;document.querySelector('#no-results').hidden=shown.length!==0;updateStorageTotals(shown);}
+function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const match=row.dataset.search.includes(search.value.toLowerCase().trim())&&(!nodeFilter.value||row.dataset.node===nodeFilter.value)&&(!missingOnly.checked||row.dataset.missingAllocation==='true');row.hidden=!match;if(match)shown.push(row);});const active=[search.value.trim()?'Search: '+search.value.trim():'',nodeFilter.value?'PVE node: '+nodeFilter.value:'',missingOnly.checked?'Usage unavailable':''].filter(Boolean);resultCount.textContent=`${shown.length} of ${body.rows.length} machines shown`+(active.length?' — '+active.join(' · '):' — All VMs');document.querySelector('#no-results').hidden=shown.length!==0;updateStorageTotals(shown);}
 search.addEventListener('input',filterRows);nodeFilter.addEventListener('change',filterRows);missingOnly.addEventListener('change',filterRows);
 document.querySelector('#show-resources').addEventListener('change',event=>{table.dataset.resources=String(event.target.checked);document.querySelector('#table-total-note').closest('td').colSpan=event.target.checked?5:2;});
-document.querySelectorAll('[data-review-vmid]').forEach(link=>link.addEventListener('click',()=>{search.value=link.dataset.reviewVmid;nodeFilter.value='';missingOnly.checked=false;filterRows();}));
+function clearFilters(){search.value='';nodeFilter.value='';missingOnly.checked=false;filterRows();}
+document.querySelector('#clear-filters').addEventListener('click',clearFilters);
+document.querySelectorAll('[data-review-vmid]').forEach(link=>link.addEventListener('click',event=>{event.preventDefault();clearFilters();location.hash='machines';showPage('machines');Array.from(body.rows).forEach(row=>{const selected=row.cells[0].dataset.value===link.dataset.reviewVmid;row.classList.toggle('selected-vm',selected);if(selected){row.tabIndex=-1;requestAnimationFrame(()=>{row.scrollIntoView({block:'center'});row.focus({preventScroll:true});});}});}));
 document.querySelector('#show-missing').addEventListener('click',()=>{missingOnly.checked=true;filterRows();location.hash='machines';showPage('machines',true);});
 filterRows();
+const pbsPanel=document.querySelector('#pbs-inventory');
+if(pbsPanel){const pbsBody=pbsPanel.querySelector('tbody'),allRows=Array.from(pbsBody.rows),input=document.querySelector('#pbs-search');let pageIndex=0,filtered=allRows;
+function renderPBS(){filtered=allRows.filter(r=>r.textContent.toLowerCase().includes(input.value.trim().toLowerCase()));pageIndex=Math.max(0,Math.min(pageIndex,Math.ceil(filtered.length/50)-1));allRows.forEach(r=>r.hidden=true);filtered.slice(pageIndex*50,(pageIndex+1)*50).forEach(r=>r.hidden=false);document.querySelector('#pbs-count').textContent=`${filtered.length} of ${allRows.length} groups match; page ${pageIndex+1} of ${Math.max(1,Math.ceil(filtered.length/50))}`;document.querySelector('#pbs-prev').disabled=pageIndex===0;document.querySelector('#pbs-next').disabled=(pageIndex+1)*50>=filtered.length;}
+input.addEventListener('input',()=>{pageIndex=0;renderPBS();});document.querySelector('#pbs-prev').onclick=()=>{pageIndex--;renderPBS();};document.querySelector('#pbs-next').onclick=()=>{pageIndex++;renderPBS();};
+pbsPanel.querySelectorAll('[data-pbs-col]').forEach(button=>button.onclick=()=>{const col=Number(button.dataset.pbsCol),asc=button.dataset.direction!=='asc';button.dataset.direction=asc?'asc':'desc';allRows.sort((a,b)=>{const x=a.cells[col],y=b.cells[col];if(x.dataset.unknown!==y.dataset.unknown)return x.dataset.unknown==='true'?1:-1;const left=x.dataset.pbsValue,right=y.dataset.pbsValue;return (asc?1:-1)*([4,5,6,7,8,11,12].includes(col)?Number(left)-Number(right):left.localeCompare(right,undefined,{numeric:true}));});allRows.forEach(r=>pbsBody.append(r));pageIndex=0;renderPBS();});renderPBS();}
+
 '''
 
 
@@ -1410,7 +1752,7 @@ def allocation_vm_reason(vm):
             elif "did not return used" in raw:
                 reason = "The storage system answered but did not provide a storage-used measurement for this disk."
             elif "timed out" in raw.lower() or "timeout" in raw.lower():
-                reason = "The storage system did not answer in time. Ask IT to check whether it is reachable."
+                reason = "The storage measurement exceeded its time limit. This does not establish that storage is offline. Check the node, storage and query details in IT reference; guest tools are not required for this measurement."
             elif "passthrough" in raw.lower() or "unmanaged" in raw.lower():
                 reason = "This disk is attached directly rather than managed through a supported storage system. Its storage usage is unavailable."
             elif "not active" in raw.lower():
@@ -1487,10 +1829,14 @@ def utc_time(value):
 def review_page_html(report):
     esc = lambda value: html.escape(display(value), quote=True)
     items = report.get("review_items", [])
+    gaps = [r for r in items if r["category"] == "Data gap"]
+    primary = [r for r in items if r["category"] != "Data gap"]
     rows = ''.join('<tr><td><span class="badge">' + esc(r["category"]) + '</span></td><td><strong>' + esc(r["name"]) + '</strong>' +
         ('<br><a href="#machines" data-review-vmid="' + esc(r["vmid"]) + '">Find VM ' + esc(r["vmid"]) + '</a>' if r["vmid"] is not None else '<br>PBS datastore') +
-        '</td><td><strong>' + esc(r["title"]) + '</strong><p>' + esc(r["evidence"]) + '</p></td><td>' + esc(r["follow_up"]) + '</td></tr>' for r in items)
-    table = '<div class="table-wrap"><table><thead><tr><th>Type</th><th>Machine or datastore</th><th>What was found</th><th>Suggested follow-up</th></tr></thead><tbody>' + rows + '</tbody></table></div>' if rows else '<p>No findings met the configured rules. This does not confirm that backups are healthy.</p>'
+        '</td><td><strong>' + esc(r["title"]) + '</strong><p>' + esc(r["evidence"]) + '</p></td><td>' + esc(r["follow_up"]) + '</td></tr>' for r in primary)
+    table = '<div class="table-wrap"><table><thead><tr><th>Type</th><th>Machine or datastore</th><th>What was found</th><th>Suggested follow-up</th></tr></thead><tbody>' + rows + '</tbody></table></div>' if rows else '<p>No capacity or backup-scope findings met the review rules. Measurement gaps, if present, are listed below.</p>'
+    if gaps:
+        table += '<details class="subsection"><summary>Measurement and access gaps — ' + str(len(gaps)) + ' findings</summary><p>These are limits in the collected information, not proof of a storage failure. Expand a machine for details.</p>' + ''.join('<details class="disk-detail"><summary>' + esc(r['name']) + ' — ' + esc(r['title']) + '</summary><p>' + esc(r['evidence']) + '</p><a href="#machines" data-review-vmid="' + esc(r['vmid']) + '">Find VM ' + esc(r['vmid']) + '</a></details>' for r in gaps) + '</details>'
     return '<p class="eyebrow">Suggested follow-up</p><h2 tabindex="-1">Items to review</h2><p class="page-intro">' + str(len(items)) + ' findings based on the data collected. These are questions to investigate, not instructions to delete machines or backups. Large-machine threshold: ' + human(report.get("large_vm_bytes", 500*1024**3)) + ' assigned disk space. Backup filesystem review threshold: ' + esc(report.get("pbs_warning_percent", 90)) + '% used.</p><section class="panel">' + table + '</section>'
 
 
@@ -1519,6 +1865,48 @@ def cleanup_result(job):
 def gc_measurement(gc, key):
     # PBS can return a default all-zero struct before any GC statistics exist.
     return number((gc or {}).get(key)) if (gc or {}).get('upid') else None
+
+
+def pbs_inventory_html(report):
+    esc = lambda x: html.escape(display(x), quote=True)
+    groups = report.get('pbs', {}).get('groups', [])
+    columns = [('store','Datastore'),('namespace','Namespace'),('backup_type','Type'),('backup_id','ID'),('snapshot_count','Snapshots'),('protected_count','Protected'),('oldest_backup_time','Oldest backup'),('latest_backup_time','Latest backup'),('age_hours','Age (hours)'),('freshness','Freshness'),('verification_state','Latest verification'),('older_verification_failures','Older verification failures'),('latest_logical_bytes','Latest logical size'),('matching_pve','PVE relationship')]
+    rows=[]
+    for g in groups:
+        cells=[]
+        for key,label in columns:
+            value=g.get(key)
+            text = 'Root' if key=='namespace' and value=='' else utc_time(value) if key.endswith('_time') else human(value) if key.endswith('_bytes') else f'{value:.1f}' if key=='age_hours' and value is not None else display(value)
+            cells.append('<td data-pbs-value="'+esc(value)+'" data-unknown="'+str(value is None).lower()+'">'+esc(text)+'</td>')
+        cells.append('<td><details><summary>Retention rules</summary><p>PBS policies are shown separately; disabled policies do not run. PVE job rules, if collected, are on PVE backup jobs. This is not a deletion prediction.</p><pre>'+esc(json.dumps(g.get('pbs_prune_policies'),indent=2))+'</pre></details></td>')
+        rows.append('<tr>'+''.join(cells)+'</tr>')
+    return '<section class="panel" id="pbs-inventory"><h2>Backup inventory</h2><p>Logical backup sizes are not physical PBS consumption. PVE ownership is unconfirmed; matching an ID alone is insufficient. Verification is not a restore test.</p><label>Search datastore, namespace, type, ID or status <input id="pbs-search" type="search"></label><p id="pbs-count" aria-live="polite"></p><div class="table-wrap"><table><thead><tr>'+''.join('<th><button type="button" data-pbs-col="'+str(i)+'">'+label+'</button></th>' for i,(key,label) in enumerate(columns))+'<th>Retention</th></tr></thead><tbody>'+''.join(rows)+'</tbody></table></div><button type="button" id="pbs-prev">Previous</button> <button type="button" id="pbs-next">Next</button><p>50 groups per page. All collected records are in CSV/JSON. Search includes freshness and verification status.</p></section>'
+
+
+def pbs_extra_html(report):
+    esc=lambda x:html.escape(display(x),quote=True)
+    output=[]
+    for store in report.get('pbs',{}).get('datastores',[]):
+        output.append('<section class="panel"><h2>'+esc(store['store'])+' — evidence and history</h2><p>Backend: '+esc(store.get('backend_type'))+'</p>')
+        for kind, records in store.get('cleanup_history', {}).items():
+            latest=records.get('latest_attempt')
+            success=records.get('latest_success')
+            status=('Running or completion unavailable' if latest and latest.get('endtime') is None else latest.get('status','Unavailable') if latest else 'No matching task found in checked history')
+            output.append('<p><strong>'+esc(kind.replace('_',' '))+'</strong>: '+esc(status)+'; latest confirmed success: '+utc_time(success.get('endtime') if success else None)+'</p>')
+        for title,key in [('Cleanup attempts and confirmed successes','cleanup_history'),('Task-history coverage','task_history'),('Verification jobs and recorded results','verification_jobs')]:
+            output.append('<details><summary>'+title+'</summary><pre>'+esc(json.dumps(store.get(key),indent=2))+'</pre></details>')
+        history=store.get('capacity_history',[])
+        output.append('<h3>Capacity history</h3><p>Change in reported used space since previous reading: '+human(store.get('change_since_previous_bytes'))+'. Readings describe the same capacity scope, not per-VM usage.</p>')
+        if len(history)>1:
+            maximum=max(h['used_bytes'] for h in history) or 1
+            points=' '.join(f'{i*600/(len(history)-1):.1f},{100-h["used_bytes"]*95/maximum:.1f}' for i,h in enumerate(history))
+            output.append('<svg viewBox="0 0 600 110" role="img" aria-label="Reported used bytes at successive valid readings">'+''.join('<circle fill="currentColor" r="3" cx="'+point.split(',')[0]+'" cy="'+point.split(',')[1]+'"/>' for point in points.split())+'</svg><p>Points are successive valid readings, not a continuous timeline. See dates below for collection gaps.</p>')
+        else:
+            output.append('<p>History is disabled or more comparable readings are needed.</p>')
+        output.append('<details><summary>History values and dates</summary><pre>'+esc(json.dumps(history,indent=2))+'</pre></details></section>')
+    output.append('<section class="panel"><h2>Scheduled VM backup visibility</h2><pre>'+esc(json.dumps(report.get('pbs',{}).get('backup_coverage',[]),indent=2))+'</pre><p>Only known PBS destinations are checked; ID matches do not prove cluster ownership.</p></section>')
+    output.append('<section class="panel"><h2>Connection and visibility checks</h2><pre>'+esc(json.dumps(report.get('pbs',{}).get('checks',[]),indent=2))+'</pre></section>')
+    return ''.join(output)
 
 
 def pbs_page_html(report):
@@ -1552,11 +1940,8 @@ def pbs_page_html(report):
             out.append('<div class="table-wrap"><table><thead><tr><th>Prune job</th><th>Enabled</th><th>Namespace</th><th>Schedule</th><th>Keep rules</th><th>Last result</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
         out.append('<p class="hint">Job rules can be limited to a namespace or depth, and snapshots may be protected. PVE jobs may also apply retention. Review all settings together rather than treating one rule as the full policy.</p></div><details class="subsection"><summary>IT reference for this datastore</summary><pre>' + esc(json.dumps({k: store.get(k) for k in ('datastore_retention', 'prune_config', 'prune_status', 'gc', 'recent_cleanup_tasks')}, indent=2)) + '</pre></details></section>')
     pve_ids = {str(v['vmid']) for v in report['vms']}
-    group_rows = []
-    for group in pbs.get('groups', [])[:500]:
-        match = ('ID is present' if group['backup_id'] in pve_ids else 'ID not seen here') if group['backup_type'] == 'vm' else 'Other backup type'
-        group_rows.append('<tr><td>' + esc(group['store']) + '</td><td>' + esc(group['namespace'] or 'Root') + '</td><td>' + esc(group['backup_type'] + '/' + group['backup_id']) + '</td><td>' + esc(group['snapshot_count']) + '</td><td>' + utc_time(group['latest_backup_time']) + '</td><td>' + human(group['latest_logical_bytes']) + '</td><td>' + match + '</td></tr>')
-    out.append('<section class="panel"><h2>Backup groups and saved versions</h2><p class="hint">IDs may be reused by other PVE clusters. A matching ID does not prove ownership, and an ID not seen here is not evidence that backups can be deleted. Latest logical size is the snapshot archive size reported by PBS, not physical space assigned to that machine.</p><div class="table-wrap"><table><thead><tr><th>Datastore</th><th>Namespace</th><th>Group</th><th>Saved versions</th><th>Latest backup time</th><th>Latest logical size</th><th>Current PVE inventory</th></tr></thead><tbody>' + ''.join(group_rows) + '</tbody></table></div><p class="hint">Showing up to 500 groups. The CSV exports include all collected groups and snapshots. Archive sizes can count shared data repeatedly and are never added as a physical PBS usage total.</p></section>')
+    out.append(pbs_inventory_html(report))
+    out.append(pbs_extra_html(report))
     out.append('<section class="panel"><details><summary>PBS collection messages · ' + str(len(pbs.get('warnings', []))) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in pbs.get('warnings', [])) or '<li>No request failures were recorded. Permissions may still limit visible data.</li>') + '</ul></details></section>')
     return ''.join(out)
 
@@ -1564,20 +1949,22 @@ def pbs_page_html(report):
 def management_body(report):
     esc = lambda value: html.escape(display(value), quote=True)
     totals = report['storage_totals']
+    if report.get('scope', {}).get('pbs_only'):
+        return '<article class="management-sheet"><h1>PBS backup review</h1><p>PVE inventory was not requested. Collected '+esc(report['generated_at'])+'</p>'+''.join('<h2>'+esc(d['store'])+'</h2><p>Reported used: '+human(d['used_bytes'])+'; available: '+human(d['available_bytes'])+'</p><p>Visible groups: '+esc(d['visible_group_count'])+'; snapshot records: '+esc(d['listed_snapshot_count'])+'</p>' for d in report.get('pbs',{}).get('datastores',[]))+'<p>Filesystem capacities may overlap. See the full report for cleanup, protection, verification and data gaps.</p></article>'
     try:
         collected = datetime.fromisoformat(report['generated_at']).astimezone(timezone.utc).strftime('%b %d, %Y at %H:%M UTC')
     except (ValueError, TypeError):
         collected = report['generated_at']
     pbs = report.get('pbs', {})
     vms = report['vms']
-    # A short summary is intended to fit on one printed page; full exports keep every record.
+    # Keep a concise overview, allowing readable pagination for long content.
     findings = sorted(report.get('review_items', []), key=lambda r: {'Cleanup': 0, 'Capacity': 1, 'Review': 2, 'Data gap': 3}.get(r['category'], 4))
     findings_html = ''.join('<li><strong>' + esc(r['name']) + ': ' + esc(r['title']) + '.</strong> ' + esc(r['follow_up']) + '</li>' for r in findings[:5]) or '<li>No findings met the review rules. This does not confirm backup health.</li>'
     metric = report['sort_metric'] + '_bytes'
     top = [v for v in vms if v[metric] is not None][:5]
     top_rows = ''.join('<tr><td>' + esc(v['name']) + ' (#' + esc(v['vmid']) + ')</td><td>' + human(v[metric]) + '</td><td>' + power_state(v['status']) + '</td><td>' + ('Unknown' if v['backup'] == NA else v['backup']) + '</td></tr>' for v in top)
     capacity = '; '.join(s['store'] + ': ' + human(s['used_bytes']) + ' used, ' + human(s['available_bytes']) + ' available' for s in pbs.get('datastores', [])[:3]) or 'No PBS capacity data collected.'
-    return '<article class="management-sheet"><p class="eyebrow">Management summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + human(totals[1]['total_bytes']) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage needs complete comparable data. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
+    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + human(totals[1]['total_bytes']) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage needs complete comparable data. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
 
 
 def management_summary_html(report):
@@ -1600,7 +1987,7 @@ def html_report(report):
     card_data = [
         ("Virtual machines reviewed", str(count), f"Across {len(nodes)} host servers", "Includes " + str(sum(v["template"] for v in vms)) + " saved machine templates. Only machines this account can view are included.", "machines"),
         ("Assigned disk space", human(totals[0]["total_bytes"]), "All disk sizes available" if totals[0]["complete_coverage"] else "Partial data; known space: " + human(totals[0]["known_subtotal_bytes"]), "Disk space made available to the machines, including space they have not filled.", "assigned"),
-        ("Measured storage used", human(totals[1]["total_bytes"]), f"{measured} of {identified} identified disks measured", "Space reported as used by VM disks. N/A means a reliable full total is unavailable.", "measured"),
+        ("Measured storage used", human(totals[1]["total_bytes"]), f"{measured} of {identified} identified disks measured", "Space reported as used by VM disks. N/A means a full total is unavailable; see Storage for measured subtotals and missing disks. Guest tools are not required.", "measured"),
         ("Scheduled for backup", f"{yes} of {count}", f"{no} not selected · {unknown} unknown", "Machines selected by an active PVE backup schedule. Successful backups have not been checked.", "backups"),
     ]
     cards = ''.join('<article class="card' + (' primary' if i == 1 else '') + '"><div class="label">' + esc(label) + '</div><div class="value">' + esc(value) + '</div><span class="badge">' + esc(caption) + '</span><p>' + esc(note) + '</p>' + report_help_link(topic, "What does this mean?") + '</article>' for i, (label, value, caption, note, topic) in enumerate(card_data))
@@ -1616,7 +2003,7 @@ def html_report(report):
         review.append(f"{no} machines are not selected by the active backup schedules checked here. Confirm their backup arrangements with IT; they may have manual or other backups.")
     if unknown:
         review.append(f"Backup scheduling could not be confirmed for {unknown} machines. Ask IT to check access to the schedule settings.")
-    overview = '<div class="section-head"><div><p class="eyebrow">Summary</p><h2 tabindex="-1">Storage and backup review</h2></div></div><p class="page-intro">A virtual machine is a computer created in software and run on a physical server. This report helps you decide which machines deserve a closer look. ' + report_help_link("machines", "New to virtual machines?") + '</p><div class="cards">' + cards + '</div><div class="two-col"><section class="panel"><p class="eyebrow">Where to start</p><h2>Items to review</h2><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in review) + '</ul><p><a href="#storage">See storage measurements</a> · <a href="#machines">Review the machines</a></p><div class="callout">PBS backup storage was not measured. ' + report_help_link("pbs", "How does this relate to the full backup server?") + '</div></section><section class="panel"><p class="eyebrow">Largest first</p><h2>10 largest virtual machines</h2><p class="hint">Ranked by ' + rank_label + '. This is a starting point for review, not a recommendation to remove backups.</p><ol class="top-list">' + bars + '</ol></section></div>'
+    overview = '<p class="callout">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | ProxInfo ' + VERSION + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><div class="section-head"><div><p class="eyebrow">Summary</p><h2 tabindex="-1">Storage and backup review</h2></div></div><p class="page-intro">A virtual machine is a computer created in software and run on a physical server. This report helps you decide which machines deserve a closer look. ' + report_help_link("machines", "New to virtual machines?") + '</p><div class="cards">' + cards + '</div><div class="two-col"><section class="panel"><p class="eyebrow">Where to start</p><h2>Items to review</h2><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in review) + '</ul><p><a href="#storage">See storage measurements</a> · <a href="#machines">Review the machines</a></p><div class="callout">PBS backup storage was not measured. ' + report_help_link("pbs", "How does this relate to the full backup server?") + '</div></section><section class="panel"><p class="eyebrow">Largest first</p><h2>10 largest virtual machines</h2><p class="hint">Ranked by ' + rank_label + '. This is a starting point for review, not a recommendation to remove backups.</p><ol class="top-list">' + bars + '</ol></section></div>'
     gaps = []
     if diagnostic["missing_config_vmids"]:
         gaps.append(f"Disk settings could not be read for {len(diagnostic['missing_config_vmids'])} machines.")
@@ -1631,7 +2018,7 @@ def html_report(report):
     subtotals = ''.join('<div class="subtotal"><span>' + esc(method_label(t["metric"].removeprefix("Allocation subtotal: "))) + ' · ' + str(t["measured_volumes"]) + ' disks</span><strong>' + human(t["known_subtotal_bytes"]) + '</strong></div>' for t in totals[2:]) or '<p class="muted">No supported usage measurements were returned. This does not mean the machines use zero space.</p>'
     missing = ''.join('<article class="disk-detail"><h3>' + esc(v["name"]) + ' · VM ' + esc(v["vmid"]) + '</h3><ul class="reason-list">' + ''.join('<li>' + esc(r) + '</li>' for r in allocation_vm_reason(v)) + '</ul></article>' for v in vms if v["actual_bytes"] is None) or '<p>No machines are missing their table-level storage-used measurement.</p>'
     storage = '<p class="eyebrow">What could be measured</p><h2 tabindex="-1">Storage measurements</h2><p class="page-intro">Assigned disk size and space actually used are different numbers. ' + report_help_link("measured", "Explain the difference") + '</p><section class="panel"><div class="section-head"><h2>' + ('The full measured total is available' if diagnostic["complete"] else 'Why the full storage-used total is N/A') + '</h2><span class="badge">' + str(measured) + ' of ' + str(identified) + ' disks</span></div><p>We show a full total only when all disks can be identified, measured and compared safely.</p><div class="coverage" role="meter" aria-label="Identified disks with a storage-used measurement" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + str(percent) + '"><span style="width:' + str(percent) + '%"></span></div><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in gaps) + '</ul>' + subtotals + '<p class="hint">These amounts cover only the disks listed for each measurement type. Do not add them to the full total again. ' + report_help_link("missing", "What does N/A mean?") + '</p><button id="show-missing" class="button" type="button">Show machines with unavailable usage</button></section><section class="panel"><h2>Machines with unavailable usage</h2><p class="hint">These are gaps in what this report could measure, not proof that a machine or its storage has failed.</p>' + missing + '</section>'
-    headings = [("VM ID", "machines"), ("Name", "machines"), ("Host server", "hosts"), ("Power", "power"), ("Labels", "labels"), ("Assigned disk space", "assigned"), ("Storage used", "measured"), ("Memory assigned", "memory"), ("Memory in use", "memory"), ("Virtual CPUs", "cpu"), ("Scheduled for backup", "backups"), ("VM information", None)]
+    headings = [("VM ID", "machines"), ("Name", "machines"), ("PVE node", "hosts"), ("Power", "power"), ("Labels", "labels"), ("Assigned disk space", "assigned"), ("Storage used", "measured"), ("Memory assigned", "memory"), ("Memory in use", "memory"), ("Virtual CPUs", "cpu"), ("Scheduled for backup", "backups"), ("VM information", None)]
     headers = ''.join('<th scope="col">' + ('<button type="button" data-col="' + str(i) + '">' + esc(label) + '</button> ' + report_help_link(topic, "?", title="Explain " + label.lower()) if topic else esc(label)) + '</th>' for i, (label, topic) in enumerate(headings))
     rows = []
     for vm in vms:
@@ -1658,7 +2045,7 @@ def html_report(report):
         klass = ' class="top"' if vm["vmid"] in report["top_vmids"] else ''
         rows.append('<tr' + klass + ' data-search="' + esc(search) + '" data-node="' + esc(vm["node"]) + '" data-config-available="' + str(vm["config_available"]).lower() + '" data-disks="' + esc(json.dumps(disk_records)) + '" data-missing-allocation="' + str(vm["actual_bytes"] is None).lower() + '">' + ''.join(cells) + '</tr>')
     footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + human(totals[1]["total_bytes"]) + '</td><td colspan="2"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
-    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All host servers</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources">Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="false"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">The storage totals below the rows update when you filter. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
+    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources">Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="false"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">The storage totals below the rows update when you filter. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
     jobs = report["jobs"]
     if jobs is None:
         job_table = '<p>Backup schedule settings could not be read. Ask IT to review access to these settings.</p>'
@@ -1677,24 +2064,47 @@ def html_report(report):
     glossary = ''.join('<article id="help-' + topic + '" class="glossary-entry"><h3>' + esc(title) + '</h3><p>' + esc(body) + '</p></article>' for topic, (title, body) in REPORT_HELP.items())
     help_page = '<p class="eyebrow">Plain-language guide</p><h2 tabindex="-1">Understanding the report</h2><p class="page-intro">You do not need to know Proxmox to read this report. Use the Explain and ? links anywhere for help with a specific term.</p><section class="panel"><div class="guide-grid">' + ''.join('<article><h3>' + esc(title) + '</h3><p>' + esc(body) + '</p>' + report_help_link(topic, "Read the explanation") + '</article>' for topic, title, body in quick_guide) + '</div></section><section class="panel"><details id="glossary-details" open><summary>All definitions</summary><div class="guide-grid">' + glossary + '</div></details></section>'
     raw_summary = ''.join('<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>' for k, v in report["summary"].items())
-    technical = '<p class="eyebrow">For the IT team</p><h2 tabindex="-1">IT reference</h2><p class="page-intro">Original metrics, collection messages and measurement limits for troubleshooting. Manager-friendly definitions are on the Help page.</p><section class="panel technical"><details><summary>All resource totals and measurement counts</summary><dl>' + raw_summary + '</dl></details><details class="subsection"><summary>Original collection messages · ' + str(len(report["warnings"])) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in report["warnings"]) or '<li>No collection messages were recorded.</li>') + '</ul></details><details class="subsection"><summary>Measurement rules and limitations</summary><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in report["limitations"]) + '</ul></details><p class="meta">PVE version: ' + esc(json.dumps(report["pve_version"])) + '<br>Collection method: ' + esc(report.get("access_mode", "local")) + '</p></section>'
+    technical = '<details><summary>Run details and slowest queries</summary><pre>' + esc(run_description(report)) + '</pre></details><p class="eyebrow">For the IT team</p><h2 tabindex="-1">IT reference</h2><p class="page-intro">Original metrics, collection messages and measurement limits for troubleshooting. Manager-friendly definitions are on the Help page.</p><section class="panel technical"><details><summary>All resource totals and measurement counts</summary><dl>' + raw_summary + '</dl></details><details class="subsection"><summary>Original collection messages · ' + str(len(report["warnings"])) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in report["warnings"]) or '<li>No collection messages were recorded.</li>') + '</ul></details><details class="subsection"><summary>Measurement rules and limitations</summary><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in report["limitations"]) + '</ul></details><p class="meta">PVE version: ' + esc(json.dumps(report["pve_version"])) + '<br>Collection method: ' + esc(report.get("access_mode", "local")) + '</p></section>'
     if report.get("access_mode") == "demo":
         overview = '<p class="callout"><strong>Example report:</strong> all machine names and numbers on these pages are synthetic preview data.</p>' + overview
     pbs_status = report.get('pbs', {}).get('status', 'not requested')
     overview = overview.replace('PBS backup storage was not measured.', 'PBS reporting: ' + esc(pbs_status) + '. <a href="#pbs">View backup-server information</a>.')
     overview += '<section class="panel"><h2>Follow-up and handoff</h2><p>' + str(len(report.get('review_items', []))) + ' findings are listed for review. No changes are made automatically.</p><p><a class="button" href="#review">Open review list</a> <a class="button" href="#management">Open management summary</a></p></section>'
     storage += breakdown_page_html(report)
-    management = '<p class="eyebrow">A short handoff</p><h2 tabindex="-1">Management summary</h2><div class="print-toolbar"><a class="button" href="management-summary.html" target="_blank" rel="noopener">Open print / PDF view</a><p class="hint">The separate summary has a Print / Save as PDF button. It includes only the first five findings and largest machines; the full report retains all records.</p></div>' + management_body(report)
+    management = '<p class="eyebrow">A short handoff</p><h2 tabindex="-1">Management summary</h2><div class="print-toolbar"><a class="button" href="management-summary.html" target="_blank" rel="noopener">Open print / PDF view</a><p class="hint">The separate summary has a Print / Save as PDF button. It includes the first five findings and largest machines. Longer summaries flow across pages; select Letter or A4 in the print dialog. The full report retains all records.</p></div>' + management_body(report)
+    if report.get('scope', {}).get('pbs_only'):
+        overview = '<section class="panel"><h2>PBS-only report</h2><p>PVE inventory and backup ownership matching were not requested. Open PBS backup storage for capacity, cleanup, retention, freshness and verification information.</p><a href="#pbs">Open PBS report</a></section>'
     views = [("overview", "Summary", overview), ("review", "Review list", review_page_html(report)),
              ("machines", "Virtual machines", machines), ("storage", "Storage", storage),
              ("backups", "PVE backup jobs", backups), ("pbs", "PBS backup storage", pbs_page_html(report)),
              ("management", "Management summary", management), ("help", "Help", help_page), ("technical", "IT reference", technical)]
-    nav = ''.join('<a href="#' + key + '" data-page-link="' + key + '">' + label + '</a>' for key, label, _ in views)
+    nav = ''.join('<a href="#' + key + '" data-page-link="' + key + '">' + label + '</a>' for key, label, _ in views if not report.get('scope',{}).get('pbs_only') or key not in ('machines','storage','backups'))
     pages = ''.join('<section class="report-page" id="page-' + key + '" data-page="' + key + '">' + content + '</section>' for key, _, content in views)
-    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Storage and backup review</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + pages + '<footer class="footer"><span>ProxInfo · report layout 3</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Storage and backup review</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + pages + '<footer class="footer"><span>ProxInfo · report layout 4</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
+
+
+def run_description(report):
+    run = report.get("run", {})
+    scope = report.get("scope", {})
+    return ("PBS ONLY; PVE inventory not requested" if scope.get("pbs_only") else "SELECTED VMS ONLY — " + json.dumps(scope) if scope.get("targeted") else "All visible VMs") + " | " + json.dumps(run, ensure_ascii=False)
 
 
 def export_report(report, directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".writing-", dir=directory) as staging:
+        result = _export_report(report, Path(staging))
+        write_csv(Path(staging) / "run_info.csv", ["setting", "value"],
+                  [dict(setting=k, value=v) for k,v in dict(report.get("run", {}), scope=report.get("scope", {})).items()])
+        for path in Path(staging).iterdir():
+            path.replace(directory / path.name)
+    marker = directory / '.report-complete.tmp'
+    marker.write_text(json.dumps(dict(run_id=report.get('run', {}).get('run_id'), collection_status=report.get('run', {}).get('status'), export_complete=True)), encoding='utf-8')
+    marker.replace(directory / 'report-complete.json')
+    return result
+
+
+def _export_report(report, directory):
     directory.mkdir(parents=True, exist_ok=True)
     terminal = terminal_report(report)
     (directory / "inventory.txt").write_text(terminal, encoding="utf-8")
@@ -1729,13 +2139,21 @@ def export_report(report, directory):
     write_csv(directory / "pbs_datastores.csv", ["store", "total_bytes", "used_bytes", "available_bytes", "capacity_scope",
         "namespaces", "inventory_complete", "visible_group_count", "listed_snapshot_count", "datastore_retention", "prune_config",
         "prune_status", "gc_last_result", "gc_last_completed", "gc_removed_bytes", "gc_pending_bytes"], datastore_rows)
-    write_csv(directory / "pbs_groups.csv", ["store", "namespace", "backup_type", "backup_id", "snapshot_count", "count_source", "latest_backup_time", "latest_logical_bytes"], pbs.get("groups", []))
+    write_csv(directory / "pbs_checks.csv", ["path", "status"], pbs.get("checks", []))
+    write_csv(directory / "pbs_groups.csv", ["pbs_prune_policies", "oldest_backup_time", "protected_count", "age_hours", "freshness", "verification_state", "older_verification_failures", "matching_pve","store", "namespace", "backup_type", "backup_id", "snapshot_count", "count_source", "latest_backup_time", "latest_logical_bytes"], pbs.get("groups", []))
     write_csv(directory / "pbs_snapshots.csv", ["store", "namespace", "backup_type", "backup_id", "backup_time", "logical_bytes", "protected", "verification"], pbs.get("snapshots", []))
     return terminal
 
 
 def main(argv=None):
+    launched = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cron", action="store_true", help="Unattended scheduled run; requires --mode and absolute --output-root")
+    parser.add_argument("--version", action="version", version="ProxInfo " + VERSION)
+    parser.add_argument("--vmid", action="append", type=int, help="Only collect this VM ID; repeat to select more")
+    parser.add_argument("--node", action="append", help="Only collect VMs on this node; repeat to select more")
+    parser.add_argument("--progress", choices=("auto", "plain", "off"), default="auto")
+    parser.add_argument("--max-runtime", type=float, help="Stop starting queries after this many collection seconds")
     parser.add_argument("--mode", choices=("ssh", "local", "cli", "api"), help="ssh=remote PVE from WSL, local=pvesh, cli=standalone commands, api=HTTPS token")
     parser.add_argument("--ssh-host", help="PVE hostname/IP or ~/.ssh/config alias")
     parser.add_argument("--ssh-user", help="Remote username (default root)")
@@ -1747,44 +2165,116 @@ def main(argv=None):
     parser.add_argument("--environment", choices=("auto", "cluster", "standalone"), default="auto")
     parser.add_argument("--no-prompt", action="store_true", help="Use explicit options/detection without startup questions")
     parser.add_argument("--config", type=Path, help="Optional JSON credentials/settings file; environment overrides it")
-    parser.add_argument("--output-dir", type=Path, default=Path("pve-report-" + datetime.now().strftime("%Y%m%d-%H%M%S")))
+    outputs = parser.add_mutually_exclusive_group()
+    outputs.add_argument("--output-dir", type=Path, help="New or empty folder for this run")
+    outputs.add_argument("--output-root", type=Path, help="Parent folder for unique run directories")
     parser.add_argument("--sort", choices=("configured", "actual"), default="configured")
+    parser.add_argument("--storage-timeout", type=float, default=60, help="Seconds per storage measurement (default 60); separate from connection/general queries")
     parser.add_argument("--timeout", type=float, default=20, help="Seconds per API/local command (default 20)")
     parser.add_argument("--no-guest-agent", action="store_true", help="Skip guest filesystem queries")
     pbs_flags = parser.add_mutually_exclusive_group()
     pbs_flags.add_argument("--pbs", dest="pbs", action="store_true", default=None, help="Include read-only PBS API reporting")
     pbs_flags.add_argument("--no-pbs", dest="pbs", action="store_false", help="Skip PBS without asking")
+    parser.add_argument("--pbs-only", action="store_true", help="Collect PBS without any PVE connection")
+    parser.add_argument("--pbs-namespace", action="append", help="Exact namespace; / means root; repeat as needed")
+    parser.add_argument("--pbs-timeout", type=float, default=60)
+    parser.add_argument("--pbs-task-days", type=int, default=14)
+    parser.add_argument("--pbs-task-limit", type=int, default=1000)
+    parser.add_argument("--pbs-verification-days", type=float, help="Optional age threshold for recorded verification-job completion")
+    parser.add_argument("--pbs-fresh-hours", type=float, help="Optional backup age expectation in hours")
+    parser.add_argument("--pbs-history", action="store_true", help="Save local capacity history under --output-root")
     parser.add_argument("--pbs-url", help="PBS HTTPS URL; credentials use PBS_TOKEN_ID / PBS_TOKEN_SECRET")
     parser.add_argument("--pbs-store", action="append", help="Only inspect this PBS datastore (repeat for more); default all visible")
     parser.add_argument("--large-vm-gib", type=float, default=500, help="Assigned-size review threshold in GiB (default 500)")
     parser.add_argument("--pbs-warning-percent", type=float, default=90, help="PBS filesystem capacity review threshold (default 90 percent)")
     args = parser.parse_args(argv)
-    if args.timeout <= 0 or args.ssh_auth_timeout <= 0:
-        parser.error("--timeout and --ssh-auth-timeout must be positive")
+    if not all(0 < value < float("inf") for value in (args.timeout, args.ssh_auth_timeout, args.storage_timeout)):
+        parser.error("Timeouts must be finite and positive")
     if not 0 < args.large_vm_gib < float('inf') or not 0 < args.pbs_warning_percent <= 100:
         parser.error("Review size must be positive and PBS review percentage must be in (0,100]")
+    if args.max_runtime is not None and not 0 < args.max_runtime < float("inf"):
+        parser.error("--max-runtime must be finite and positive")
+    if args.vmid and any(v <= 0 for v in args.vmid):
+        parser.error("VM IDs must be positive")
+    if args.pbs_only:
+        if args.pbs is False or args.vmid or args.node or args.mode:
+            parser.error("--pbs-only cannot combine with --no-pbs, PVE selectors, or --mode")
+        args.pbs = True
+    if not 0 < args.pbs_timeout < float('inf') or args.pbs_task_days <= 0 or args.pbs_task_limit <= 0:
+        parser.error("PBS timeout/history limits must be positive and finite")
+    if args.pbs_verification_days is not None and not 0 < args.pbs_verification_days < float("inf"):
+        parser.error("Verification days must be positive and finite")
+    if args.pbs_fresh_hours is not None and not 0 < args.pbs_fresh_hours < float('inf'):
+        parser.error("PBS freshness hours must be positive and finite")
+    if args.pbs_history and (args.output_root is None or args.pbs is False):
+        parser.error("--pbs-history requires --output-root and enabled PBS")
+    if args.cron:
+        if not (args.mode or args.pbs_only) or args.output_root is None or not args.output_root.is_absolute():
+            parser.error("--cron requires --mode and an absolute --output-root")
+        if args.ssh_auth == "password":
+            parser.error("Cron cannot answer SSH password prompts; use a key, API token, or local mode")
+        args.no_prompt = True
+        if args.progress == "auto":
+            args.progress = "plain"
+        if args.pbs is None:
+            args.pbs = False
+        if args.max_runtime is None:
+            args.max_runtime = 3600
+    run_folder = "pve-report-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    args.output_dir = ((args.output_root / run_folder) if args.output_root is not None else args.output_dir or Path(run_folder))
     ssh_client = None
+    tracker = None
+    cron_lock = None
+    cron_status = "failed"
     try:
-        environment, mode = startup_options(args)
+        if args.cron:
+            args.output_root.mkdir(parents=True, exist_ok=True)
+            cron_lock = CronLock(args.output_root / ".proxinfo.lock")
+            args.output_dir.mkdir()
+            tracker = RunTracker(args.output_dir, args.progress, args.max_runtime)
+            atomic_text(args.output_root / "last-run.json", json.dumps(dict(status="running", run_id=tracker.run_id, directory=str(args.output_dir), started_at=tracker.started_at)))
+        environment, mode = ("pbs-only", "pbs-api") if args.pbs_only else startup_options(args)
         config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
         def setting(name):
             return os.environ.get("PVE_" + name.upper(), config.get(name))
-        if mode == "ssh":
-            ssh_client = SSHClient(**ssh_settings(args, setting))
-            ssh_client.connect()
-            client = ssh_client
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        if tracker is None and any(args.output_dir.iterdir()):
+            raise ValueError("Output directory is not empty; choose a new directory to preserve previous reports")
+        with tempfile.TemporaryFile(dir=args.output_dir):
+            pass
+        for command in ({"ssh": ["ssh"], "local": ["pvesh"], "cli": ["qm", "pvesm"]}.get(mode, [])):
+            if shutil.which(command) is None:
+                raise ValueError("Required local command not found: " + command)
+        if args.pbs_only:
+            if tracker is None:
+                tracker = RunTracker(args.output_dir, args.progress, args.max_runtime)
+            report = dict(generated_at=datetime.now(timezone.utc).isoformat(), pve_version=None,
+                          vms=[], nodes=[], jobs=None, warnings=[], skipped_containers=None,
+                          limitations=["PVE inventory was not requested. PBS group ownership matching was not performed."],
+                          scope=dict(pbs_only=True, selected=0, discovered=0, targeted=False))
         else:
-            client = (CLIClient(args.timeout) if mode == "cli" else
-                      Client(mode, args.timeout, **api_settings(args, setting)) if mode == "api" else
-                      Client(mode, args.timeout))
-        report = Collector(client, not args.no_guest_agent).collect()
+            if mode == "ssh":
+                ssh_client = SSHClient(**ssh_settings(args, setting))
+                ssh_client.connect()
+                client = ssh_client
+            else:
+                client = (CLIClient(args.timeout) if mode == "cli" else
+                          Client(mode, args.timeout, **api_settings(args, setting)) if mode == "api" else
+                          Client(mode, args.timeout))
+            if tracker is None:
+                tracker = RunTracker(args.output_dir, args.progress, args.max_runtime)
+            else:
+                tracker.started = time.monotonic()  # Collection budget begins after authentication.
+            client = ObservedClient(client, tracker)
+            report = Collector(client, not args.no_guest_agent, args.storage_timeout, args.vmid, args.node).collect()
         report["large_vm_bytes"] = int(args.large_vm_gib * 1024**3)
         report["pbs_warning_percent"] = args.pbs_warning_percent
         report["pbs"] = dict(requested=False, status="not requested", datastores=[], groups=[], snapshots=[], warnings=[])
+        pbs_config = None
         try:
-            pbs_config = pbs_settings(args, config)
+            pbs_config = None if tracker.cancelled or tracker.expired else pbs_settings(args, config)
             if pbs_config is not None:
-                report["pbs"] = PBSCollector(PBSClient(**pbs_config), args.pbs_store).collect()
+                report["pbs"] = PBSCollector(ObservedClient(PBSClient(**pbs_config), tracker), args.pbs_store, args.pbs_namespace, args.pbs_task_days, args.pbs_task_limit, args.pbs_fresh_hours).collect()
         except (ReadError, OSError, ValueError, TypeError, EOFError) as exc:
             report["pbs"] = dict(requested=True, status="unavailable", datastores=[], groups=[], snapshots=[],
                                  warnings=["PBS reporting could not be completed: " + str(exc)[:600]])
@@ -1800,23 +2290,82 @@ def main(argv=None):
             report["limitations"].append("Standalone CLI mode inventories only this server using qm/pvesm. "
                                           "Container count is N/A because pct was not queried. Backup jobs use optional read-only pvesh; "
                                           "if unavailable, membership is N/A. Allocation sources are shown in disk details.")
+        if report['pbs']['requested'] and pbs_config and report['pbs'].get('groups') is not None:
+            pbs_relationships(report, pbs_config['url'], config.get('pbs_freshness_overrides', []))
+        for store in report['pbs'].get('datastores',[]):
+            for job in store.get('verification_jobs') or []:
+                ended=number(job.get('last-run-endtime'))
+                job['age_review']='no expectation configured' if args.pbs_verification_days is None else 'unavailable' if ended is None else 'older than expected' if time.time()-ended>args.pbs_verification_days*86400 else 'within expectation'
         try:
             sort_report(report, args.sort)
         except ValueError as exc:
             report["warnings"].append(str(exc) + " Fell back to configured sorting.")
             sort_report(report, "configured")
+        report["run"] = dict(tracker.metadata(), total_runtime_seconds=round(time.monotonic()-launched, 3), status=("cancelled" if tracker.cancelled else "time limit reached" if tracker.expired else "finished"), access_mode=mode, storage_timeout=args.storage_timeout,
+                             query_timeout=args.timeout, guest_agent_enabled=not args.no_guest_agent,
+                             pbs_requested=report['pbs']['requested'])
+        gaps = Counter()
+        for vm in report['vms']:
+            for disk in unique_disks(vm['disks']):
+                if disk['actual_bytes'] is None:
+                    reason = (disk['actual_reason'] or '').lower()
+                    category = ('timeout' if 'timed out' in reason or 'timeout' in reason else
+                                'unsupported' if 'no validated' in reason else
+                                'not queried' if 'not queried' in reason or 'cancelled' in reason else
+                                'access denied' if '403' in reason or 'permission denied' in reason else 'unavailable')
+                    gaps[category] += 1
+        report['run']['unmeasured_disk_references'] = dict(gaps)
+        if report['run']['status'] == 'finished' and (report['warnings'] or gaps or report['pbs'].get('warnings')):
+            report['run']['status'] = 'finished with missing measurements'
+        if args.pbs_only:
+            report['summary'] = {key: 'N/A (PVE inventory not requested)' for key in report['summary']}
+            for total in report['storage_totals']:
+                total['total_bytes'] = total['known_subtotal_bytes'] = None
+        if args.pbs_history and report['pbs']['requested'] and pbs_config:
+            try:
+                pbs_history(report, args.output_root, pbs_config['url'].rstrip('/'))
+            except (OSError, sqlite3.Error) as exc:
+                report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
+                report['run']['status'] = 'finished with history unavailable'
         print(export_report(report, args.output_dir))
+        complete_configs = sum(v['config_available'] for v in report['vms'])
+        incomplete = tracker.cancelled or tracker.expired or bool(report['warnings']) or any(v['actual_bytes'] is None for v in report['vms'])
+        tracker.message(("Report created with missing measurements" if incomplete else "Report created") +
+                        f" | {complete_configs}/{len(report['vms'])} VM configurations read | {report['run']['elapsed_seconds']}s")
+        tracker.message("Query outcomes: " + json.dumps(report['run']['query_outcomes']))
+        tracker.message(f"Disks measured: {report['allocation_diagnostics']['measured_disks']}/{report['allocation_diagnostics']['identified_disks']} | selected {report['scope']['selected']} of {report['scope']['discovered']} visible VMs")
         print(f"Reports written to {args.output_dir.resolve()}", file=sys.stderr)
-        return 0
+        if args.cron:
+            cron_status = ("cancelled" if tracker.cancelled else "incomplete" if incomplete or report['pbs'].get('warnings') else "complete")
+            target = parse.quote(args.output_dir.name + "/inventory.html", safe="/")
+            atomic_text(args.output_root / "latest.html", '<!doctype html><meta charset="utf-8"><title>Latest ProxInfo report</title><p>Latest exported report: ' + html.escape(cron_status) + ' | ' + html.escape(report['generated_at']) + '</p><a href="' + target + '">Open report</a><p>Check last-run.json for the latest attempt, which may have failed after this export.</p>')
+        return 130 if tracker.cancelled else 3 if args.cron and cron_status == "incomplete" else 0
+    except CronBusy as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
     except KeyboardInterrupt:
+        cron_status = "cancelled"
         print("Inventory cancelled.", file=sys.stderr)
         return 130
     except (ReadError, OSError, ValueError, TypeError, EOFError) as exc:
+        if tracker:
+            tracker.message("Collection failed; no complete report was produced. See terminal error.")
         print(f"Inventory failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        if ssh_client is not None:
-            ssh_client.close()
+        try:
+            if tracker is not None:
+                if args.cron:
+                    try:
+                        atomic_text(args.output_root / "last-run.json", json.dumps(dict(status=cron_status, run_id=tracker.run_id, directory=str(args.output_dir), finished_at=datetime.now(timezone.utc).isoformat())))
+                    except OSError as exc:
+                        print("Unable to write scheduled-run status: " + str(exc), file=sys.stderr)
+                tracker.close()
+            if ssh_client is not None:
+                ssh_client.close()
+        finally:
+            if cron_lock is not None:
+                cron_lock.close()
 
 
 if __name__ == "__main__":

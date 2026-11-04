@@ -43,10 +43,10 @@ First choose how to connect. Use **`ssh` for your normal PVE account login**, or
 ```text
 Connection method (ssh/api/local/cli) [ssh]: ssh
 Environment (cluster/standalone) [cluster]: cluster
+SSH sign-in method (password/key/auto) [password]: password
 PVE SSH hostname or IP address: 192.168.1.10
 SSH username [root]:
 SSH port [SSH config default, normally 22]:
-SSH sign-in method (password/key/auto) [password]: password
 ```
 
 Replace the example address with yours. Press Enter for defaults. For a single server, choose `standalone`. Supplying `--mode ssh` or `--mode api` skips the connection-method question.
@@ -310,7 +310,7 @@ python3 pve_inventory.py --large-vm-gib 750 --pbs-warning-percent 85
 
 On **Storage**, the host breakdown counts **local disks on each host**, then lists **shared disks in a separate cluster-wide row**. The storage-location breakdown separates identically named local storage on different hosts, while counting a shared volume ID once. Machine counts may repeat when a VM has disks in several locations. These are attached-disk totals, not pool capacities. Missing settings prevent a full total; known subtotals remain labeled. Do not add the host table to the location table: they are two views of the same disks.
 
-**Management summary** gives a short handoff with key totals, up to five findings, five largest machines, and up to three PBS datastore capacity entries. Open **Print / PDF view**, or open `management-summary.html` directly, then use **Print / Save as PDF** in that file. The layout is designed for one A4 page for ordinary report data. All findings, machines and stores remain in the full report and CSV files. Keep `management-summary.html` beside `inventory.html` to use its link back to the full report.
+**Management summary** gives a short handoff with key totals, up to five findings, five largest machines, and up to three PBS datastore capacity entries. Open **Print / PDF view**, or open `management-summary.html` directly, then use **Print / Save as PDF** in that file. The summary flows across pages as needed. Choose Letter or A4 in your browser print dialog; table headings repeat and rows stay together where possible. All findings, machines and stores remain in the full report and CSV files. Keep `management-summary.html` beside `inventory.html` to use its link back to the full report.
 
 Additional exports:
 
@@ -479,3 +479,230 @@ API behavior was checked against upstream Proxmox sources. Your installed versio
 - [PBS API tokens and audit permissions](https://pbs.proxmox.com/docs/user-management.html)
 - [PBS datastore API](https://github.com/proxmox/proxmox-backup/blob/master/src/api2/admin/datastore.rs)
 - [PBS prune-job status API](https://github.com/proxmox/proxmox-backup/blob/master/src/api2/admin/prune.rs)
+
+## Guided setup and report navigation
+
+Run `python3 pve_inventory.py` for guided setup. Choose the connection method by name or number. Supplying `--mode ssh` selects SSH and skips that menu; the script now explains this. SSH asks password/key authentication before the host and login details. The flag is `--mode ssh`, not `--ssh`. PBS remains off by default.
+
+The PVE node dropdown combines with any search and usage filter. The count line lists active filters. **Show all VMs / Clear filters** restores the full list. **Find VM** clears filters and highlights the exact VM without hiding other machines. Click **PVE node** to sort naturally in either direction.
+
+## Storage measurements and timeouts
+
+Storage used does not require guest tools. Only guest filesystem used/free information requires the QEMU Guest Agent. Backend detection remains automatic; unsupported or inaccessible measurements remain N/A with an explanation. Configured disk capacity is never substituted for measured usage.
+
+Storage measurements now have a separate 60-second default budget. For slower storage, run:
+
+```bash
+python3 pve_inventory.py --mode ssh --storage-timeout 120
+```
+
+`--timeout` still controls general queries and connection timing. Storage diagnostics identify the node, storage/volume or backend counter, and timeout budget. A timeout does not establish that storage is offline. Timed-out remote commands are not automatically retried because they may still be running. This avoids issuing duplicate expensive reads. Shared failure results are reused within a run; a subsequent run collects fresh measurements.
+
+Known measurements remain available as subtotals by measurement type on the Storage page and in filtered table totals. Incompatible measurement types are not combined. Measurement/access findings are grouped into an expandable section of Review list, with individual VM details retained. The print summary is concise rather than guaranteed to occupy one page.
+
+## Collection progress, diagnostics, and targeted runs
+
+Run `python3 pve_inventory.py --version` to confirm the version without connecting. Normal startup checks required local commands and write access before collecting data. Use a **new or empty output folder** for each run; existing reports are protected. Omitting `--output-dir` creates a timestamped folder with a random suffix.
+
+```sh
+# Whole cluster, with PBS explicitly skipped
+python3 pve_inventory.py --mode ssh --no-pbs
+# One VM or node (repeat --vmid or --node to select more)
+python3 pve_inventory.py --mode ssh --vmid 108 --no-pbs
+python3 pve_inventory.py --mode ssh --node pve01 --no-pbs
+# Stop starting requests after ten minutes of collection
+python3 pve_inventory.py --mode ssh --max-runtime 600 --no-pbs
+```
+
+VM IDs are combined as a selection; node names are combined as a selection. When both are supplied, a VM must match both. Detailed queries are limited to selected VMs. Shared metadata queries still run. Unknown selections never fall back to a full inventory. Selected reports and their totals describe only selected VMs. PBS, if explicitly enabled, retains its separately labeled datastore scope.
+
+Progress shows the current read, selected-VM count, elapsed query time, and timeout where available. Slow requests receive updates every five seconds. `--progress off` suppresses progress output; `--progress plain` and the default `auto` use readable lines, including when redirected. Authentication runs before the progress worker, so password prompts are not interrupted. Collection duration excludes sign-in; total runtime includes setup. Durations measure local request time, not isolated server processing time.
+
+`collection.log` and `query_timings.csv` are written incrementally. They contain safe operation labels and outcomes, not raw authentication headers or exception text. Exact backend messages remain in the report's IT reference. `run_info.csv` and `inventory.json` record the run ID, version, settings, selection, timings, and failure groups. The HTML IT reference lists slow queries. Keep files from the same run together.
+
+Ctrl+C during a query saves unavailable placeholders for remaining discovered VMs and finishes an incomplete report (exit 130). The overall time limit stops new requests and reduces supported command timeouts to the remaining budget. Export may extend beyond that budget. Discovery failure cannot produce a reliable VM report; its diagnostic log is retained. A second interrupt may stop recovery/export immediately. File-stat system calls may not be interruptible promptly by the operating system.
+
+Reports are staged and each final file is replaced atomically. `report-complete.json` is written last: it confirms export completion, not complete measurement coverage. A failed export has no completion marker. Do not interpret unfinished output as a finished report. Completed partial runs retain exit code 0, with their limitations recorded explicitly.
+
+### Developer verification
+
+The tests folder is only needed for development. Normal inventory use still needs no Python packages.
+
+```sh
+python3 -m unittest discover -s tests -q
+# Optional browser tests, requiring Node and Playwright in the development environment:
+node tests/browser_checks.cjs
+```
+
+Browser checks use synthetic data and make no PVE/PBS calls. `PYTHON` may select the Python executable; `BROWSER_PATH` may select an installed Chromium/Edge executable. Otherwise Playwright uses its installed Chromium. The browser test dependency is separate from the inventory script.
+
+For live acceptance, compare VM counts on both nodes and compare identical storage metrics for a working VM and a previously timed-out disk. Test node filters and Find VM, then inspect logs for remaining gaps. Confirm targeted totals describe only the chosen selection. Live acceptance requires access to your environment and has not been completed by the automated tests.
+
+## Optional cron jobs directly on PVE
+
+**Manual use is unchanged.** Running `python3 pve_inventory.py` still shows the guided prompts. `--mode ssh` still supports interactive password login from WSL/Ubuntu. Only adding **`--cron`** enables the scheduled behavior described below. The script does not install, edit, or remove cron jobs itself.
+
+Schedule on **one PVE node**, using root's crontab and `--mode local --environment cluster`. Local mode uses existing PVE command permissions and requires no SSH login or PVE API token. It inventories all visible cluster nodes. The scheduling node must be online; this is not a cluster failover service. All PVE/PBS operations remain read-only. A standalone host can use `--environment standalone` with local mode.
+
+### 1. Copy and prepare the script
+
+From WSL/Ubuntu, while in the project folder, copy the updated script to your chosen PVE node (replace `pve01` with its hostname/address):
+
+```sh
+scp ./pve_inventory.py root@pve01:/root/pve_inventory.py
+ssh root@pve01
+```
+
+Then, on that PVE node as root:
+
+```sh
+/usr/bin/python3 --version
+command -v pvesh
+install -d -m 700 /opt/proxinfo /etc/proxinfo /var/lib/proxinfo/reports /var/log/proxinfo
+install -m 600 /root/pve_inventory.py /opt/proxinfo/pve_inventory.py
+/usr/bin/python3 /opt/proxinfo/pve_inventory.py --version
+```
+
+Python 3.9+ is required. No pip packages or tests folder are needed to run the inventory. For updates, copy and install the new script again. Local PVE-only collection needs no configuration file.
+
+### 2. Test the exact unattended command
+
+Run this on the scheduling node before adding cron:
+
+```sh
+/usr/bin/python3 /opt/proxinfo/pve_inventory.py --cron --mode local --environment cluster --no-pbs --output-root /var/lib/proxinfo/reports --max-runtime 1800
+printf 'Exit status: %s\n' "$?"
+```
+
+The command must run without prompts. Check both nodes' VM counts, remaining measurement gaps, and the result files. An incomplete report can be useful and has exit status 3 in cron mode.
+
+`--cron` requires an explicit `--mode` and an **absolute** `--output-root`. It implies `--no-prompt`, selects plain progress by default, keeps PBS off unless `--pbs` is supplied, and defaults to a 3,600-second collection budget unless overridden. `--output-root` and `--output-dir` are mutually exclusive. The time budget applies to collection, not authentication or export; some underlying system calls may finish later. No remote query is automatically repeated after a timeout.
+
+### 3. Add the schedule
+
+As root on the selected PVE node, run:
+
+```sh
+crontab -e
+```
+
+Add these lines. This example runs daily at **06:15 in the scheduling node's local time zone**; choose a time that suits your backup/storage workload. The cron command must be one line. Confirm the node's time zone using `date`.
+
+```cron
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+15 6 * * * /usr/bin/python3 /opt/proxinfo/pve_inventory.py --cron --mode local --environment cluster --no-pbs --output-root /var/lib/proxinfo/reports --max-runtime 1800 >> /var/log/proxinfo/cron.log 2>&1
+```
+
+Use `crontab -l` to review the installed entry. The job uses absolute paths and does not depend on your interactive shell environment. Ensure the host's cron service is running. An ordinary cron schedule does not automatically replay a run missed while the node was powered off.
+
+To change the schedule, edit the entry with `crontab -e`. To disable it, put `#` at the beginning of that job's line. Do not remove unrelated cron entries. Monitor the local report/log directory sizes and manage retention according to your policy; the script does not delete old reports or backups.
+
+### 4. Find and retrieve reports
+
+Each launch creates a unique `pve-report-DATE-TIME-ID` directory beneath `/var/lib/proxinfo/reports`. Each run contains the HTML, CSVs, JSON, print summary, and logs.
+
+- `latest.html` links to the latest fully **exported** report, which may have incomplete measurements; its status and collection date are shown.
+- `last-run.json` describes the latest acquired run: `running`, `complete`, `incomplete`, `failed`, or `cancelled`.
+- A failed launch leaves the previous `latest.html` unchanged. Check `last-run.json` and timestamps before treating that link as current.
+- `collection.log` captures startup and collection milestones. Authentication and other startup errors are also captured in `/var/log/proxinfo/cron.log` by the cron redirection.
+- `report-complete.json` inside a run confirms export completion, not complete measurement coverage.
+
+To retrieve a report, run this **from WSL/Ubuntu**, replacing the example folder name with the actual one:
+
+```sh
+scp -r root@pve01:/var/lib/proxinfo/reports/pve-report-DATE-TIME-ID ./
+```
+
+Open that folder's `inventory.html` locally. Keep its `management-summary.html` beside it. Copying just the root `latest.html` without its target run folder will not preserve the link.
+
+### Scheduled outcomes and overlap protection
+
+| Exit status | Meaning |
+|---|---|
+| 0 | Report exported with no detected collection gaps under the current checks |
+| 1 | Startup, connection, collection, or export failed |
+| 2 | Invalid command options |
+| 3 | Report exported with incomplete measurements, warnings, requested PBS gaps, or a collection time limit |
+| 4 | Another scheduled run holds the lock for this output root; launch skipped |
+| 130 | Interrupted/cancelled |
+
+A missing/unsupported measurement may consistently produce exit 3; this is not proof of a storage outage. Interactive/manual partial reports retain their existing exit code 0. Cron records output; it does not itself act on these codes as an alerting system.
+
+The lock is held until collection, export, and connection cleanup finish. The OS releases it on process exit, including an unexpected termination. The `.proxinfo.lock` file is expected to remain; do not delete it while a run may be active. Locking is local to one scheduling host and output root: use the same root for overlapping jobs, and schedule on only one cluster node. An overlap skip does not overwrite the active run's status.
+
+### Optional remote authentication and PBS
+
+Cron mode also supports `--mode api` with a token or `--mode ssh --ssh-auth key` with unattended key authentication. Password prompts and unverified-host prompts cannot be answered by cron. Encrypted keys require an agent that is available to the scheduled account; local PVE mode avoids this setup entirely. SSH sudo, if used, must already work noninteractively. TLS certificate and SSH host-key verification remain enabled.
+
+API/PBS credentials use the existing environment variables or `--config /etc/proxinfo/scheduled.json`. Protect that file with owner-only permissions (`chmod 600 /etc/proxinfo/scheduled.json`) and keep it outside Git. Use the example configuration files for field names and the API permissions sections above for audit access. Tokens/passwords do not belong in a crontab command or diagnostic log. The connected account still needs permission to read the selected objects.
+
+PBS remains off by default even if credentials are saved. To include it, replace `--no-pbs` with `--pbs` and provide its separate token, URL, and trusted CA settings. Local PVE permissions do not supply PBS API authentication.
+
+## PBS investigation tools (1.3)
+
+PBS is still optional and off by default. The new PBS-only mode connects **only to PBS**, using its own audit token. It needs no PVE connection, SSH login, or PVE API credentials:
+
+```sh
+python3 pve_inventory.py --pbs-only --pbs-store backups
+# Root namespace only (/ means root; selection is exact, not recursive)
+python3 pve_inventory.py --pbs-only --pbs-store backups --pbs-namespace /
+# Daily backup expectation; omit to show age without an overdue judgment
+python3 pve_inventory.py --pbs-only --pbs-fresh-hours 36
+# Save comparable capacity observations locally
+python3 pve_inventory.py --pbs-only --output-root ./pbs-reports --pbs-history
+```
+
+Datastore and namespace options can be repeated. Without namespace selection, all visible namespaces are queried. PBS-only mode cannot combine with PVE `--mode`, `--vmid`, `--node`, or `--no-pbs`. Combined collection still uses `--pbs` with your normal PVE options. PVE task/VM failures are avoided entirely by PBS-only mode.
+
+### PBS-only cron on PVE
+
+Root on PVE still needs a **separate PBS API token**. Save it in the protected configuration file described above. A planned nightly entry can use this actual command (absolute paths required for cron output root):
+
+```sh
+/usr/bin/python3 /opt/proxinfo/pve_inventory.py --cron --pbs-only --config /etc/proxinfo/scheduled.json --output-root /var/lib/proxinfo/pbs-reports --pbs-history --max-runtime 1800
+```
+
+Use the same cron setup procedure as the PVE section. Omit `--mode` for PBS-only runs. `latest.html`, logs, locking, and cron exit codes work as for other scheduled runs. Manual prompting is unchanged.
+
+### Connection checks, capacity and cleanup
+
+The PBS page includes per-endpoint availability checks and version information in the exported JSON. HTTP authentication failures, permission failures, unavailable endpoints, and timeouts are distinguished. Visible scope is not proof of complete server access. `pbs_checks.csv` exports those checks.
+
+`--pbs-timeout` defaults to 60 seconds per request. `--pbs-task-days` defaults to 14 and `--pbs-task-limit` to 1000 **per datastore**. Task reads are paginated. Coverage states whether the limit or an error stopped the history search. Empty task history means no matching task was found within that checked scope, not that cleanup never ran. Older servers that reject the history parameters are reported as unavailable rather than guessed.
+
+Cleanup summaries separate the latest attempt from the latest confirmed success. A task without a completion time is shown as running or completion unavailable. GC statistics retain their own recorded context and may predate the latest attempted job. Pending removals remain subject to PBS safety rules. No prune, GC, or verification task is started.
+
+Capacity is displayed only when the datastore configuration supports the validated local-filesystem interpretation. Unknown/object-storage backends currently show N/A for full capacity: local cache usage is not bucket consumption. No direct cloud/storage-provider access is added. Multiple datastore capacities may describe overlapping storage and are never summed.
+
+### Retention, freshness and verification
+
+The inventory table includes oldest/latest visible snapshot times, snapshot counts, protected counts, age, verification results, and PBS policy details. Missing protection fields mean unavailable protection counts, not zero. Matching PBS prune policies respect namespace depth; disabled policies stay labeled. PVE backup-job settings remain separately visible in combined reports. Multiple rules are not merged into a guessed deletion policy.
+
+The table is searchable and sortable, with 50 groups per page and no 500-group display cutoff. Search can match datastore, namespace, type, ID, freshness, or verification state. CSV/JSON retain all collected records.
+
+`--pbs-fresh-hours` sets a general age expectation. Optional configuration `pbs_freshness_overrides` applies in listed order (later matching entries win):
+
+```json
+{
+  "pbs_freshness_overrides": [
+    {"store": "backups", "namespace": "weekly", "hours": 192},
+    {"store": "backups", "namespace": "", "backup_type": "vm", "backup_id": "108", "hours": 36}
+  ]
+}
+```
+
+Namespace `""` means root in JSON; omitted selector fields match any value. A freshness finding is based on the latest **visible snapshot**, not proof of a successful restore. Known PVE PBS destinations are compared by server hostname, datastore, namespace, backup type and ID. Matches remain candidates because multiple clusters can reuse IDs. Inaccessible or uncollected destinations are not labeled missing. PBS-only reports explicitly skip PVE ownership matching.
+
+Verification states are passed, failed, explicitly not verified, or unavailable. Unknown/missing fields remain unavailable. Older snapshot failures are separate from latest-snapshot status. The script also reads `/config/verify` and `/admin/verify` using GET only. These reads use datastore audit access; do not grant verification-execution permission merely to improve the report. Unsupported or denied endpoints remain unavailable. Recorded job completion dates are available in the verification details; per-snapshot verification dates are not inferred from snapshot creation times.
+
+`--pbs-verification-days` optionally marks recorded verification-job completions older than an expected age. It does not assume every snapshot was verified by that job. Verification results do not establish that a complete restore has been tested.
+
+### Local capacity history
+
+Enable with `--pbs-history --output-root ...`. A local SQLite file (Python standard library) stores valid readings under that root; no third-party Python package is required. Readings are keyed by PBS URL, datastore, backend, backing path, and reported total capacity. Changing that scope starts a separate series. Repeated run IDs are deduplicated and writes use database transactions. Each report includes up to 90 comparable readings.
+
+The chart plots successive valid observations, with exact timestamps and values below it. Gaps are not filled with zero and points are not joined to imply continuous measurements. Changes are observed differences, not proof that cleanup caused them. The first reading has no previous-change value. No per-VM physical attribution or date-when-full forecast is calculated. Failed local history writes are reported while the inventory can still be exported.
+
+### First live PBS acceptance run
+
+Start with one datastore and PBS-only mode. Compare reported capacity, visible namespaces/group counts, oldest/latest snapshots, protected entries, prune settings, GC statistics, and verification state with the PBS web interface. Confirm the account has the documented audit access. Then test an intentionally limited namespace and a combined PVE/PBS run. Only after matching those readings should the scheduled history be relied upon. Automated fixtures and browser tests cannot validate your installed server version or account visibility.

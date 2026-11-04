@@ -6,3 +6,5 @@ config.*.json
 !config.example.json
 !config.*.example.json
 *.secret.json
+
+pbs-history.sqlite3*
