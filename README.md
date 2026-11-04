@@ -270,7 +270,7 @@ sudo python3 pve_inventory.py --sort actual --output-dir ./pve-report-actual
 
 `--sort configured` is the default. With `--sort actual`, incomplete coverage, a diskless VM, or mixed allocation metric meanings cause a clearly recorded fallback to configured sorting. No VMs are silently removed to make an actual sort look complete. N/A always sorts after known numbers in both directions in the HTML table.
 
-Use a fresh output directory for each run; an existing directory's report files will be overwritten. Reports are written locally. SSH mode also uses a temporary local connection socket; OpenSSH may update local known-host records when you accept a new host. Restrict access to reports because they contain infrastructure names and storage identifiers. A partial report exits 0 and includes collection warnings and coverage counts; failure to obtain the VM list exits 1. No live cluster validation has been performed for your environment yet; PVE version and backend details have not been supplied.
+You can reuse an output directory; its report and diagnostic log files are replaced on each run. Other files and subdirectories are left alone. Use a new directory when you want to preserve previous results. Reports are written locally. SSH mode also uses a temporary local connection socket; OpenSSH may update local known-host records when you accept a new host. Restrict access to reports because they contain infrastructure names and storage identifiers. A partial report exits 0 and includes collection warnings and coverage counts; failure to obtain the VM list exits 1. No live cluster validation has been performed for your environment yet; PVE version and backend details have not been supplied.
 
 ## Optional HTTPS API-token mode
 
@@ -488,6 +488,35 @@ The PVE node dropdown combines with any search and usage filter. The count line 
 
 ## Storage measurements and timeouts
 
+### Checking incomplete VM measurements (1.3.1)
+
+An unreadable EFI/startup disk, TPM/security disk or additional data disk no longer hides measurements from the other disks. The VM row shows the known amount and coverage, for example **30 GiB measured; partial; 1 of 2 disks measured**. The complete total remains N/A. Zero is a valid measurement; zero plus an unreadable disk is still partial. Measurements that count space differently remain separate subtotals.
+
+`actual_bytes` retains its complete-total meaning. CSV/JSON also include `known_actual_bytes`, `measured_subtotals`, `measurement_status`, `measured_disk_count` and `counted_disk_count`. Disk CSV includes the outcome, local collection elapsed seconds and whether the result was cached. Cached times measure lookup time, not a new host query. Query timings include the new host metadata commands.
+
+HTML storage sorting puts complete values first, then partial results, then unavailable results; partial results are not ranked as full totals. Configured capacity remains the default ordering and top-10 basis. Command-line `--sort actual` retains its requirement for complete, comparable measurements; incomplete runs fall back to configured capacity with an explanation.
+
+For raw regular-file disks, SSH/local collection now reads allocated file blocks on the owning node using `pvesm path` and `stat`. This avoids opening the running disk image. It requires permission to resolve and stat the disk, and the existing cluster SSH access when the owner is another node. No additional Python installation on PVE is needed. API-token collection continues through the PVE API. QCOW2 and other image formats use PVE's image-aware measurement, including in standalone mode: measuring only their primary file could miss additional data files. Missing active thin counters remain unavailable; a backend-reported failure and an unrecognized response are now distinguished from an absent counter. No disk is activated or unlocked.
+
+Run this from the folder containing the script on WSL/Ubuntu, replacing 100 and 101 with one affected VM and one working VM:
+
+```bash
+python3 pve_inventory.py --mode ssh --vmid 100 --vmid 101 --no-pbs --no-guest-agent --output-dir ./storage-check
+```
+
+Open `storage-check/inventory.html` on that machine. Expand **View VM information → IT reference for this VM**, and compare every attached disk, not only the main disk. `disks.csv` contains the corresponding raw results. Guest-agent collection is disabled here to demonstrate that host allocation is independent of guest filesystem reporting. No files need to be transferred to another environment.
+
+For a raw file, IT can compare the result on its owning PVE node using these read-only commands. Substitute the exact volume identifier from the disk detail:
+
+```bash
+pvesm path 'local:100/vm-100-disk-0.raw'
+stat -L --printf='type=%F allocated_blocks=%b bytes_per_block=%B\n' -- '/path/returned/above'
+```
+
+Allocated blocks multiplied by bytes per block should agree with the recorded file allocation, allowing for writes between observations. This is not filesystem free space or exclusive physical usage. For thin volumes, `dmsetup status --target thin --noflush` reports mapped sectors; multiply the matching target's mapped-sector count by 512. A stopped VM does not necessarily mean its disk target is inactive. Do not activate a missing target just for this check.
+
+Manual authentication and cron behavior are unchanged. Automated tests use simulated hosts; the first selected-VM run is still required to validate the specific failure in your environment.
+
 Storage used does not require guest tools. Only guest filesystem used/free information requires the QEMU Guest Agent. Backend detection remains automatic; unsupported or inaccessible measurements remain N/A with an explanation. Configured disk capacity is never substituted for measured usage.
 
 Storage measurements now have a separate 60-second default budget. For slower storage, run:
@@ -502,7 +531,7 @@ Known measurements remain available as subtotals by measurement type on the Stor
 
 ## Collection progress, diagnostics, and targeted runs
 
-Run `python3 pve_inventory.py --version` to confirm the version without connecting. Normal startup checks required local commands and write access before collecting data. Use a **new or empty output folder** for each run; existing reports are protected. Omitting `--output-dir` creates a timestamped folder with a random suffix.
+Run `python3 pve_inventory.py --version` to confirm the version without connecting. Normal startup checks required local commands and write access before collecting data. You can reuse **`--output-dir ./pve-report`** on every run without a confirmation prompt. Existing report files are replaced when export succeeds, and diagnostic logs are restarted for each collection. Unrelated files and subdirectories are left alone. Omitting `--output-dir` creates a timestamped folder with a random suffix.
 
 ```sh
 # Whole cluster, with PBS explicitly skipped
@@ -522,7 +551,7 @@ Progress shows the current read, selected-VM count, elapsed query time, and time
 
 Ctrl+C during a query saves unavailable placeholders for remaining discovered VMs and finishes an incomplete report (exit 130). The overall time limit stops new requests and reduces supported command timeouts to the remaining budget. Export may extend beyond that budget. Discovery failure cannot produce a reliable VM report; its diagnostic log is retained. A second interrupt may stop recovery/export immediately. File-stat system calls may not be interruptible promptly by the operating system.
 
-Reports are staged and each final file is replaced atomically. `report-complete.json` is written last: it confirms export completion, not complete measurement coverage. A failed export has no completion marker. Do not interpret unfinished output as a finished report. Completed partial runs retain exit code 0, with their limitations recorded explicitly.
+Reports are staged and each final file is replaced atomically. `report-complete.json` is written last: it confirms export completion, not complete measurement coverage. If collection or staging fails before report replacement begins, the previous reports and their marker remain; check their date and run ID. Once replacement begins, the old marker is removed, so an interrupted replacement has no completion marker. Diagnostic logs describe the latest attempt. Do not interpret unfinished output as a finished report. Completed partial runs retain exit code 0, with their limitations recorded explicitly.
 
 ### Developer verification
 

@@ -422,6 +422,12 @@ class SSHTests(unittest.TestCase):
             if "-M" in command or "-O" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
             remote = shlex.split(command[-1])
+            if remote == ['hostname', '-s']:
+                return subprocess.CompletedProcess(command, 0, 'a\n', '')
+            if remote[:2] == ['pvesm', 'path']:
+                return subprocess.CompletedProcess(command, 0, '/images/disk.raw\n', '')
+            if remote[:1] == ['stat']:
+                return subprocess.CompletedProcess(command, 0, '81a4|0|512', '')
             self.assertEqual(remote[:2], ["pvesh", "get"])
             path = remote[2]
             if "/content/" in path:

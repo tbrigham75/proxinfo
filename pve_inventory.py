@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 
 class CronBusy(Exception):
@@ -84,8 +84,8 @@ class RunTracker:
         self.cancelled = False
         self.expired = False
         self.queries = []
-        self.log = (self.directory / "collection.log").open("x", encoding="utf-8")
-        self.stream = (self.directory / "query_timings.csv").open("x", newline="", encoding="utf-8-sig")
+        self.log = (self.directory / "collection.log").open("w", encoding="utf-8")
+        self.stream = (self.directory / "query_timings.csv").open("w", newline="", encoding="utf-8-sig")
         self.writer = csv.DictWriter(self.stream, fieldnames=["run_id", "operation", "started_at", "elapsed_seconds", "outcome"])
         self.writer.writeheader()
         self.stream.flush()
@@ -181,6 +181,9 @@ class ObservedClient:
 
     def thin_status(self, node):
         return self.observed("LVM-thin counters on " + node, lambda: self.client.thin_status(node))
+
+    def backend_command(self, command):
+        return self.observed('Storage metadata ' + shlex.join(command), lambda: self.client.backend_command(command))
 
 
 NA = "N/A"
@@ -788,6 +791,16 @@ def cluster_ssh_prefix():
 
 
 def approved_backend_command(command):
+    if (len(command) == 3 and command[:2] == ['pvesm', 'path']
+            and re.fullmatch(r'[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+', command[2])):
+        return True
+    if (len(command) == 5 and command[:4] == ['stat', '-L', '--printf=%f|%b|%B', '--']
+            and command[4].startswith('/') and '\n' not in command[4]):
+        return True
+    if (len(command) == 12 and command[:10] == cluster_ssh_prefix()
+            and re.fullmatch(r'root@[A-Za-z0-9][A-Za-z0-9_.-]*', command[10])):
+        nested = shlex.split(command[11])
+        return nested[:1] != ['ssh'] and approved_backend_command(nested)
     reads = (["hostname", "-s"], ["dmsetup", "status", "--target", "thin", "--noflush"])
     return command in reads or (len(command) == 12 and command[:10] == cluster_ssh_prefix()
         and re.fullmatch(r"root@[A-Za-z0-9][A-Za-z0-9_.-]*", command[10]) is not None
@@ -796,7 +809,7 @@ def approved_backend_command(command):
 
 def parse_thin_status(output):
     """Exact mapped sectors from active thin targets. Never derive bytes from rounded Data%."""
-    result = {}
+    result = ThinCounters()
     for line in output.splitlines():
         match = re.fullmatch(r"([^:]+):\s+0\s+\d+\s+thin\s+(\d+)\s+\S+\s*", line.strip())
         if match:
@@ -806,7 +819,17 @@ def parse_thin_status(output):
                 result[name] = None
             else:
                 result[name] = value
+        elif ':' in line:
+            name, detail = line.split(':', 1)
+            result.errors[name.strip()] = ('Storage target reported failure' if 'Fail' in detail else
+                                           'Storage target response was not understood')
     return result
+
+
+class ThinCounters(dict):
+    def __init__(self):
+        super().__init__()
+        self.errors = {}
 
 
 def read_thin_status(client, node):
@@ -818,6 +841,27 @@ def read_thin_status(client, node):
     if node != client.entry_node:
         command = cluster_ssh_prefix() + ["root@" + node, shlex.join(command)]
     return parse_thin_status(client.backend_command(command))
+
+
+def raw_file_allocation(client, node, volume):
+    """Read allocation of one raw regular file on its owning host, without opening its image."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', node):
+        raise ReadError('Invalid cluster node name')
+    if not hasattr(client, 'entry_node'):
+        client.entry_node = client.backend_command(['hostname', '-s']).strip()
+    def run(command):
+        if node != client.entry_node:
+            command = cluster_ssh_prefix() + ['root@' + node, shlex.join(command)]
+        return client.backend_command(command)
+    path = run(['pvesm', 'path', volume]).strip()
+    if not path.startswith('/') or '\n' in path:
+        raise ReadError('Storage returned an invalid file path')
+    fields = run(['stat', '-L', '--printf=%f|%b|%B', '--', path]).strip().split('|')
+    if len(fields) != 3 or not re.fullmatch(r'[0-9a-fA-F]+', fields[0]) or not stat.S_ISREG(int(fields[0], 16)):
+        raise ReadError('Allocation path is not a regular file')
+    if not all(value.isdigit() for value in fields[1:]):
+        raise ReadError('File allocation counters were not understood')
+    return int(fields[1]) * int(fields[2])
 
 
 def parse_qm_list(text, node):
@@ -938,6 +982,10 @@ class CLIClient:
                         raise ReadError("ZFS returned no numeric usedbydataset value")
                     return {"used": used, "_allocation_source": "zfs get usedbydataset (via pvesm path)"}
                 if kind in ACTUAL_METHODS:
+                    if not volume.endswith('.raw'):
+                        if self.pvesh:
+                            return self.pvesh.get(path, **params)
+                        raise ReadError('Image may span multiple data files; primary-file allocation is not a complete image measurement')
                     info = os.stat(filename)
                     if not stat.S_ISREG(info.st_mode) or not hasattr(info, "st_blocks"):
                         raise ReadError("Not a regular file with allocated-block counters")
@@ -1050,6 +1098,15 @@ class Collector:
         if not method:
             return identity, None, f"N/A: backend {config.get('type', NA)} has no validated allocation metric in this version"
         if identity not in self.volume_cache:
+            if (config.get('type') in ('dir', 'nfs', 'cifs', 'cephfs', 'glusterfs')
+                    and volume.endswith('.raw') and getattr(self.client, 'mode', None) in ('local', 'ssh')):
+                try:
+                    used = self.storage_read(lambda: raw_file_allocation(self.client, node, volume),
+                                             f'Node {node}, raw file {volume}')
+                    self.volume_cache[identity] = (used, method + '; source regular-file stat allocated blocks; owning node ' + node)
+                except (ReadError, OSError, subprocess.TimeoutExpired) as exc:
+                    self.volume_cache[identity] = (None, 'N/A: ' + str(exc))
+                return (identity,) + self.volume_cache[identity]
             if config.get("type") == "lvmthin":
                 try:
                     if node not in self.thin_cache:
@@ -1064,7 +1121,7 @@ class Collector:
                     name = vg.replace("-", "--") + "-" + lv.replace("-", "--")
                     used = mappings.get(name)
                     if used is None:
-                        raise ReadError(failure or "Thin volume is not active or has no exact mapped-sector counter; no volume was activated")
+                        raise ReadError(failure or getattr(mappings, 'errors', {}).get(name) or "Thin volume is not active or has no exact mapped-sector counter; no volume was activated")
                     self.volume_cache[identity] = (used, method + "; source dmsetup status --target thin --noflush; mapped sectors × 512; shared blocks may be counted by multiple volumes")
                 except (ReadError, ValueError, IndexError) as exc:
                     self.volume_cache[identity] = (None, "N/A: " + str(exc))
@@ -1099,6 +1156,8 @@ class Collector:
             capacity = size_bytes(options.get("size"))
             reason = "N/A: " + excluded if excluded else None
             identity, actual = None, None
+            started = time.monotonic()
+            cached_before = set(self.volume_cache)
             if not excluded:
                 if storage:
                     identity, actual, reason = self.volume(node, storage, volume, storages.get(storage))
@@ -1108,6 +1167,9 @@ class Collector:
                               capacity_reason=("configuration size=" + options["size"] if capacity is not None else
                                                "N/A: " + (excluded or "no parseable configured size; volume size is not substituted")),
                               actual_bytes=actual, actual_reason=reason,
+                              measurement_status=disk_outcome(actual, reason, excluded is not None),
+                              measurement_seconds=round(time.monotonic() - started, 3),
+                              cached_measurement=identity in cached_before if identity else False,
                               actual_method=ACTUAL_METHODS.get(storages.get(storage, {}).get("type")) if actual is not None else None,
                               identity=list(identity) if identity else None,
                               counted=excluded is None, excluded_reason=excluded,
@@ -1279,7 +1341,50 @@ def complete_sum(values):
     return None if any(value is None for value in values) else sum(values)
 
 
+def measurement_details(vm):
+    disks = unique_disks(vm['disks'])
+    measured = [d for d in disks if d['actual_bytes'] is not None]
+    groups = {}
+    for disk in measured:
+        method = disk['actual_method']
+        groups[method] = groups.get(method, 0) + disk['actual_bytes']
+    state = ('complete' if vm['actual_bytes'] is not None else
+             'partial' if measured else 'unavailable')
+    return dict(measurement_status=state, measured_disk_count=len(measured),
+                counted_disk_count=len(disks), measured_subtotals=groups,
+                known_actual_bytes=next(iter(groups.values())) if len(groups) == 1 else None)
+
+
+def disk_outcome(value, reason, excluded=False):
+    if excluded:
+        return 'excluded'
+    if value is not None:
+        return 'measured'
+    reason = (reason or '').lower()
+    for category, fragments in (
+        ('not collected', ('not queried', 'cancelled', 'time limit reached', 'runtime budget')),
+        ('timeout', ('timed out', 'timeout')),
+        ('access denied', ('permission denied', '403')),
+        ('backend failure', ('target reported failure',)),
+        ('unrecognized response', ('not understood',)),
+        ('counter unavailable', ('not active',)),
+        ('unsupported', ('no validated', 'not supported', 'unmanaged'))):
+        if any(fragment in reason for fragment in fragments):
+            return category
+    return 'unavailable'
+
+
+def measurement_label(vm):
+    detail = measurement_details(vm)
+    if detail['measurement_status'] == 'complete':
+        return human(vm['actual_bytes']) + ' (complete)'
+    amounts = '; '.join(human(value) + ' ' + method for method, value in detail['measured_subtotals'].items())
+    return ((amounts + ' measured; partial; ') if amounts else 'N/A; ') + f"{detail['measured_disk_count']} of {detail['counted_disk_count']} disks measured"
+
+
 def sort_report(report, metric):
+    for vm in report['vms']:
+        vm.update(measurement_details(vm))
     key = metric + "_bytes"
     if metric == "actual":
         vms = report["vms"]
@@ -1543,7 +1648,7 @@ def terminal_report(report):
     for vm in report["vms"]:
         star = "*" if vm["vmid"] in report["top_vmids"] else " "
         lines.append(f"{star} {vm['vmid']}  {vm['node']} / {display(vm['name'])} / {display(vm['status'])} "
-                     f"| {human(vm['configured_bytes'])} | {human(vm['actual_bytes'])} "
+                     f"| {human(vm['configured_bytes'])} | {measurement_label(vm)} "
                      f"| {human(vm['ram_bytes'])} / {human(vm['memory_used_bytes'])} "
                      f"| {display(vm['vcpus'])} | {vm['backup']}")
         lines.append(f"    Tags: {display(vm['tags']) or '(none)'}; template={vm['template']}; "
@@ -1639,7 +1744,7 @@ document.querySelectorAll('button[data-col]').forEach(button=>{
  button.addEventListener('click',()=>{
   const col=Number(button.dataset.col),asc=button.dataset.direction!=='asc',rows=Array.from(body.rows);
   rows.sort((a,b)=>{const ac=a.cells[col],bc=b.cells[col],am=ac.dataset.missing==='true',bm=bc.dataset.missing==='true';
-   if(am!==bm)return am?1:-1;if(am)return 0;
+   if(am!==bm)return am?1:-1;if(am){if(col===6){return Number(bc.dataset.partial==='true')-Number(ac.dataset.partial==='true');}return 0;}
    const x=ac.dataset.value,y=bc.dataset.value,diff=numeric.has(col)?Number(x)-Number(y):x.localeCompare(y,undefined,{numeric:true,sensitivity:"base"});return asc?diff:-diff;});
   table.querySelectorAll('th').forEach(h=>h.removeAttribute('aria-sort'));button.closest('th').setAttribute('aria-sort',asc?'ascending':'descending');button.dataset.direction=asc?'asc':'desc';body.append(...rows);
  });
@@ -1761,7 +1866,7 @@ def allocation_vm_reason(vm):
                 reason = "This storage measurement needs SSH or local host access. A PVE API token alone cannot read the exact thin-volume counter."
             else:
                 reason = "A reliable measurement could not be collected. IT can review the exact request in this machine's IT reference."
-            reasons.append(f"Disk {index} ({disk['storage'] or 'directly attached storage'}): {reason}")
+            reasons.append(f"{disk['slot']} ({disk['volume']}): {reason} Exact result: {raw}")
     if len({d["actual_method"] for d in unique_disks(vm["disks"]) if d["actual_method"]}) > 1:
         reasons.append("The storage systems count space differently. Their measurements cannot safely be added into one total.")
     if not reasons:
@@ -1964,7 +2069,7 @@ def management_body(report):
     top = [v for v in vms if v[metric] is not None][:5]
     top_rows = ''.join('<tr><td>' + esc(v['name']) + ' (#' + esc(v['vmid']) + ')</td><td>' + human(v[metric]) + '</td><td>' + power_state(v['status']) + '</td><td>' + ('Unknown' if v['backup'] == NA else v['backup']) + '</td></tr>' for v in top)
     capacity = '; '.join(s['store'] + ': ' + human(s['used_bytes']) + ' used, ' + human(s['available_bytes']) + ' available' for s in pbs.get('datastores', [])[:3]) or 'No PBS capacity data collected.'
-    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + human(totals[1]['total_bytes']) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage needs complete comparable data. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
+    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + human(totals[1]['total_bytes']) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage needs complete comparable data. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><p>Partial storage measurements: ' + esc('; '.join(str(v['vmid']) + ': ' + measurement_label(v) for v in vms if measurement_details(v)['measurement_status'] == 'partial') or 'None') + '</p><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
 
 
 def management_summary_html(report):
@@ -2034,11 +2139,11 @@ def html_report(report):
             elif index == 10:
                 content = '<span class="badge ' + ('good' if value == 'Yes' else 'warn' if value == 'Unknown' else '') + '">' + content + '</span>'
             elif index == 6 and value is None:
-                content = '<details class="metric-reason"><summary>N/A · why?</summary>' + ''.join('<p>' + esc(r) + '</p>' for r in allocation_vm_reason(vm)) + '</details>'
+                content = '<strong>' + esc(measurement_label(vm)) + '</strong><details class="metric-reason"><summary>N/A · why?</summary>' + ''.join('<p>' + esc(r) + '</p>' for r in allocation_vm_reason(vm)) + '</details>'
             elif value is None:
                 content += '<small>' + report_help_link("missing", "Why unavailable?") + '</small>'
             unavailable = value is None or (index in (3, 10) and value == "Unknown")
-            cells.append('<td data-value="' + esc(value) + '" data-missing="' + str(unavailable).lower() + '">' + content + '</td>')
+            cells.append('<td data-partial="' + str(index == 6 and measurement_details(vm)['measurement_status'] == 'partial').lower() + '" data-value="' + esc(value) + '" data-missing="' + str(unavailable).lower() + '">' + content + '</td>')
         cells.append('<td><details class="vm-details"><summary>View VM information</summary>' + vm_information_html(vm) + '</details></td>')
         disk_records = [dict(identity=d["identity"], capacity=str(d["capacity_bytes"]) if d["capacity_bytes"] is not None else None, used=str(d["actual_bytes"]) if d["actual_bytes"] is not None else None, method=d["actual_method"]) for d in unique_disks(vm["disks"])]
         search = ' '.join(display(vm[key]) for key in ("vmid", "name", "node", "tags")).lower()
@@ -2096,6 +2201,8 @@ def export_report(report, directory):
         result = _export_report(report, Path(staging))
         write_csv(Path(staging) / "run_info.csv", ["setting", "value"],
                   [dict(setting=k, value=v) for k,v in dict(report.get("run", {}), scope=report.get("scope", {})).items()])
+        # Once replacement starts, an old marker must not certify mixed-run files.
+        (directory / "report-complete.json").unlink(missing_ok=True)
         for path in Path(staging).iterdir():
             path.replace(directory / path.name)
     marker = directory / '.report-complete.tmp'
@@ -2113,15 +2220,15 @@ def _export_report(report, directory):
     (directory / "inventory.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     rows = []
     for vm in report["vms"]:
-        row = dict(vm)
+        row = dict(vm, **measurement_details(vm))
         for key in ("configured_bytes", "actual_bytes", "ram_bytes", "memory_used_bytes"):
             row[key.replace("_bytes", "_human")] = human(vm[key])
         row["disks_json"], row["filesystems_json"] = vm["disks"], vm["filesystems"]
         rows.append(row)
     extra = [k.replace("_bytes", "_human") for k in ("configured_bytes", "actual_bytes", "ram_bytes", "memory_used_bytes")]
-    write_csv(directory / "vms.csv", VM_COLUMNS + extra + ["disks_json", "filesystems_json"], rows)
+    write_csv(directory / "vms.csv", VM_COLUMNS + extra + ["measurement_status", "known_actual_bytes", "measured_disk_count", "counted_disk_count", "measured_subtotals", "disks_json", "filesystems_json"], rows)
     disk_columns = ["vmid", "node", "slot", "volume", "storage", "counted", "excluded_reason", "capacity_bytes",
-                    "capacity_reason", "actual_bytes", "actual_method", "actual_reason", "backup_disk", "identity"]
+                    "capacity_reason", "actual_bytes", "actual_method", "actual_reason", "backup_disk", "identity", "measurement_status", "measurement_seconds", "cached_measurement"]
     write_csv(directory / "disks.csv", disk_columns,
               [dict(d, vmid=v["vmid"], node=v["node"]) for v in report["vms"] for d in v["disks"]])
     write_csv(directory / "filesystems.csv", ["vmid", "node", "mountpoint", "name", "type", "used_bytes", "free_bytes", "total_bytes", "reason"],
@@ -2166,7 +2273,7 @@ def main(argv=None):
     parser.add_argument("--no-prompt", action="store_true", help="Use explicit options/detection without startup questions")
     parser.add_argument("--config", type=Path, help="Optional JSON credentials/settings file; environment overrides it")
     outputs = parser.add_mutually_exclusive_group()
-    outputs.add_argument("--output-dir", type=Path, help="New or empty folder for this run")
+    outputs.add_argument("--output-dir", type=Path, help="Report folder; existing report and log files are replaced")
     outputs.add_argument("--output-root", type=Path, help="Parent folder for unique run directories")
     parser.add_argument("--sort", choices=("configured", "actual"), default="configured")
     parser.add_argument("--storage-timeout", type=float, default=60, help="Seconds per storage measurement (default 60); separate from connection/general queries")
@@ -2238,8 +2345,6 @@ def main(argv=None):
         def setting(name):
             return os.environ.get("PVE_" + name.upper(), config.get(name))
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        if tracker is None and any(args.output_dir.iterdir()):
-            raise ValueError("Output directory is not empty; choose a new directory to preserve previous reports")
         with tempfile.TemporaryFile(dir=args.output_dir):
             pass
         for command in ({"ssh": ["ssh"], "local": ["pvesh"], "cli": ["qm", "pvesm"]}.get(mode, [])):
