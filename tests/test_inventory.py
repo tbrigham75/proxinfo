@@ -21,6 +21,9 @@ class FakeClient:
         self.calls = []
         self.data = {
             "/version": {"version": "synthetic-test"},
+            "/cluster/status": [{"type":"node","name":"a","ip":"192.0.2.1"},{"type":"node","name":"b","ip":"192.0.2.2"}],
+            "/nodes/a/status": {}, "/nodes/b/status": {},
+            "/nodes/a/storage": [], "/nodes/b/storage": [],
             "/nodes": [{"node": "a", "status": "online"}, {"node": "b", "status": "online"}],
             "/cluster/resources": [
                 {"vmid": 100, "type": "qemu", "node": "a", "name": "large", "status": "running"},

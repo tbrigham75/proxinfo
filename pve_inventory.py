@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 
 class CronBusy(Exception):
@@ -311,7 +311,7 @@ class Client:
         # Fixed GET-only surface, including exactly one read-only guest-agent command.
         allowed = (
             r"/version", r"/nodes", r"/cluster/status", r"/cluster/resources", r"/cluster/backup",
-            r"/storage", r"/cluster/backup/[^/]+/included_volumes",
+            r"/nodes/[^/]+/(?:status|storage)", r"/storage", r"/cluster/backup/[^/]+/included_volumes",
             r"/nodes/[^/]+/qemu/\d+/(?:config|status/current|agent/get-fsinfo)",
             r"/nodes/[^/]+/storage/[^/]+/content/[^/]+",
         )
@@ -515,7 +515,7 @@ class PBSClient:
 
     def get(self, path, **params):
         paths = (r"/version", r"/admin/datastore", r"/config/datastore/[^/]+", r"/config/prune",
-                 r"/admin/prune", r"/config/verify", r"/admin/verify", r"/nodes/localhost/tasks",
+                 r"/admin/sync", r"/config/sync", r"/admin/prune", r"/config/verify", r"/admin/verify", r"/nodes/localhost/tasks",
                  r"/admin/datastore/[^/]+/(?:status|namespace|groups|snapshots|gc)")
         if not any(re.fullmatch(pattern, path) for pattern in paths):
             raise ValueError("Not an approved PBS inventory GET path: " + path)
@@ -647,6 +647,7 @@ class PBSCollector:
         prune_status = self.read("/admin/prune", list)
         verify_config = self.read("/config/verify", list)
         verify_status = self.read("/admin/verify", list)
+        sync_jobs = self.read("/admin/sync", list)
         names = self.stores if self.stores else [s["store"] for s in visible or [] if isinstance(s, dict) and s.get("store")]
         results, all_groups, all_snapshots = [], [], []
         for store in dict.fromkeys(names):
@@ -762,7 +763,7 @@ class PBSCollector:
                     latest_success=next((t for t in matching if t.get('status') == 'OK' and t.get('endtime') is not None), None))
             if not local_capacity:
                 capacity = None
-            results.append(dict(backend_type=backend_type, backing_scope=(config or {}).get('path'),
+            results.append(dict(backup_attempts=[t for t in tasks or [] if t.get("worker_type", t.get("worker-type")) == "backup"], sync_jobs=[j for j in sync_jobs or [] if j.get("store") == store] if sync_jobs is not None else None, backend_type=backend_type, backing_scope=(config or {}).get('path'),
                 task_history=dict(since=since, records=len(tasks), complete_within_visible_scope=task_complete, limit=self.task_limit),
                 cleanup_history=latest_cleanup,
                 verification_jobs=[j for j in verify_status or [] if j.get("store")==store] if verify_status is not None else None,
@@ -792,6 +793,9 @@ def cluster_ssh_prefix():
 
 
 def approved_backend_command(command):
+    if (len(command) == 7 and command[:3] == ['findmnt', '--json', '--target']
+            and command[3].startswith('/') and command[4:] == ['--output', 'SOURCE,TARGET,FSTYPE,UUID', '--first-only']):
+        return True
     if len(command) == 16 and command[:1] == ['ssh']:
         node = command[10].removeprefix('HostKeyAlias=')
         address = command[14].removeprefix('root@')
@@ -1264,6 +1268,8 @@ class Collector:
             raise ReadError("No visible VMs match the selection; full inventory was not substituted")
         resources = selected + [r for r in resources if r.get("type") != "qemu"]
         nodes, _ = self.read("/nodes")
+        address_rows, _ = (None, None) if getattr(self.client, "container_count_unknown", False) else self.read("/cluster/status")
+        host_addresses = {item.get("name"): item.get("ip") for item in address_rows or [] if item.get("type") == "node"}
         node_status = {item["node"]: item.get("status") for item in nodes or []}
         storage_list, _ = self.read("/storage")
         storages = {item["storage"]: item for item in storage_list or []}
@@ -1375,6 +1381,7 @@ class Collector:
                             disk.update(actual_bytes=None, actual_method=None, actual_reason=reason, measurement_status='placement changed')
         return dict(generated_at=datetime.now(timezone.utc).isoformat(), pve_version=version,
                     vms=vms, nodes=nodes, jobs=jobs, warnings=self.warnings,
+                    hosts=[dict(node=n["node"], address=host_addresses.get(n["node"]), status=n.get("status"), details=self.read("/nodes/" + segment(n["node"]) + "/status")[0] if n.get("status") != "offline" else None, storage=self.read("/nodes/" + segment(n["node"]) + "/storage")[0] if n.get("status") != "offline" else None) for n in nodes or [] if (not self.selected_nodes or n["node"] in self.selected_nodes) and not getattr(self.client, "container_count_unknown", False)],
                     pbs_destinations=[{k:st.get(k) for k in ("storage","server","datastore","namespace")} for st in storages.values() if st.get("type")=="pbs"],
                     scope=dict(targeted=bool(self.vmids or self.selected_nodes), vmids=sorted(self.vmids), nodes=sorted(self.selected_nodes), discovered=len(visible), selected=len(selected)),
                     skipped_containers=(None if getattr(self.client, "container_count_unknown", False) else
@@ -1776,7 +1783,7 @@ def write_csv(path, columns, rows):
 HTML_STYLE = r'''
 :root{color-scheme:light;--bg:#f3f6fa;--panel:#fff;--ink:#18273b;--muted:#5d6c80;--line:#dce4ed;--accent:#146c60;--soft:#e5f3ee;--amber:#8a5814;--amber-bg:#fff4df;--header:#edf2f7;--shadow:0 5px 24px #18273b08}
 :root[data-theme=dark]{color-scheme:dark;--bg:#10171f;--panel:#19232e;--ink:#e7eef7;--muted:#a6b7c9;--line:#31404f;--accent:#80d9c0;--soft:#203c37;--amber:#f0c779;--amber-bg:#3b3020;--header:#202c39;--shadow:none}
-*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:20px}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button,a,input,select,summary{outline-offset:4px}button,summary{cursor:pointer}a{color:var(--accent)}.shell{max-width:1600px;margin:auto;padding:36px clamp(18px,4vw,60px)}.masthead,.section-head,.toolbar,.brand{display:flex;align-items:center;gap:16px}.masthead,.section-head{justify-content:space-between}.brand-mark{background:var(--ink);color:var(--panel);font-size:13px;font-weight:800;letter-spacing:1px;border-radius:12px;padding:12px}.eyebrow{font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:1.8px;color:var(--accent);margin:0 0 5px}h1{font-size:clamp(27px,3vw,38px);letter-spacing:-1.3px;line-height:1.2;margin:0}h2{font-size:20px;letter-spacing:-.5px;margin:0}h3{font-size:15px;margin:0 0 6px}p{margin:8px 0}.muted,.meta,.hint{color:var(--muted)}.meta{font-size:12px}.nav{display:flex;gap:24px;border-bottom:1px solid var(--line);padding:22px 0 14px;margin-bottom:26px;flex-wrap:wrap}.nav a{text-decoration:none;font-size:13px;color:var(--muted);font-weight:650}.nav a:hover{color:var(--accent)}.button{border:1px solid var(--line);border-radius:9px;padding:8px 13px;background:var(--panel);color:var(--ink);white-space:nowrap}.button:hover{border-color:var(--accent)}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card,.panel{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:15px}.card{padding:22px}.card .label{font-size:12px;color:var(--muted);font-weight:650}.card .value{font-size:30px;font-weight:720;letter-spacing:-1px;line-height:1.3;margin:9px 0}.card p{font-size:12px;color:var(--muted)}.card.primary{border-top:3px solid var(--accent)}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:5px;padding:2px 7px;font-size:11px;font-weight:650;background:var(--header);color:var(--muted)}.badge.good{background:var(--soft);color:var(--accent)}.badge.warn{background:var(--amber-bg);color:var(--amber)}.panel{padding:24px;margin-top:20px}.two-col{display:grid;grid-template-columns:1.2fr 1fr;gap:20px}.two-col .panel{min-width:0}.section-head{align-items:flex-start;margin-bottom:15px}.coverage{height:8px;background:var(--header);border-radius:9px;overflow:hidden;margin:14px 0}.coverage span{display:block;height:100%;background:var(--accent)}.reason-list{padding-left:20px;color:var(--muted);font-size:13px}.reason-list li{margin-bottom:9px}.callout{border-left:3px solid var(--accent);background:var(--soft);padding:10px 14px;border-radius:0 8px 8px 0;font-size:13px;margin-top:15px}.subtotal{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-top:1px solid var(--line);font-size:13px}.subtotal span{color:var(--muted)}.top-list{list-style:none;margin:0;padding:0}.top-list li{padding:10px 0;border-bottom:1px solid var(--line)}.top-label{display:flex;justify-content:space-between;gap:12px;font-size:12px}.rank{color:var(--muted);display:inline-block;min-width:23px}.bar{height:5px;margin:7px 0 0 25px;border-radius:5px;background:var(--header)}.bar span{display:block;height:100%;border-radius:5px;background:var(--accent);opacity:.8}.toolbar{flex-wrap:wrap;margin:15px 0}.toolbar input,.toolbar select{border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);padding:9px 12px}.toolbar input[type=search]{flex:1;min-width:220px}.toolbar label{display:flex;gap:7px;align-items:center;font-size:12px;color:var(--muted)}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{border-collapse:collapse;width:100%;font-size:12px}#vms{min-width:1200px}.toolbar input[type=checkbox]{width:auto;min-width:0;flex:none;margin:0}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px 11px;vertical-align:top}th{background:var(--header);white-space:nowrap;font-size:11px;color:var(--muted);position:sticky;top:0;z-index:1}th button{background:none;border:0;font:inherit;color:inherit;font-weight:700;padding:0;text-align:left}th[aria-sort=ascending] button::after{content:' ↑'}th[aria-sort=descending] button::after{content:' ↓'}td{font-variant-numeric:tabular-nums}tr:last-child td{border-bottom:0}tr.top td:first-child{box-shadow:inset 3px 0 var(--accent)}td:nth-child(6),td:nth-child(7),td:nth-child(8),td:nth-child(9){white-space:nowrap}td small{display:block;color:var(--muted);font-size:10px}details>summary{font-size:12px;color:var(--accent);font-weight:600}details[open]>summary{margin-bottom:12px}.metric-reason{white-space:normal;min-width:110px;max-width:330px}.metric-reason p{font-size:12px;color:var(--muted)}.vm-details{min-width:190px}.vm-details[open]{min-width:450px;max-width:680px}.disk-detail{padding:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;margin-top:10px;overflow-wrap:anywhere}.disk-detail p{font-size:12px}.guide-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px}.guide-grid p{font-size:13px;color:var(--muted)}.subsection{margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}.technical dl{display:grid;grid-template-columns:minmax(180px,1fr) 2fr;gap:10px 24px;font-size:12px}.technical dt{font-weight:600}.technical dd{margin:0;color:var(--muted)}.warning-list{font-size:12px;overflow-wrap:anywhere;padding-left:20px}.footer{display:flex;justify-content:space-between;gap:18px;color:var(--muted);font-size:11px;padding:25px 0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}[hidden]{display:none!important}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:20px}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select{font:inherit}button,a,input,select,summary{outline-offset:4px}button,summary{cursor:pointer}a{color:var(--accent)}.shell{max-width:1600px;margin:auto;padding:36px clamp(18px,4vw,60px)}.masthead,.section-head,.toolbar,.brand{display:flex;align-items:center;gap:16px}.masthead,.section-head{justify-content:space-between}.brand-mark{background:var(--ink);color:var(--panel);font-size:13px;font-weight:800;letter-spacing:1px;border-radius:12px;padding:12px}.eyebrow{font-size:11px;font-weight:750;text-transform:uppercase;letter-spacing:1.8px;color:var(--accent);margin:0 0 5px}h1{font-size:clamp(27px,3vw,38px);letter-spacing:-1.3px;line-height:1.2;margin:0}h2{font-size:20px;letter-spacing:-.5px;margin:0}h3{font-size:15px;margin:0 0 6px}p{margin:8px 0}.muted,.meta,.hint{color:var(--muted)}.meta{font-size:12px}.nav{display:flex;gap:24px;border-bottom:1px solid var(--line);padding:22px 0 14px;margin-bottom:26px;flex-wrap:wrap}.nav a{text-decoration:none;font-size:13px;color:var(--muted);font-weight:650}.nav a:hover{color:var(--accent)}.button{border:1px solid var(--line);border-radius:9px;padding:8px 13px;background:var(--panel);color:var(--ink);white-space:nowrap}.button:hover{border-color:var(--accent)}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.card,.panel{background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:15px}.card{padding:22px}.card .label{font-size:12px;color:var(--muted);font-weight:650}.card .value{font-size:30px;font-weight:720;letter-spacing:-1px;line-height:1.3;margin:9px 0}.card p{font-size:12px;color:var(--muted)}.card.primary{border-top:3px solid var(--accent)}.badge{display:inline-flex;align-items:center;gap:5px;border-radius:5px;padding:2px 7px;font-size:11px;font-weight:650;background:var(--header);color:var(--muted)}.badge.good{background:var(--soft);color:var(--accent)}.badge.warn{background:var(--amber-bg);color:var(--amber)}.panel{padding:24px;margin-top:20px}.two-col{display:grid;grid-template-columns:1.2fr 1fr;gap:20px}.two-col .panel{min-width:0}.section-head{align-items:flex-start;margin-bottom:15px}.coverage{height:8px;background:var(--header);border-radius:9px;overflow:hidden;margin:14px 0}.coverage span{display:block;height:100%;background:var(--accent)}.reason-list{padding-left:20px;color:var(--muted);font-size:13px}.reason-list li{margin-bottom:9px}.callout{border-left:3px solid var(--accent);background:var(--soft);padding:10px 14px;border-radius:0 8px 8px 0;font-size:13px;margin-top:15px}.subtotal{display:flex;justify-content:space-between;gap:16px;padding:10px 0;border-top:1px solid var(--line);font-size:13px}.subtotal span{color:var(--muted)}.top-list{list-style:none;margin:0;padding:0}.top-list li{padding:10px 0;border-bottom:1px solid var(--line)}.top-label{display:flex;justify-content:space-between;gap:12px;font-size:12px}.rank{color:var(--muted);display:inline-block;min-width:23px}.bar{height:5px;margin:7px 0 0 25px;border-radius:5px;background:var(--header)}.bar span{display:block;height:100%;border-radius:5px;background:var(--accent);opacity:.8}.toolbar{flex-wrap:wrap;margin:15px 0}.scope-control select{border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--ink);padding:8px 12px}.toolbar input,.toolbar select{border:1px solid var(--line);border-radius:9px;background:var(--bg);color:var(--ink);padding:9px 12px}.toolbar input[type=search]{flex:1;min-width:220px}.toolbar label{display:flex;gap:7px;align-items:center;font-size:12px;color:var(--muted)}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:10px}table{border-collapse:collapse;width:100%;font-size:12px}#vms{min-width:1200px}#inventory .table-wrap{max-height:70vh}@media print{#inventory .table-wrap{max-height:none}}.toolbar input[type=checkbox]{width:auto;min-width:0;flex:none;margin:0}th,td{text-align:left;border-bottom:1px solid var(--line);padding:12px 11px;vertical-align:top}th{background:var(--header);white-space:nowrap;font-size:11px;color:var(--muted);position:sticky;top:0;z-index:1}th button{background:none;border:0;font:inherit;color:inherit;font-weight:700;padding:0;text-align:left}th[aria-sort=ascending] button::after{content:' ↑'}th[aria-sort=descending] button::after{content:' ↓'}td{font-variant-numeric:tabular-nums}tr:last-child td{border-bottom:0}tr.top td:first-child{box-shadow:inset 3px 0 var(--accent)}td:nth-child(6),td:nth-child(7),td:nth-child(8),td:nth-child(9){white-space:nowrap}td small{display:block;color:var(--muted);font-size:10px}details>summary{font-size:12px;color:var(--accent);font-weight:600}details[open]>summary{margin-bottom:12px}.metric-reason{white-space:normal;min-width:110px;max-width:330px}.metric-reason p{font-size:12px;color:var(--muted)}.vm-details{min-width:190px}.vm-details[open]{min-width:190px}.vm-drawer{margin:0 0 0 auto;max-height:100vh;height:100vh;max-width:680px;border-radius:0;padding:24px}.disk-detail{padding:12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;margin-top:10px;overflow-wrap:anywhere}.disk-detail p{font-size:12px}.guide-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:22px}.guide-grid p{font-size:13px;color:var(--muted)}.subsection{margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}.technical dl{display:grid;grid-template-columns:minmax(180px,1fr) 2fr;gap:10px 24px;font-size:12px}.technical dt{font-weight:600}.technical dd{margin:0;color:var(--muted)}.warning-list{font-size:12px;overflow-wrap:anywhere;padding-left:20px}.footer{display:flex;justify-content:space-between;gap:18px;color:var(--muted);font-size:11px;padding:25px 0}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}[hidden]{display:none!important}
 @media(prefers-color-scheme:dark){:root:not([data-theme=light]){color-scheme:dark;--bg:#10171f;--panel:#19232e;--ink:#e7eef7;--muted:#a6b7c9;--line:#31404f;--accent:#80d9c0;--soft:#203c37;--amber:#f0c779;--amber-bg:#3b3020;--header:#202c39;--shadow:none}}
 @media(max-width:1100px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.two-col{grid-template-columns:1fr}.guide-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:600px){.shell{padding:22px 14px}.brand-mark{display:none}.cards,.guide-grid{grid-template-columns:1fr}.panel{padding:18px}.technical dl{grid-template-columns:1fr}.masthead{align-items:flex-start}.footer{display:block}.toolbar input[type=search]{min-width:160px}}
@@ -1821,8 +1828,11 @@ window.addEventListener('hashchange',route);route();
 const dialog=document.querySelector('#explanation-dialog');
 document.querySelectorAll('[data-help]').forEach(link=>link.addEventListener('click',event=>{const entry=document.getElementById('help-'+link.dataset.help);if(!entry||typeof dialog.showModal!=='function')return;event.preventDefault();const content=entry.cloneNode(true);content.removeAttribute('id');const heading=content.querySelector('h3');document.querySelector('#explanation-title').textContent=heading.textContent;heading.remove();document.querySelector('#explanation-content').replaceChildren(content);dialog.showModal();}));
 dialog.addEventListener('click',event=>{if(event.target===dialog){const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close();}});
+const vmDialog=document.createElement('dialog');vmDialog.className='vm-drawer';vmDialog.innerHTML='<form method="dialog"><button class="button">Close VM information</button></form><div class="vm-drawer-body"></div>';document.body.append(vmDialog);
+document.querySelectorAll('.vm-details').forEach(details=>details.addEventListener('toggle',()=>{if(details.open){vmDialog.querySelector('.vm-drawer-body').innerHTML=details.innerHTML;vmDialog.querySelector('.vm-drawer-body summary')?.remove();details.open=false;vmDialog.showModal();}}));
+const pbsPage=document.querySelector('[data-page="pbs"]');if(pbsPage&&pbsPage.querySelector('#pbs-inventory')){Array.from(pbsPage.children).filter(e=>e.querySelector('h2')?.textContent.startsWith('Datastore:')).forEach(panel=>{const retention=panel.querySelector(':scope > .subsection');if(retention){const section=document.createElement('section');section.className='panel';const title=document.createElement('h2');title.textContent='Retention & cleanup · '+panel.querySelector('h2').textContent;section.append(title,retention);pbsPage.append(section);}});const panels=Array.from(pbsPage.children).filter(e=>e.tagName==='SECTION');const controls=document.createElement('div');controls.className='toolbar';const groups=['Overview','Backups','Activity','Retention & cleanup','Evidence'];panels.forEach(panel=>{const heading=panel.querySelector('h2')?.textContent||'';panel.dataset.pbsSection=heading.startsWith('Retention & cleanup')?'Retention & cleanup':heading==='Backup inventory'?'Backups':heading.includes('attempts and secondary')?'Activity':heading.includes('evidence')||heading.includes('visibility')||heading.includes('checks')?'Evidence':'Overview';});groups.forEach(name=>{const button=document.createElement('button');button.className='button';button.textContent=name;button.type='button';button.onclick=()=>{panels.forEach(p=>p.hidden=p.dataset.pbsSection!==name);controls.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed',String(b===button)));};controls.append(button);});pbsPage.insertBefore(controls,panels[0]);controls.firstElementChild.click();}
 function humanBytes(value){let amount=Number(value);for(const unit of ['B','KiB','MiB','GiB','TiB','PiB','EiB']){if(amount<1024||unit==='EiB')return amount.toFixed(2)+' '+unit;amount/=1024;}}
-function updateStorageTotals(rows){const label=document.querySelector('#table-total-label'),assigned=document.querySelector('#table-assigned-total'),used=document.querySelector('#table-used-total'),note=document.querySelector('#table-total-note');label.textContent=`Storage total for ${rows.length} shown machines`;if(!rows.length){assigned.textContent='—';used.textContent='—';note.textContent='No machines match the filters.';return;}
+function updateStorageTotals(rows){const label=document.querySelector('#table-total-label'),assigned=document.querySelector('#table-assigned-total'),used=document.querySelector('#table-used-total'),note=document.querySelector('#table-total-note');const ram=document.querySelector('#table-ram-total');const values=rows.map(r=>r.cells[7]).filter(c=>c.dataset.missing!=='true').map(c=>BigInt(c.dataset.value));ram.textContent=!rows.length?'—':values.length===rows.length?humanBytes(values.reduce((a,b)=>a+b,0n)):(values.length?humanBytes(values.reduce((a,b)=>a+b,0n))+' known · '+values.length+' of '+rows.length+' VMs':'N/A');label.textContent=`Totals for ${rows.length} shown VMs`;if(!rows.length){assigned.textContent='—';used.textContent='—';note.textContent='No machines match the filters.';return;}
  const disks=new Map();let missingConfig=false,unknownIdentity=false;
  rows.forEach(row=>{if(row.dataset.configAvailable!=='true')missingConfig=true;JSON.parse(row.dataset.disks).forEach(d=>{if(!d.identity){unknownIdentity=true;return;}const key=JSON.stringify(d.identity);if(disks.has(key)){const old=disks.get(key);if(old.capacity!==d.capacity)old.capacity=null;if(old.used!==d.used||old.method!==d.method){old.used=null;old.method=null;}}else disks.set(key,{...d});});});
  let assignedKnown=0n,usedKnown=0n,sizes=0,measurements=0;const methods=new Set();disks.forEach(d=>{if(d.capacity!==null){assignedKnown+=BigInt(d.capacity);sizes++;}if(d.used!==null&&d.method){usedKnown+=BigInt(d.used);measurements++;methods.add(d.method);}});
@@ -1833,8 +1843,11 @@ function updateStorageTotals(rows){const label=document.querySelector('#table-to
 const search=document.querySelector('#search'),nodeFilter=document.querySelector('#node-filter'),missingOnly=document.querySelector('#missing-only'),resultCount=document.querySelector('#result-count');
 function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const match=row.dataset.search.includes(search.value.toLowerCase().trim())&&(!nodeFilter.value||row.dataset.node===nodeFilter.value)&&(!missingOnly.checked||row.dataset.missingAllocation==='true');row.hidden=!match;if(match)shown.push(row);});const active=[search.value.trim()?'Search: '+search.value.trim():'',nodeFilter.value?'PVE node: '+nodeFilter.value:'',missingOnly.checked?'Usage unavailable':''].filter(Boolean);resultCount.textContent=`${shown.length} of ${body.rows.length} machines shown`+(active.length?' — '+active.join(' · '):' — All VMs');document.querySelector('#no-results').hidden=shown.length!==0;updateStorageTotals(shown);}
 search.addEventListener('input',filterRows);nodeFilter.addEventListener('change',filterRows);missingOnly.addEventListener('change',filterRows);
-document.querySelector('#show-resources').addEventListener('change',event=>{table.dataset.resources=String(event.target.checked);document.querySelector('#table-total-note').closest('td').colSpan=event.target.checked?5:2;});
-function clearFilters(){search.value='';nodeFilter.value='';missingOnly.checked=false;filterRows();}
+document.querySelector('#show-resources').addEventListener('change',event=>{table.dataset.resources=String(event.target.checked);document.querySelector('#table-total-note').closest('td').colSpan=event.target.checked?4:2;document.querySelector('#table-ram-total').hidden=!event.target.checked;});
+const globalNode=document.querySelector('#global-node-filter');const nodeViews=JSON.parse(document.querySelector('#node-view-data')?.textContent||'{}');const fullViews={};['overview','hosts','review','storage'].forEach(key=>{fullViews[key]=document.querySelector(`[data-page="${key}"]`).innerHTML;});
+function applyNodeView(value){if(globalNode)globalNode.value=value;nodeFilter.value=value;filterRows();for(const key of Object.keys(fullViews)){document.querySelector(`[data-page="${key}"]`).innerHTML=value&&nodeViews[value]?nodeViews[value][key]:fullViews[key];}const note=document.querySelector('#global-scope-note');if(note)note.textContent=(value?'Viewing PVE node: '+value:'Viewing all collected PVE nodes')+'. PBS, backup-job definitions and exports retain their full collected scope.';document.querySelectorAll('[data-review-vmid]').forEach(link=>{link.onclick=event=>{event.preventDefault();applyNodeView('');search.value='';missingOnly.checked=false;filterRows();showPage('machines');location.hash='machines';const target=Array.from(body.rows).find(row=>row.cells[0].dataset.value===link.dataset.reviewVmid);body.querySelectorAll('.selected-vm').forEach(r=>r.classList.remove('selected-vm'));if(target){target.classList.add('selected-vm');target.scrollIntoView({block:'center'});}};});const missingButton=document.querySelector('#show-missing');if(missingButton)missingButton.onclick=()=>{missingOnly.checked=true;filterRows();showPage('machines');location.hash='machines';};}
+if(globalNode){globalNode.onchange=()=>applyNodeView(globalNode.value);nodeFilter.addEventListener('change',()=>applyNodeView(nodeFilter.value));}
+function clearFilters(){search.value='';nodeFilter.value='';missingOnly.checked=false;applyNodeView('');}
 document.querySelector('#clear-filters').addEventListener('click',clearFilters);
 document.querySelectorAll('[data-review-vmid]').forEach(link=>link.addEventListener('click',event=>{event.preventDefault();clearFilters();location.hash='machines';showPage('machines');Array.from(body.rows).forEach(row=>{const selected=row.cells[0].dataset.value===link.dataset.reviewVmid;row.classList.toggle('selected-vm',selected);if(selected){row.tabIndex=-1;requestAnimationFrame(()=>{row.scrollIntoView({block:'center'});row.focus({preventScroll:true});});}});}));
 document.querySelector('#show-missing').addEventListener('click',()=>{missingOnly.checked=true;filterRows();location.hash='machines';showPage('machines',true);});
@@ -1856,7 +1869,7 @@ REPORT_HELP = {
     "assigned": ("Assigned disk space", "This is the size of the disks made available to a VM, whether or not it has filled them. For example, a 500 GiB disk counts as 500 GiB even if it contains only 20 GiB of files. The overall total counts repeated references to the same identified disk once. It excludes installation media and disks that are no longer attached. It is not a measurement of backup storage used."),
     "measured": ("Measured storage used", "This is the disk space that a supported storage system reports as allocated to VM disks. It differs from assigned disk size and from files used inside a VM. Storage systems can count shared data, snapshots and compressed data differently. A total is shown only when every disk can be identified and has a comparable measurement. It does not establish unique physical space used, space recoverable by deletion, or backup storage used."),
     "missing": ("Why a number may be unavailable", "N/A means no reliable number is available; it does not mean zero. The storage system may not provide a supported measurement, the account may lack access, or a server may not respond. A missing VM configuration can also prevent a full total. Known subtotals cover only the disks that could be read. Open the VM's Data availability section for a plain-language explanation, or its IT reference for the exact request details."),
-    "memory": ("Memory assigned and memory in use", "Memory (RAM) is the short-term workspace a computer uses while running applications. It is different from disk space, which stores files. Assigned memory is the maximum configured for the VM. Memory in use is the current value reported by Proxmox; it can be affected by memory-sharing and reporting settings. This report does not measure the memory used by each application."),
+    "memory": ("RAM assigned and memory in use", "Memory (RAM) is the short-term workspace a computer uses while running applications. It is different from disk space, which stores files. Assigned memory is the maximum configured for the VM. RAM in use is the current value reported by Proxmox; it can be affected by memory-sharing and reporting settings. This report does not measure the memory used by each application."),
     "cpu": ("Virtual CPUs", "Virtual CPUs are the processing capacity assigned to a VM. A larger number lets it use more processing work at once, subject to what the host can supply. They are not a count of physical processor cores owned by the VM, and this number does not show current processor usage."),
     "backups": ("Scheduled for backup", "Yes means at least one currently enabled Proxmox backup schedule selects this VM. No means no enabled schedule selects it among the schedules successfully checked. Unknown means the selection could not be determined. This does not prove that a backup ran or succeeded. Manual backups, older backups and jobs outside PVE are not discovered here. A schedule can select a VM while excluding some of its disks."),
     "inside": ("Space inside the virtual machine", "These numbers describe the drives or mounted folders reported by a small helper service inside the VM, called the guest agent. Used means space occupied within that reported filesystem; free is reported total minus used. A mount point is the drive letter or folder where that filesystem is accessed. The same storage can appear in more than one place, so these entries are not added together. Missing data often means the VM is off or the helper service is unavailable."),
@@ -1980,7 +1993,7 @@ def vm_information_html(vm):
         '<details class="subsection"><summary>Disks and storage</summary><p class="hint">Assigned space is the size given to the machine. Storage used is a separate measurement. ' + report_help_link("assigned", "Explain the difference") + '</p>' + disk_html + '</details>' + \
         '<details class="subsection"><summary>Space inside the VM</summary><p class="hint">Space used and free on its drives or folders. Entries can overlap and are not added together. ' + report_help_link("inside", "How is this measured?") + '</p>' + inside_html + '</details>' + \
         '<details class="subsection"><summary>Backup schedules</summary><p>' + ('Selection could not be confirmed.' if vm["backup"] == NA else 'An active schedule selects this machine.' if vm["backup"] == 'Yes' else 'No active schedule was found selecting this machine.') + '</p><p><strong>Active schedules:</strong> ' + esc(', '.join(vm["enabled_jobs"]) or "None confirmed") + '<br><strong>Inactive schedules:</strong> ' + esc(', '.join(vm["disabled_jobs"]) or "None confirmed") + '</p><p class="hint">Selection does not prove that a backup succeeded. ' + report_help_link("backups", "What does this tell me?") + '</p></details>' + \
-        '<details class="subsection"><summary>Memory and processing</summary><p>Memory assigned: <strong>' + human(vm["ram_bytes"]) + '</strong><br>Memory in use: <strong>' + human(vm["memory_used_bytes"]) + '</strong><br>Virtual CPUs assigned: <strong>' + esc(vm["vcpus"]) + '</strong></p>' + report_help_link("memory", "Explain memory") + ' · ' + report_help_link("cpu", "Explain virtual CPUs") + '</details>' + \
+        '<details class="subsection"><summary>Memory and processing</summary><p>RAM assigned: <strong>' + human(vm["ram_bytes"]) + '</strong><br>RAM in use: <strong>' + human(vm["memory_used_bytes"]) + '</strong><br>Virtual CPUs assigned: <strong>' + esc(vm["vcpus"]) + '</strong></p>' + report_help_link("memory", "Explain memory") + ' · ' + report_help_link("cpu", "Explain virtual CPUs") + '</details>' + \
         '<details class="subsection"><summary>Data availability</summary>' + available_html + '</details>' + \
         '<details class="subsection"><summary>IT reference for this VM</summary><p class="hint">Original disk identifiers, measurement sources and collection messages for troubleshooting.</p><ul class="warning-list">' + ''.join('<li>' + esc(item) + '</li>' for item in raw) + '</ul></details>'
 
@@ -2073,7 +2086,7 @@ def pbs_extra_html(report):
         else:
             output.append('<p>History is disabled or more comparable readings are needed.</p>')
         output.append('<details><summary>History values and dates</summary><pre>'+esc(json.dumps(history,indent=2))+'</pre></details></section>')
-    output.append('<section class="panel"><h2>Scheduled VM backup visibility</h2><pre>'+esc(json.dumps(report.get('pbs',{}).get('backup_coverage',[]),indent=2))+'</pre><p>Only known PBS destinations are checked; ID matches do not prove cluster ownership.</p></section>')
+    output.append('<section class="panel"><h2>Scheduled VM backup visibility</h2>'+record_table(report.get('pbs',{}).get('backup_coverage',[]), [('vmid','VM'),('job','Backup job'),('datastore','Destination'),('namespace','Namespace'),('status','Evidence')])+'<p>ID matches alone do not prove ownership.</p></section>')
     output.append('<section class="panel"><h2>Connection and visibility checks</h2><pre>'+esc(json.dumps(report.get('pbs',{}).get('checks',[]),indent=2))+'</pre></section>')
     return ''.join(output)
 
@@ -2085,13 +2098,18 @@ def pbs_page_html(report):
     intro = '<p class="eyebrow">Separate backup server</p><h2 tabindex="-1">PBS backup storage</h2>'
     if not pbs.get("requested"):
         return intro + '<section class="panel"><h2>PBS reporting was skipped</h2><p>It is off by default. Choose include at the optional PBS prompt or add <code>--pbs</code> next time to collect backup-server information. No PBS credentials are needed when skipped.</p><p>This report still includes the PVE inventory and review findings. PBS capacity and cleanup results are unavailable.</p></section>'
-    out = [intro, '<p class="page-intro">Collection status: <strong>' + esc(status) + '</strong>. Capacity comes from PBS itself, not from adding VM disk sizes. ' + report_help_link("pbs", "Explain backup storage") + '</p>']
+    out = [intro, '<p>PBS server: ' + esc(pbs.get('server')) + '</p>', '<p class="page-intro">Collection status: <strong>' + esc(status) + '</strong>. Capacity comes from PBS itself, not from adding VM disk sizes. ' + report_help_link("pbs", "Explain backup storage") + '</p>']
     for store in pbs.get("datastores", []):
         total, used = store["total_bytes"], store["used_bytes"]
         percent = f"{100*used/total:.1f}%" if total and used is not None else NA
         gc = store.get("gc") or {}
+        location = store.get('location_evidence', {})
+        if location:
+            out.append('<section class="panel"><h3>Backing storage observed on ' + esc(location.get('ssh_host')) + '</h3>' + record_table(location.get('filesystems', []), [('target','Mount point'),('source','Device, dataset or share'),('fstype','Filesystem'),('uuid','Filesystem ID')]) + '</section>')
+        if store.get('location_error'):
+            out.append('<p>' + esc(store['location_error']) + '</p>')
         cards = [('Total filesystem capacity', human(total)), ('Used on that filesystem', human(used)), ('Available on that filesystem', human(store['available_bytes'])), ('Used / total', percent)]
-        out.append('<section class="panel"><h2>Datastore: ' + esc(store["store"]) + '</h2><div class="cards">' + ''.join('<div class="card"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>' for label, value in cards) + '</div><p class="hint">PBS reports the underlying filesystem. Other data or another datastore may share it, so do not add datastore capacities or interpret all used bytes as this datastore alone.</p>')
+        out.append('<section class="panel"><h2>Datastore: ' + esc(store["store"]) + '</h2><p>Configured folder on PBS: <strong>' + esc(store.get('backing_scope')) + '</strong></p><p>Backend: ' + esc(store.get('backend_type')) + '. The backing filesystem or device has not been independently identified.</p><div class="cards">' + ''.join('<div class="card"><div class="label">' + label + '</div><div class="value">' + value + '</div></div>' for label, value in cards) + '</div><p class="hint">PBS reports the underlying filesystem. Other data or another datastore may share it, so do not add datastore capacities or interpret all used bytes as this datastore alone.</p>')
         out.append('<div class="two-col"><article><h3>Backup inventory</h3><p>' + display(store["visible_group_count"]) + ' visible backup groups · ' + display(store["listed_snapshot_count"]) + ' snapshot records read.</p><p>' + ('Inventory queries completed within visible scope.' if store['inventory_complete'] else 'Inventory is incomplete; some namespaces, groups or snapshots could not be read.') + '</p><p class="hint">A backup group represents a machine or another backup source. A snapshot is one saved backup version. Namespaces are folders used to organize groups.</p></article><article><h3>Space cleanup</h3><p>Last garbage collection: <strong>' + esc(cleanup_result(gc)) + '</strong><br>Last completion: ' + utc_time(gc.get('last-run-endtime')) + '<br>Bytes removed in recorded GC statistics: ' + human(gc_measurement(gc, 'removed-bytes')) + '<br>Bytes waiting under safety rules: ' + human(gc_measurement(gc, 'pending-bytes')) + '</p><p class="hint">Pruning removes old backup references. Garbage collection later reclaims eligible unreferenced data. Recorded GC statistics may be older than the latest job result; pending bytes are not space that can necessarily be freed immediately.</p></article></div>')
         out.append('<div class="subsection"><h3>Retention and prune jobs</h3><p>Datastore-level rules: ' + esc(retention_description({"prune-backups": {k: v for k, v in (store.get('datastore_retention') or {}).items() if k.startswith('keep-')}}) if store.get('datastore_retention') is not None else 'Not available') + '</p>')
         configs = {j.get('id'): j for j in store.get('prune_config') or []}
@@ -2111,6 +2129,7 @@ def pbs_page_html(report):
     pve_ids = {str(v['vmid']) for v in report['vms']}
     out.append(pbs_inventory_html(report))
     out.append(pbs_extra_html(report))
+    out.append(pbs_jobs_html(report))
     out.append('<section class="panel"><details><summary>PBS collection messages · ' + str(len(pbs.get('warnings', []))) + '</summary><ul class="warning-list">' + (''.join('<li>' + esc(w) + '</li>' for w in pbs.get('warnings', [])) or '<li>No request failures were recorded. Permissions may still limit visible data.</li>') + '</ul></details></section>')
     return ''.join(out)
 
@@ -2140,13 +2159,119 @@ def management_summary_html(report):
     return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo management summary</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><div class="print-toolbar"><button class="button" onclick="window.print()">Print / Save as PDF</button> <a href="inventory.html">Open full report</a></div>' + management_body(report) + '</main></body></html>'
 
 
-def html_report(report):
+def compare_inventory(report, previous):
+    if previous is None:
+        return dict(status='No previous report selected', items=[])
+    old = json.loads(Path(previous).read_text(encoding='utf-8'))
+    selection = lambda r: {k:r.get('scope', {}).get(k) for k in ('targeted','vmids','nodes','pbs_only')}
+    if selection(old) != selection(report) or {n.get('node') for n in old.get('nodes') or []} != {n.get('node') for n in report.get('nodes') or []}:
+        return dict(status='Collection scopes differ; comparison withheld', items=[])
+    before = {v['vmid']:v for v in old.get('vms', [])}
+    after = {v['vmid']:v for v in report.get('vms', [])}
+    items = []
+    for vmid in sorted(before.keys() | after.keys()):
+        if vmid not in before:
+            items.append(dict(vmid=vmid, change='Newly visible in this report'))
+        elif vmid not in after:
+            items.append(dict(vmid=vmid, change='Not visible this run; deletion is unconfirmed'))
+        else:
+            a,b = before[vmid],after[vmid]
+            for key in ('node','configured_bytes','ram_bytes','vcpus','actual_bytes'):
+                if a.get(key) is None or b.get(key) is None:
+                    continue
+                if key == 'actual_bytes' and ({json.dumps(d.get('identity')) for d in unique_disks(a.get('disks', []))} != {json.dumps(d.get('identity')) for d in unique_disks(b.get('disks', []))} or a.get('actual_method') != b.get('actual_method') or not b.get('actual_method')):
+                    continue
+                if a[key] != b[key]:
+                    items.append(dict(vmid=vmid, change=key, previous=a[key], current=b[key]))
+    return dict(status='Compared selected reports; VM ID reuse and access changes can affect interpretation', previous_date=old.get('generated_at'), items=items)
+
+
+def record_table(records, columns):
+    esc = lambda x: html.escape(display(x), quote=True)
+    if not records:
+        return '<p>No records were returned in the checked scope.</p>'
+    return '<div class="table-wrap"><table><thead><tr>' + ''.join('<th>'+esc(label)+'</th>' for key,label in columns) + '</tr></thead><tbody>' + ''.join('<tr>'+''.join('<td>'+esc(r.get(key))+'</td>' for key,label in columns)+'</tr>' for r in records) + '</tbody></table></div>'
+
+
+def changes_html(report):
+    changes = report.get('changes') or dict(status='No previous report selected', items=[])
+    return '<h2>Changes between reports</h2><p>'+html.escape(changes['status'])+'</p><p>Compare reports from the same environment. Byte fields are exact byte counts. Missing measurements are never treated as zero.</p>'+record_table(changes['items'], [('vmid','VM ID'),('change','Changed field'),('previous','Previous'),('current','Current')])
+
+
+def pbs_jobs_html(report):
+    parts = ['<section class="panel"><h2>Backup attempts and secondary copies</h2><p>Results describe visible tasks. Successful synchronization is not a restore test or proof that every backup has a second copy.</p>']
+    for store in report.get('pbs', {}).get('datastores', []):
+        parts.append('<h3>'+html.escape(store['store'])+'</h3>')
+        attempts = sorted(store.get('backup_attempts', []), key=lambda t:t.get('starttime',0), reverse=True)
+        rows = [dict(source=t.get('worker_id'), started=utc_time(t.get('starttime')), result=t.get('status', 'Running or completion unavailable'), duration=t['endtime']-t['starttime'] if t.get('endtime') is not None and t.get('starttime') is not None else None) for t in attempts]
+        success = next((t for t in attempts if t.get('status') == 'OK' and t.get('endtime') is not None), None)
+        parts.append('<p>Most recent confirmed successful backup task in checked history: ' + utc_time(success.get('endtime') if success else None) + '. This date does not establish coverage for every VM.</p>')
+        parts.append(record_table(rows,[('source','Backup source'),('started','Attempt started'),('result','Result'),('duration','Duration (seconds)')]))
+        parts.append('<h3>Sync jobs</h3>'+ ('<p>Sync-job visibility unavailable.</p>' if store.get('sync_jobs') is None else record_table(store['sync_jobs'],[('id','Job'),('remote','Remote'),('remote-store','Remote datastore'),('schedule','Schedule'),('last-run-state','Last result')])) )
+    groups = report.get('pbs', {}).get('groups', [])
+    candidates = [dict(store=g['store'], group=g['backup_type']+'/'+g['backup_id'], namespace=g['namespace'], snapshots=g.get('snapshot_count'), protected=g.get('protected_count'), policies='No visible enabled PBS prune job' if g.get('pbs_prune_policies') is not None and not any(not j.get('disabled') for j in g['pbs_prune_policies']) else 'Review applicable policies') for g in groups if g.get('protected_count') or g.get('pbs_prune_policies') == []]
+    parts.append('<h3>Retention review candidates</h3><p>Protected versions and absent visible prune policies deserve review. Other retention mechanisms may apply. These are not deletion recommendations or estimates of recoverable space.</p>'+record_table(candidates, [('store','Datastore'),('namespace','Namespace'),('group','Group'),('snapshots','Versions'),('protected','Protected'),('policies','Policy visibility')]))
+    parts.append('<h3>Operator-recorded restore tests</h3><p>Supplied locally by an operator; ProxInfo has not performed or independently verified these tests.</p>'+record_table(report.get('restore_tests', []), [('server','PBS server'),('datastore','Datastore'),('source','Source'),('date','Test date'),('result','Result'),('notes','Notes')])+'</section>')
+    return ''.join(parts)
+
+
+def pbs_location_details(report, config, args, tracker):
+    host = config.get('pbs_ssh_host')
+    if not host or not report.get('pbs', {}).get('requested'):
+        return
+    client = SSHClient(host, user=config.get('pbs_ssh_user', 'root'),
+        port=config.get('pbs_ssh_port'), identity=config.get('pbs_ssh_key'),
+        timeout=args.pbs_timeout, batch=args.no_prompt, authentication='auto')
+    try:
+        client.connect()
+        client = ObservedClient(client, tracker)
+        for store in report['pbs'].get('datastores', []):
+            path = store.get('backing_scope')
+            if path and path.startswith('/'):
+                try:
+                    result = json.loads(client.backend_command(['findmnt', '--json', '--target', path,
+                        '--output', 'SOURCE,TARGET,FSTYPE,UUID', '--first-only']))
+                    store['location_evidence'] = dict(ssh_host=host, filesystems=result.get('filesystems', []))
+                except (ReadError, ValueError, OSError) as exc:
+                    store['location_error'] = str(exc)
+    except (ReadError, ValueError, OSError) as exc:
+        report['pbs']['warnings'].append('Optional PBS filesystem lookup unavailable: ' + str(exc))
+    finally:
+        client.close()
+
+
+def downloads_html():
+    files = [('Host inventory', 'hosts.csv'), ('Report changes', 'changes.csv'), ('VM spreadsheet', 'vms.csv'), ('Disk spreadsheet', 'disks.csv'),
+             ('Full inventory', 'inventory.json'), ('Printable summary', 'management-summary.html'),
+             ('PBS backup groups', 'pbs_groups.csv'), ('PBS snapshots', 'pbs_snapshots.csv')]
+    return '<h2>Downloads</h2><p>These files cover the entire collected report, regardless of browser filters. Keep them alongside this HTML file.</p><section class="panel">' + ''.join('<p><a href="' + path + '">' + label + '</a></p>' for label, path in files) + '</section>'
+
+
+def hosts_page_html(report):
+    esc = lambda value: html.escape(display(value), quote=True)
+    parts = ['<h2>PVE hosts</h2><p>Physical host readings at collection time. Assigned VM resources are separate from physical capacity. Missing readings do not establish that a host is offline.</p>']
+    for host in report.get('hosts', []):
+        info = host.get('details') or {}
+        ram = info.get('memory') or {}
+        cpu = info.get('cpuinfo') or {}
+        parts.append('<section class="panel"><h3>' + esc(host['node']) + '</h3><p>IP: ' + esc(host.get('address')) + ' · Status: ' + esc(host.get('status')) + ' · PVE: ' + esc(info.get('pveversion')) + ' · Uptime (seconds): ' + esc(info.get('uptime')) + '</p><p>CPU: ' + esc(cpu.get('model')) + ' · Logical processors: ' + esc(cpu.get('cpus')) + '</p><p>Physical RAM: ' + human(number(ram.get('total'))) + ' · Used: ' + human(number(ram.get('used'))) + ' · Available: ' + human(number(ram.get('available'))) + '</p><h3>Storage capacity reported on this host</h3><p>These are storage-location capacities, not attached VM disk totals. Shared or overlapping storage may appear on several hosts; these rows are not summed.</p><div class="table-wrap"><table><thead><tr><th>Location</th><th>Type</th><th>Total</th><th>Used</th><th>Available</th><th>Used %</th></tr></thead><tbody>')
+        for store in host.get('storage') or []:
+            total, used = number(store.get('total')), number(store.get('used'))
+            percent = f'{100*used/total:.1f}%' if total and used is not None else NA
+            parts.append('<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in (store.get('storage'), store.get('type'), human(total), human(used), human(number(store.get('avail'))), percent)) + '</tr>')
+        parts.append('</tbody></table></div>' + ('<p>Storage information unavailable.</p>' if host.get('storage') is None else '') + '</section>')
+    if not report.get('hosts'):
+        parts.append('<p>Host details were not collected in this report or connection mode.</p>')
+    return ''.join(parts)
+
+
+def html_report(report, include_scopes=True):
     esc = lambda value: html.escape(display(value), quote=True)
     vms, totals, diagnostic = report["vms"], report["storage_totals"], report["allocation_diagnostics"]
     count = len(vms)
     measured, identified = diagnostic["measured_disks"], diagnostic["identified_disks"]
     percent = round(100 * measured / identified) if identified else 0
-    nodes = sorted({v["node"] for v in vms})
+    nodes = sorted({v["node"] for v in vms} | {h["node"] for h in report.get("hosts", [])})
     yes, no, unknown = (sum(v["backup"] == state for v in vms) for state in ("Yes", "No", NA))
     try:
         date = datetime.fromisoformat(report["generated_at"]).astimezone(timezone.utc).strftime("%b %d, %Y at %H:%M UTC")
@@ -2187,7 +2312,7 @@ def html_report(report):
     subtotals = ''.join('<div class="subtotal"><span>' + esc(method_label(t["metric"].removeprefix("Allocation subtotal: "))) + ' · ' + str(t["measured_volumes"]) + ' disks</span><strong>' + human(t["known_subtotal_bytes"]) + '</strong></div>' for t in totals[2:]) or '<p class="muted">No supported usage measurements were returned. This does not mean the machines use zero space.</p>'
     missing = ''.join('<article class="disk-detail"><h3>' + esc(v["name"]) + ' · VM ' + esc(v["vmid"]) + '</h3><ul class="reason-list">' + ''.join('<li>' + esc(r) + '</li>' for r in allocation_vm_reason(v)) + '</ul></article>' for v in vms if v["actual_bytes"] is None) or '<p>No machines are missing their table-level storage-used measurement.</p>'
     storage = '<p class="eyebrow">What could be measured</p><h2 tabindex="-1">Storage measurements</h2><p class="page-intro">Assigned disk size and space actually used are different numbers. ' + report_help_link("measured", "Explain the difference") + '</p><section class="panel"><div class="section-head"><h2>' + ('The full measured total is available' if diagnostic["complete"] else 'Why the full storage-used total is N/A') + '</h2><span class="badge">' + str(measured) + ' of ' + str(identified) + ' disks</span></div><p>We show a full total only when all disks can be identified, measured and compared safely.</p><div class="coverage" role="meter" aria-label="Identified disks with a storage-used measurement" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + str(percent) + '"><span style="width:' + str(percent) + '%"></span></div><ul class="reason-list">' + ''.join('<li>' + esc(item) + '</li>' for item in gaps) + '</ul>' + subtotals + '<p class="hint">These amounts cover only the disks listed for each measurement type. Do not add them to the full total again. ' + report_help_link("missing", "What does N/A mean?") + '</p><button id="show-missing" class="button" type="button">Show machines with unavailable usage</button></section><section class="panel"><h2>Machines with unavailable usage</h2><p class="hint">These are gaps in what this report could measure, not proof that a machine or its storage has failed.</p>' + missing + '</section>'
-    headings = [("VM ID", "machines"), ("Name", "machines"), ("PVE node", "hosts"), ("Power", "power"), ("Labels", "labels"), ("Assigned disk space", "assigned"), ("Storage used", "measured"), ("Memory assigned", "memory"), ("Memory in use", "memory"), ("Virtual CPUs", "cpu"), ("Scheduled for backup", "backups"), ("VM information", None)]
+    headings = [("VM ID", "machines"), ("Name", "machines"), ("PVE node", "hosts"), ("Power", "power"), ("Labels", "labels"), ("Assigned disk space", "assigned"), ("Storage used", "measured"), ("RAM assigned", "memory"), ("RAM in use", "memory"), ("vCPUs assigned", "cpu"), ("Scheduled for backup", "backups"), ("VM information", None)]
     headers = ''.join('<th scope="col">' + ('<button type="button" data-col="' + str(i) + '">' + esc(label) + '</button> ' + report_help_link(topic, "?", title="Explain " + label.lower()) if topic else esc(label)) + '</th>' for i, (label, topic) in enumerate(headings))
     rows = []
     for vm in vms:
@@ -2213,8 +2338,8 @@ def html_report(report):
         search = ' '.join(display(vm[key]) for key in ("vmid", "name", "node", "tags")).lower()
         klass = ' class="top"' if vm["vmid"] in report["top_vmids"] else ''
         rows.append('<tr' + klass + ' data-search="' + esc(search) + '" data-node="' + esc(vm["node"]) + '" data-config-available="' + str(vm["config_available"]).lower() + '" data-disks="' + esc(json.dumps(disk_records)) + '" data-missing-allocation="' + str(vm["actual_bytes"] is None).lower() + '">' + ''.join(cells) + '</tr>')
-    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + human(totals[1]["total_bytes"]) + '</td><td colspan="2"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
-    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources">Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="false"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">The storage totals below the rows update when you filter. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
+    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + human(totals[1]["total_bytes"]) + '</td><td id="table-ram-total">' + human(complete_sum([v['ram_bytes'] for v in vms])) + '</td><td colspan="4"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
+    machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual machines</h2><p class="page-intro">Each row is a virtual computer or saved machine template. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources" checked>Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="true"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">Totals update when you filter. RAM assigned includes the displayed stopped machines and templates; it is not host memory usage. RAM in use is a snapshot at collection time. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
     jobs = report["jobs"]
     if jobs is None:
         job_table = '<p>Backup schedule settings could not be read. Ask IT to review access to these settings.</p>'
@@ -2238,18 +2363,34 @@ def html_report(report):
         overview = '<p class="callout"><strong>Example report:</strong> all machine names and numbers on these pages are synthetic preview data.</p>' + overview
     pbs_status = report.get('pbs', {}).get('status', 'not requested')
     overview = overview.replace('PBS backup storage was not measured.', 'PBS reporting: ' + esc(pbs_status) + '. <a href="#pbs">View backup-server information</a>.')
+    overview += '<section class="panel"><h2>Collection status</h2><p>Hosts below include nodes with no visible VMs. A missing storage reading is not proof of a host outage.</p>' + record_table([dict(node=h['node'], status=h.get('status'), host_read='Available' if h.get('details') is not None else 'Unavailable', storage_read='Available' if h.get('storage') is not None else 'Unavailable') for h in report.get('hosts', [])], [('node','Host'),('status','Reported state'),('host_read','Host readings'),('storage_read','Storage readings')]) + '</section>'
     overview += '<section class="panel"><h2>Follow-up and handoff</h2><p>' + str(len(report.get('review_items', []))) + ' findings are listed for review. No changes are made automatically.</p><p><a class="button" href="#review">Open review list</a> <a class="button" href="#management">Open management summary</a></p></section>'
     storage += breakdown_page_html(report)
     management = '<p class="eyebrow">A short handoff</p><h2 tabindex="-1">Management summary</h2><div class="print-toolbar"><a class="button" href="management-summary.html" target="_blank" rel="noopener">Open print / PDF view</a><p class="hint">The separate summary has a Print / Save as PDF button. It includes the first five findings and largest machines. Longer summaries flow across pages; select Letter or A4 in the print dialog. The full report retains all records.</p></div>' + management_body(report)
     if report.get('scope', {}).get('pbs_only'):
         overview = '<section class="panel"><h2>PBS-only report</h2><p>PVE inventory and backup ownership matching were not requested. Open PBS backup storage for capacity, cleanup, retention, freshness and verification information.</p><a href="#pbs">Open PBS report</a></section>'
     views = [("overview", "Summary", overview), ("review", "Review list", review_page_html(report)),
-             ("machines", "Virtual machines", machines), ("storage", "Storage", storage),
-             ("backups", "PVE backup jobs", backups), ("pbs", "PBS backup storage", pbs_page_html(report)),
+             ("changes", "Changes", changes_html(report)), ("hosts", "PVE hosts", hosts_page_html(report)), ("downloads", "Downloads", downloads_html()), ("machines", "Virtual machines", machines), ("storage", "Storage", storage),
+             ("backups", "PVE backup jobs", backups), ("pbs", "PBS backup storage", pbs_page_html(report) if include_scopes else ""),
              ("management", "Management summary", management), ("help", "Help", help_page), ("technical", "IT reference", technical)]
-    nav = ''.join('<a href="#' + key + '" data-page-link="' + key + '">' + label + '</a>' for key, label, _ in views if not report.get('scope',{}).get('pbs_only') or key not in ('machines','storage','backups'))
+    scope_views = {}
+    if include_scopes and not report.get('scope', {}).get('pbs_only'):
+        for node in nodes:
+            selected = dict(report)
+            selected['vms'] = [vm for vm in selected['vms'] if vm['node'] == node]
+            selected['hosts'] = [host for host in selected.get('hosts', []) if host['node'] == node]
+            selected['scope'] = dict(selected.get('scope', {}), targeted=True, selected=len(selected['vms']))
+            try:
+                sort_report(selected, report['sort_metric'])
+            except ValueError:
+                sort_report(selected, 'configured')
+            rendered = html_report(selected, include_scopes=False)
+            scope_views[node] = {key:content for key,content in re.findall(r'<section class="report-page" id="page-([^" ]+)" data-page="[^" ]+">(.*?)</section>(?=<section class="report-page"|<footer)', rendered, re.S) if key in ('overview','hosts','review','storage')}
+    scope_data = json.dumps(scope_views).replace('<', '\\u003c')
+    scope_control = '<label class="scope-control">PVE view: <select id="global-node-filter"><option value="">All collected nodes</option>' + ''.join('<option>'+html.escape(n)+'</option>' for n in nodes) + '</select></label><p id="global-scope-note" class="hint">PVE views show all collected nodes. PBS and exported files retain their own full collected scope.</p>' if include_scopes and nodes else ''
+    nav = ''.join('<a href="#' + key + '" data-page-link="' + key + '">' + label + '</a>' for key, label, _ in views if not report.get('scope',{}).get('pbs_only') or key not in ('machines','storage','backups','hosts'))
     pages = ''.join('<section class="report-page" id="page-' + key + '" data-page="' + key + '">' + content + '</section>' for key, _, content in views)
-    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Storage and backup review</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + pages + '<footer class="footer"><span>ProxInfo · report layout 4</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo · Storage and backup review</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><header class="masthead"><div class="brand"><div class="brand-mark">PI</div><div><p class="eyebrow">ProxInfo</p><h1>Environment overview</h1></div></div><button class="button" id="theme-toggle" type="button" aria-pressed="false">Dark mode</button></header><p class="meta">Collected ' + esc(date) + ' · ' + str(len(nodes)) + ' host servers · Read-only report</p><nav class="nav" aria-label="Report pages">' + nav + '</nav>' + scope_control + pages + '<script type="application/json" id="node-view-data">' + scope_data + '</script><footer class="footer"><span>ProxInfo · report layout 4</span><span>N/A means unavailable. Zero means a known zero. ' + report_help_link("pbs", "About backup storage") + '</span></footer></main><dialog id="explanation-dialog" aria-labelledby="explanation-title"><form method="dialog"><button class="button" aria-label="Close explanation">Close</button></form><h2 id="explanation-title"></h2><div id="explanation-content"></div></dialog><script>' + HTML_SCRIPT + '</script></body></html>'
 
 
 def run_description(report):
@@ -2277,6 +2418,8 @@ def export_report(report, directory):
 
 def _export_report(report, directory):
     directory.mkdir(parents=True, exist_ok=True)
+    write_csv(directory / 'hosts.csv', ['node','address','status','details','storage'], report.get('hosts', []))
+    write_csv(directory / 'changes.csv', ['vmid','change','previous','current'], report.get('changes', {}).get('items', []))
     terminal = terminal_report(report)
     (directory / "inventory.txt").write_text(terminal, encoding="utf-8")
     (directory / "inventory.html").write_text(html_report(report), encoding="utf-8")
@@ -2410,6 +2553,8 @@ def main(argv=None):
     outputs = parser.add_mutually_exclusive_group()
     outputs.add_argument("--output-dir", type=Path, help="Report folder; existing report and log files are replaced")
     outputs.add_argument("--output-root", type=Path, help="Parent folder for unique run directories")
+    parser.add_argument("--previous-report", type=Path, help="Previous inventory.json for a local comparison")
+    parser.add_argument("--restore-tests", type=Path, help="Optional local JSON list of operator-recorded restore tests")
     parser.add_argument("--sort", choices=("configured", "actual"), default="configured")
     parser.add_argument("--storage-timeout", type=float, default=60, help="Seconds per storage measurement (default 60); separate from connection/general queries")
     parser.add_argument("--timeout", type=float, default=20, help="Seconds per API/local command (default 20)")
@@ -2531,6 +2676,7 @@ def main(argv=None):
             environment = "cluster"
             report["warnings"].append("SSH target exposes multiple nodes; report scope changed from standalone to cluster. All visible VMs were collected.")
         report["environment"], report["access_mode"] = environment, mode
+        report["pbs"]["server"] = parse.urlparse(pbs_config["url"]).hostname if pbs_config else None
         if mode == "ssh":
             report["limitations"].append("Python and reports run locally. PVE API reads use pvesh get over SSH; PVE proxies other nodes. "
                                           "Exact active LVM-thin reads use dmsetup status on the owning host, with existing noninteractive root SSH trust between PVE nodes when needed. "
@@ -2576,6 +2722,15 @@ def main(argv=None):
             except (OSError, sqlite3.Error) as exc:
                 report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
                 report['run']['status'] = 'finished with history unavailable'
+        if not tracker.cancelled and not tracker.expired:
+            pbs_location_details(report, config, args, tracker)
+        report['changes'] = compare_inventory(report, args.previous_report)
+        report['restore_tests'] = []
+        if args.restore_tests:
+            records = json.loads(args.restore_tests.read_text(encoding='utf-8'))
+            if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+                raise ValueError('Restore-test file must be a JSON list of records')
+            report['restore_tests'] = [{k:r.get(k) for k in ('server','datastore','source','date','result','notes')} for r in records]
         print(export_report(report, args.output_dir))
         if args.diagnostics is not None:
             secrets = diagnostic_secrets(config)

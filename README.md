@@ -1,4 +1,60 @@
-# PVE cluster VM inventory
+# ProxInfo environment inventory
+
+## Environment overview additions (1.4.0)
+
+Run the updated script normally; no new options are required for the VM table, host overview or downloads:
+
+```bash
+python3 pve_inventory.py --mode ssh --no-pbs --diagnostics --output-dir ./pve-report
+```
+
+RAM assigned, RAM in use and assigned vCPUs are visible by default. RAM usage is a snapshot, not a live monitor. The VM footer totals assigned disk space, measured disk usage and assigned RAM for shown rows; it does not sum CPUs. Unknown RAM produces a known subtotal and coverage, not a false complete total. Powered-off VMs and displayed templates retain their configured RAM in this total. The optional resource checkbox can still hide these columns.
+
+**PVE view** selects a node across Summary, PVE hosts, Virtual machines, Storage and Review list. Search and missing-usage filters continue to affect the VM table. PBS, backup-job definitions and downloadable files retain their full collected scope, as indicated on screen. VM information opens in a separate panel so it does not widen table rows. Shared storage references remain deduplicated within the selected view.
+
+**PVE hosts** shows host status, discovered IP, PVE version, uptime, CPU details, physical memory and storage-location capacity. New GET reads are `/cluster/status`, `/nodes/N/status` and `/nodes/N/storage`; node audit and storage audit visibility are needed. Offline hosts are retained without querying their status/storage. Regular standalone CLI mode currently leaves this added host-detail page unavailable; the original VM inventory remains usable. Storage capacities can overlap across locations and hosts and are never summed into a claimed physical cluster total.
+
+**Downloads** links to existing CSV/JSON/print files plus `hosts.csv` and `changes.csv`. Keep the exported files together. Collection status summarizes which host and storage reads returned data; that is not an overall infrastructure health certification.
+
+### Comparing two collected reports
+
+Keep an earlier `inventory.json`, then provide it explicitly:
+
+```bash
+python3 pve_inventory.py --mode ssh --previous-report ./earlier/inventory.json --output-dir ./pve-report
+```
+
+Use reports from the same environment. Selection scope and node membership must match; otherwise comparison is withheld. Changes include newly visible/missing IDs, node placement and disk/RAM/vCPU assignments. Comparable complete measured disk totals can also change; missing values are never treated as zero, and changed disk identities or measurement methods prevent an allocation comparison. Changed fields ending in `_bytes` are exported as exact bytes. VM ID reuse and changed permissions can affect interpretation. An absent VM is not automatically labeled deleted. Without `--previous-report`, this page explains that no baseline was selected. This is an explicit local comparison, not automatic PVE history retention.
+
+### PBS additions
+
+PBS remains off by default. Enable it with the existing `--pbs` options. Its page now has Overview, Backups, Activity, Retention & cleanup, and Evidence controls. Configured datastore folders and the configured PBS server are shown. Backup task outcomes/durations and the latest confirmed successful task in checked history are separate from snapshot freshness; they do not establish every VM's backup success. Sync-job visibility uses GET `/admin/sync`; applicable datastore audit and remote audit visibility are required, depending on server version and job direction. Missing access remains unavailable; no job is started.
+
+Retention review candidates expose protected snapshots and groups without a visible applicable PBS prune policy. Other retention mechanisms may apply. These are review prompts, not deletion advice or recoverable-byte estimates. Backup coverage is displayed as a table while retaining ownership uncertainty. CSV/JSON preserve the collected detail, with the added task and sync metadata in JSON.
+
+For optional backing-filesystem discovery, add these settings to your existing protected config file:
+
+```json
+{
+  "pbs_ssh_host": "192.0.2.40",
+  "pbs_ssh_user": "audit",
+  "pbs_ssh_key": "/home/your-user/.ssh/id_ed25519"
+}
+```
+
+Replace the documentation address with your PBS host. This is separate from the PVE SSH connection. It runs only `findmnt` read queries for configured datastore folders, reporting the observed mount point, filesystem and device/dataset/share. The operator must configure the SSH host to match the PBS API server; the report labels the observation source. It does not recursively inspect physical disks, mount storage or identify S3 bucket usage from a local cache. API-only PBS reports remain supported without these settings. Manual SSH authentication follows OpenSSH; cron requires preconfigured noninteractive keys and host trust. Keep host-specific SSH port changes in `pbs_ssh_port` if needed.
+
+An optional locally maintained JSON file can record completed restore tests:
+
+```json
+[
+  {"server":"pbs01","datastore":"backups","source":"vm/100","date":"2026-11-04","result":"Passed","notes":"Operator confirmed application startup in isolated test."}
+]
+```
+
+Supply it using `--restore-tests ./restore-tests.json`. These are explicitly labeled operator records, not tests performed or independently verified by ProxInfo. Verification results and restore tests remain separate. No restore operations are launched.
+
+Validate new host and PBS readings against your own web consoles before relying on scheduled output. Automated tests simulate endpoints and cannot establish visibility or correctness on your live servers.
 
 Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. Optional PBS reporting is **off by default**. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
 
@@ -69,11 +125,11 @@ From WSL, open the output folder in Windows Explorer:
 explorer.exe ./pve-report
 ```
 
-Double-click `inventory.html`. The top navigation switches between **Summary**, **Review list**, **Virtual machines**, **Storage**, **PVE backup jobs**, **PBS backup storage**, **Management summary**, **Help**, and **IT reference**. Each is its own report view. The main report remains one offline HTML file; the printable management summary is also exported separately. No web server or external assets are required. A link ending in `#machines`, for example, opens the Virtual machines view directly.
+Double-click `inventory.html`. The top navigation switches between **Summary**, **Review list**, **Changes**, **PVE hosts**, **Downloads**, **Virtual machines**, **Storage**, **PVE backup jobs**, **PBS backup storage**, **Management summary**, **Help**, and **IT reference**. Each is its own report view. The main report remains one offline HTML file; the printable management summary is also exported separately. No web server or external assets are required. A link ending in `#machines`, for example, opens the Virtual machines view directly.
 
 The **Summary** uses plain-language cards: machines reviewed, assigned disk space, measured storage used and machines scheduled for backup. **Explain**, **What does this mean?**, and **?** links open readable explanations without leaving your place. Use **Help** for a short guide and all definitions. Original collection errors, measurement rules and technical totals are kept in **IT reference** for the IT team.
 
-In **Virtual machines**, search by name, ID, host server or label. Filter by host server or show only machines whose usage could not be measured. **Power** shows On, Off or Unknown. Click column headings to sort, or their **?** links for definitions. The main table focuses on storage and backup selection; check **Show memory & CPUs** to reveal those extra columns. Uncheck it for a simpler view.
+In **Virtual machines**, search by name, ID, host server or label. Filter by host server or show only machines whose usage could not be measured. **Power** shows On, Off or Unknown. Click column headings to sort, or their **?** links for definitions. RAM and CPU columns are shown by default. Uncheck **Show memory & CPUs** for a narrower view.
 
 The storage-total row **below the VM rows** updates for the machines currently shown. It keeps **assigned disk space** separate from **storage used**, counts a shared disk ID once, and leaves an incomplete or incompatible full total as **N/A**. Known partial amounts and an explanation are shown when available. Filtering can therefore give a complete total for a readable subset even when the whole report has missing data. These are VM disk totals, not PBS backup usage; shared data and other storage overhead prevent treating them as a unique physical-storage footprint.
 

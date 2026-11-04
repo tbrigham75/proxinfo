@@ -22,6 +22,7 @@ class FakePBS:
             '/config/verify': [], '/admin/verify': [],
             '/config/prune': [{'id': 'daily', 'store': 'store', 'schedule': 'daily', 'keep-last': 7}],
             '/admin/prune': [{'id': 'daily', 'store': 'store', 'last-run-state': 'error: test failure', 'last-run-endtime': 300}],
+            '/admin/sync': [],
             '/config/datastore/store': {'name': 'store', 'gc-schedule': 'daily', 'keep-last': 10, 'path': '/not/exported'},
             base+'/status': {'total': 1000*GIB, 'used': 950*GIB, 'avail': 40*GIB},
             base+'/gc': {'upid': 'recorded-gc-id', 'last-run-state': 'OK', 'last-run-endtime': 400,

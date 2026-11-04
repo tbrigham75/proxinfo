@@ -18,9 +18,12 @@ assert.equal(result.status,0,result.stderr);const content=JSON.parse(result.stdo
   await page.fill('#search','nothing');assert.equal(await page.locator('#vms tbody tr:visible').count(),0);
   await page.click('#clear-filters');assert.equal(await page.locator('#vms tbody tr:visible').count(),2);
   assert.equal(await page.locator('#table-assigned-total').textContent(),'150.00 GiB');
+  assert.equal(await page.locator('#table-ram-total').textContent(),'6.00 GiB');
+  await page.selectOption('#global-node-filter','pve01');assert.equal(await page.locator('#table-ram-total').textContent(),'4.00 GiB');assert.equal(await page.locator('#vms tbody tr:visible').count(),1);
+  await page.selectOption('#global-node-filter','');await page.locator('.vm-details summary').first().click();assert.equal(await page.locator('.vm-drawer').evaluate(el=>el.open),true);await page.locator('.vm-drawer button').first().click();
   await page.locator('button[data-col="2"]').click();await page.locator('button[data-col="2"]').click();
   assert.equal(await page.locator('#vms tbody tr').first().getAttribute('data-node'),'pve02');
-  await page.evaluate(()=>showPage('pbs'));
+  await page.evaluate(()=>showPage('pbs'));await page.getByRole('button',{name:'Backups',exact:true}).click();
   assert.equal(await page.locator('#pbs-inventory tbody tr:visible').count(),50);
   await page.click('#pbs-next');assert.ok((await page.locator('#pbs-count').textContent()).includes('page 2'));
   await page.fill('#pbs-search','2549');assert.equal(await page.locator('#pbs-inventory tbody tr:visible').count(),1);
