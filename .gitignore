@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 pve-report-*/
+pve-report/
 config.json
 config.*.json
 !config.example.json

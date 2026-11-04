@@ -488,6 +488,36 @@ The PVE node dropdown combines with any search and usage filter. The count line 
 
 ## Storage measurements and timeouts
 
+### Collect troubleshooting files for review
+
+Add `--diagnostics` to your normal command to write a separate folder under **`logs/`**, relative to where you run the script:
+
+```bash
+python3 pve_inventory.py --mode ssh --no-pbs --diagnostics --output-dir ./pve-report
+```
+
+For a smaller comparison, add `--vmid 100 --vmid 101`, replacing those IDs with one working VM and one affected VM. You can also use `--mode local` on PVE. This option adds no prompts or extra server queries. To select another destination, use `--diagnostics /absolute/path/to/logs` (recommended for cron).
+
+Each run creates `logs/storage-RUN_ID/` containing:
+
+- `README.txt`: readable per-VM and per-disk measurement results.
+- `storage-diagnostics.json`: PVE/tool version, selected scope, run settings, power state, storage backend, volume group, measurement source, exact error, timing and coverage.
+- `disks.csv`: the same disk evidence in tabular form.
+- `collection.log` and `query_timings.csv`: collection progress and query outcomes through report export.
+
+The bundle is generated after report export, including reports with N/A values. Startup/discovery failures that cannot produce a report do not create this bundle. Existing diagnostic runs are retained. No credentials/configuration files, guest filesystem details or full API responses are copied. Known credentials and common credential patterns are redacted from included text. Node names, disk identifiers and storage paths remain so measurements can be traced; review the files before publishing them, especially in a public repository.
+
+`pve-report/` and timestamped report folders are ignored by Git. `logs/` is intentionally **not ignored**, allowing you to commit just the selected troubleshooting run:
+
+```bash
+git status --short
+git add logs/storage-REPLACE_WITH_RUN_ID
+git commit -m "Add storage troubleshooting bundle"
+git push
+```
+
+Use the actual folder printed by the script. Git ignore rules do not untrack files already committed; if `pve-report` is already tracked, `git rm -r --cached -- pve-report` removes it from Git's index while leaving local files intact.
+
 ### Checking incomplete VM measurements (1.3.1)
 
 An unreadable EFI/startup disk, TPM/security disk or additional data disk no longer hides measurements from the other disks. The VM row shows the known amount and coverage, for example **30 GiB measured; partial; 1 of 2 disks measured**. The complete total remains N/A. Zero is a valid measurement; zero plus an unreadable disk is still partial. Measurements that count space differently remain separate subtotals.

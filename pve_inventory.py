@@ -1167,6 +1167,9 @@ class Collector:
                               capacity_reason=("configuration size=" + options["size"] if capacity is not None else
                                                "N/A: " + (excluded or "no parseable configured size; volume size is not substituted")),
                               actual_bytes=actual, actual_reason=reason,
+                              storage_backend=storages.get(storage, {}).get('type'),
+                              storage_vg=storages.get(storage, {}).get('vgname'),
+                              storage_shared=storages.get(storage, {}).get('shared'),
                               measurement_status=disk_outcome(actual, reason, excluded is not None),
                               measurement_seconds=round(time.monotonic() - started, 3),
                               cached_measurement=identity in cached_before if identity else False,
@@ -2252,6 +2255,75 @@ def _export_report(report, directory):
     return terminal
 
 
+def diagnostic_secrets(config):
+    values = []
+    for key, value in config.items():
+        if isinstance(value, dict):
+            values.extend(diagnostic_secrets(value))
+        elif isinstance(value, str) and any(word in key.lower() for word in ('token', 'secret', 'password', 'authorization')):
+            values.append(value)
+    return values
+
+
+def redact_diagnostics(value, secrets=()):
+    if isinstance(value, dict):
+        return {key: redact_diagnostics(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_diagnostics(item, secrets) for item in value]
+    if not isinstance(value, str):
+        return value
+    for secret in sorted(set(filter(None, secrets)), key=len, reverse=True):
+        value = value.replace(secret, '[REDACTED]')
+    value = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----', '[REDACTED KEY]', value, flags=re.S)
+    value = re.sub(r'(?i)(?:PVEAPIToken|PBSAPIToken)=[^\s\"\'<>]+', '[REDACTED TOKEN]', value)
+    value = re.sub(r'(?i)(authorization\s*[:=]\s*)[^\r\n]+', r'\1[REDACTED]', value)
+    value = re.sub(r'(?i)((?:password|token_secret|secret)\s*[:=]\s*)[^\s,;]+', r'\1[REDACTED]', value)
+    return re.sub(r'(https?://)[^/\s@]+@', r'\1[REDACTED]@', value)
+
+
+def write_diagnostics(report, tracker, root, secrets=()):
+    """Explicit allowlist: no credential config, environment dump, guest data or raw API bodies."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / ('storage-' + tracker.run_id)
+    destination.mkdir(exist_ok=False)
+    disk_keys = ('slot', 'volume', 'storage', 'storage_backend', 'storage_vg', 'storage_shared',
+                 'capacity_bytes', 'actual_bytes', 'actual_method', 'actual_reason', 'identity',
+                 'counted', 'excluded_reason', 'measurement_status', 'measurement_seconds', 'cached_measurement')
+    vms = []
+    for vm in report['vms']:
+        row = {key: vm.get(key) for key in ('vmid', 'node', 'status', 'cached_status', 'config_available',
+                                          'configured_bytes', 'actual_bytes', 'actual_method')}
+        row.update(measurement_details(vm))
+        row['disks'] = [{key: disk.get(key) for key in disk_keys} for disk in vm['disks']]
+        vms.append(row)
+    data = redact_diagnostics(dict(bundle_schema=1, tool_version=VERSION,
+        generated_at=report['generated_at'], pve_version=report.get('pve_version'),
+        scope=report.get('scope'), environment=report.get('environment'),
+        run=report.get('run'), vms=vms), secrets)
+    atomic_text(destination / 'storage-diagnostics.json', json.dumps(data, indent=2))
+    rows = [dict(vmid=vm['vmid'], node=vm['node'], vm_status=vm['status'], **disk)
+            for vm in data['vms'] for disk in vm['disks']]
+    write_csv(destination / 'disks.csv', ['vmid', 'node', 'vm_status'] + list(disk_keys), rows)
+    tracker.log.flush()
+    tracker.stream.flush()
+    for name in ('collection.log', 'query_timings.csv'):
+        source = tracker.directory / name
+        atomic_text(destination / name, redact_diagnostics(source.read_text(encoding='utf-8-sig'), secrets))
+    lines = ['ProxInfo storage troubleshooting', 'Run: ' + tracker.run_id,
+             'Tool: ' + VERSION, 'PVE version: ' + json.dumps(data['pve_version']),
+             'This bundle contains node names, disk identifiers and storage paths. Review before committing.',
+             'Credential settings, guest filesystems, VM names/tags and full configurations are excluded.',
+             'Known credentials and common credential patterns in error text are redacted.',
+             'Collection logs are a snapshot taken after report export.', '']
+    for vm in data['vms']:
+        lines.append(f"VM {vm['vmid']} on {vm['node']}: {vm['measurement_status']}; {vm['measured_disk_count']}/{vm['counted_disk_count']} disks measured")
+        for disk in vm['disks']:
+            lines.append(f"  {disk['slot']} | {disk['storage_backend']} | {disk['volume']} | used={human(disk['actual_bytes'])} | {disk['actual_reason']}")
+    atomic_text(destination / 'README.txt', '\n'.join(lines) + '\n')
+    return destination
+
+
 def main(argv=None):
     launched = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
@@ -2272,6 +2344,8 @@ def main(argv=None):
     parser.add_argument("--environment", choices=("auto", "cluster", "standalone"), default="auto")
     parser.add_argument("--no-prompt", action="store_true", help="Use explicit options/detection without startup questions")
     parser.add_argument("--config", type=Path, help="Optional JSON credentials/settings file; environment overrides it")
+    parser.add_argument('--diagnostics', nargs='?', const=Path('logs'), type=Path,
+                        help='Save a credential-redacted storage troubleshooting bundle (default folder: logs)')
     outputs = parser.add_mutually_exclusive_group()
     outputs.add_argument("--output-dir", type=Path, help="Report folder; existing report and log files are replaced")
     outputs.add_argument("--output-root", type=Path, help="Parent folder for unique run directories")
@@ -2433,6 +2507,21 @@ def main(argv=None):
                 report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
                 report['run']['status'] = 'finished with history unavailable'
         print(export_report(report, args.output_dir))
+        if args.diagnostics is not None:
+            secrets = diagnostic_secrets(config)
+            for name, value in os.environ.items():
+                if name.startswith(('PVE_', 'PBS_')) and any(word in name.lower() for word in ('token', 'secret', 'password')):
+                    secrets.append(value)
+            if not args.pbs_only:
+                auth = getattr(client, 'auth', '')
+                if auth:
+                    secrets.extend([auth, auth.rsplit('=', 1)[-1]])
+            secrets.extend(diagnostic_secrets(pbs_config or {}))
+            try:
+                bundle = write_diagnostics(report, tracker, args.diagnostics, secrets)
+                print(f'Troubleshooting files written to {bundle.resolve()}', file=sys.stderr)
+            except OSError as exc:
+                print('Report saved, but troubleshooting bundle could not be written: ' + str(exc), file=sys.stderr)
         complete_configs = sum(v['config_available'] for v in report['vms'])
         incomplete = tracker.cancelled or tracker.expired or bool(report['warnings']) or any(v['actual_bytes'] is None for v in report['vms'])
         tracker.message(("Report created with missing measurements" if incomplete else "Report created") +
