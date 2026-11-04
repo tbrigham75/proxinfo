@@ -1,0 +1,41 @@
+run_id,operation,started_at,elapsed_seconds,outcome
+b5150af87ffc4c009e0f5cfa99943b56,GET /version,2026-11-04T20:41:22.057510+00:00,0.895,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /cluster/resources,2026-11-04T20:41:22.953044+00:00,0.765,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes,2026-11-04T20:41:23.717904+00:00,0.756,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /storage,2026-11-04T20:41:24.474487+00:00,0.696,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /cluster/backup,2026-11-04T20:41:25.170873+00:00,0.756,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /cluster/backup/backup-b1e095ad-c70d/included_volumes,2026-11-04T20:41:25.927361+00:00,0.744,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/100/config,2026-11-04T20:41:26.672136+00:00,1.72,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/100/status/current,2026-11-04T20:41:28.392041+00:00,1.521,success
+b5150af87ffc4c009e0f5cfa99943b56,LVM-thin counters on pve02,2026-11-04T20:41:29.914407+00:00,9.202,timeout
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/100/agent/get-fsinfo,2026-11-04T20:41:39.116878+00:00,1.797,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/101/config,2026-11-04T20:41:43.847447+00:00,0.704,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/101/status/current,2026-11-04T20:41:44.551811+00:00,0.707,success
+b5150af87ffc4c009e0f5cfa99943b56,LVM-thin counters on pve01,2026-11-04T20:41:45.258790+00:00,0.011,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/101/agent/get-fsinfo,2026-11-04T20:41:45.269565+00:00,0.91,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/102/config,2026-11-04T20:41:46.179736+00:00,0.676,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/102/status/current,2026-11-04T20:41:46.856273+00:00,0.713,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/102/agent/get-fsinfo,2026-11-04T20:41:47.569515+00:00,3.513,failed
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/103/config,2026-11-04T20:41:51.082786+00:00,0.697,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/103/status/current,2026-11-04T20:41:51.779896+00:00,0.801,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/104/config,2026-11-04T20:41:52.581983+00:00,1.75,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/104/status/current,2026-11-04T20:41:54.332492+00:00,1.593,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/105/config,2026-11-04T20:41:55.926166+00:00,1.528,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/105/status/current,2026-11-04T20:41:57.454988+00:00,1.531,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/105/agent/get-fsinfo,2026-11-04T20:41:58.985975+00:00,1.724,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/106/config,2026-11-04T20:42:00.710648+00:00,1.613,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/106/status/current,2026-11-04T20:42:02.323617+00:00,1.539,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/106/agent/get-fsinfo,2026-11-04T20:42:03.863304+00:00,1.635,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/107/config,2026-11-04T20:42:05.498330+00:00,1.573,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/107/status/current,2026-11-04T20:42:07.071540+00:00,1.555,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/108/config,2026-11-04T20:42:08.627223+00:00,1.513,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/108/status/current,2026-11-04T20:42:10.140730+00:00,1.569,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/111/config,2026-11-04T20:42:11.709617+00:00,1.601,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/111/status/current,2026-11-04T20:42:13.310843+00:00,1.542,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/111/agent/get-fsinfo,2026-11-04T20:42:14.853033+00:00,1.73,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/112/config,2026-11-04T20:42:19.515841+00:00,0.739,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/112/status/current,2026-11-04T20:42:20.254609+00:00,0.672,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/900/config,2026-11-04T20:42:20.927302+00:00,0.812,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve01/qemu/900/status/current,2026-11-04T20:42:21.739570+00:00,0.748,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/901/config,2026-11-04T20:42:22.488339+00:00,1.444,success
+b5150af87ffc4c009e0f5cfa99943b56,GET /nodes/pve02/qemu/901/status/current,2026-11-04T20:42:23.932012+00:00,1.516,success

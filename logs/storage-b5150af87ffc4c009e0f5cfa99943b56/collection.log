@@ -1,0 +1,95 @@
+2026-11-04T20:41:22.057437+00:00 ProxInfo 1.3.1 | run b5150af87ffc4c009e0f5cfa99943b56
+2026-11-04T20:41:22.057532+00:00 Reading GET /version | timeout 20s
+2026-11-04T20:41:22.952847+00:00 success: GET /version | 0.895s
+2026-11-04T20:41:22.953061+00:00 Reading GET /cluster/resources | timeout 20s
+2026-11-04T20:41:23.717692+00:00 success: GET /cluster/resources | 0.765s
+2026-11-04T20:41:23.717957+00:00 Reading GET /nodes | timeout 20s
+2026-11-04T20:41:24.474230+00:00 success: GET /nodes | 0.756s
+2026-11-04T20:41:24.474604+00:00 Reading GET /storage | timeout 20s
+2026-11-04T20:41:25.170622+00:00 success: GET /storage | 0.696s
+2026-11-04T20:41:25.170938+00:00 Reading GET /cluster/backup | timeout 20s
+2026-11-04T20:41:25.927271+00:00 success: GET /cluster/backup | 0.756s
+2026-11-04T20:41:25.927389+00:00 Reading GET /cluster/backup/backup-b1e095ad-c70d/included_volumes | timeout 20s
+2026-11-04T20:41:26.671811+00:00 success: GET /cluster/backup/backup-b1e095ad-c70d/included_volumes | 0.744s
+2026-11-04T20:41:26.671977+00:00 VM 1/13: 100 on pve02
+2026-11-04T20:41:26.672173+00:00 Reading GET /nodes/pve02/qemu/100/config | timeout 20s
+2026-11-04T20:41:28.391976+00:00 success: GET /nodes/pve02/qemu/100/config | 1.72s
+2026-11-04T20:41:28.392058+00:00 Reading GET /nodes/pve02/qemu/100/status/current | timeout 20s
+2026-11-04T20:41:29.912887+00:00 success: GET /nodes/pve02/qemu/100/status/current | 1.521s
+2026-11-04T20:41:29.914427+00:00 Reading LVM-thin counters on pve02 | timeout 60s
+2026-11-04T20:41:34.914767+00:00 Waiting: LVM-thin counters on pve02 | 5s elapsed | timeout 60s
+2026-11-04T20:41:39.116614+00:00 timeout: LVM-thin counters on pve02 | 9.202s
+2026-11-04T20:41:39.116911+00:00 Reading GET /nodes/pve02/qemu/100/agent/get-fsinfo | timeout 20s
+2026-11-04T20:41:43.847297+00:00 success: GET /nodes/pve02/qemu/100/agent/get-fsinfo | 1.797s
+2026-11-04T20:41:43.847396+00:00 VM 2/13: 101 on pve01
+2026-11-04T20:41:43.847479+00:00 Reading GET /nodes/pve01/qemu/101/config | timeout 20s
+2026-11-04T20:41:44.551693+00:00 success: GET /nodes/pve01/qemu/101/config | 0.704s
+2026-11-04T20:41:44.551844+00:00 Reading GET /nodes/pve01/qemu/101/status/current | timeout 20s
+2026-11-04T20:41:45.258587+00:00 success: GET /nodes/pve01/qemu/101/status/current | 0.707s
+2026-11-04T20:41:45.258806+00:00 Reading LVM-thin counters on pve01 | timeout 60s
+2026-11-04T20:41:45.269463+00:00 success: LVM-thin counters on pve01 | 0.011s
+2026-11-04T20:41:45.269583+00:00 Reading GET /nodes/pve01/qemu/101/agent/get-fsinfo | timeout 20s
+2026-11-04T20:41:46.179580+00:00 success: GET /nodes/pve01/qemu/101/agent/get-fsinfo | 0.91s
+2026-11-04T20:41:46.179683+00:00 VM 3/13: 102 on pve01
+2026-11-04T20:41:46.179752+00:00 Reading GET /nodes/pve01/qemu/102/config | timeout 20s
+2026-11-04T20:41:46.856208+00:00 success: GET /nodes/pve01/qemu/102/config | 0.676s
+2026-11-04T20:41:46.856289+00:00 Reading GET /nodes/pve01/qemu/102/status/current | timeout 20s
+2026-11-04T20:41:47.569345+00:00 success: GET /nodes/pve01/qemu/102/status/current | 0.713s
+2026-11-04T20:41:47.569530+00:00 Reading GET /nodes/pve01/qemu/102/agent/get-fsinfo | timeout 20s
+2026-11-04T20:41:51.082644+00:00 failed: GET /nodes/pve01/qemu/102/agent/get-fsinfo | 3.513s
+2026-11-04T20:41:51.082737+00:00 VM 4/13: 103 on pve01
+2026-11-04T20:41:51.082802+00:00 Reading GET /nodes/pve01/qemu/103/config | timeout 20s
+2026-11-04T20:41:51.779769+00:00 success: GET /nodes/pve01/qemu/103/config | 0.697s
+2026-11-04T20:41:51.779929+00:00 Reading GET /nodes/pve01/qemu/103/status/current | timeout 20s
+2026-11-04T20:41:52.581403+00:00 success: GET /nodes/pve01/qemu/103/status/current | 0.801s
+2026-11-04T20:41:52.581866+00:00 VM 5/13: 104 on pve02
+2026-11-04T20:41:52.582026+00:00 Reading GET /nodes/pve02/qemu/104/config | timeout 20s
+2026-11-04T20:41:54.332428+00:00 success: GET /nodes/pve02/qemu/104/config | 1.75s
+2026-11-04T20:41:54.332509+00:00 Reading GET /nodes/pve02/qemu/104/status/current | timeout 20s
+2026-11-04T20:41:55.925773+00:00 success: GET /nodes/pve02/qemu/104/status/current | 1.593s
+2026-11-04T20:41:55.926105+00:00 VM 6/13: 105 on pve02
+2026-11-04T20:41:55.926181+00:00 Reading GET /nodes/pve02/qemu/105/config | timeout 20s
+2026-11-04T20:41:57.454657+00:00 success: GET /nodes/pve02/qemu/105/config | 1.528s
+2026-11-04T20:41:57.455055+00:00 Reading GET /nodes/pve02/qemu/105/status/current | timeout 20s
+2026-11-04T20:41:58.985696+00:00 success: GET /nodes/pve02/qemu/105/status/current | 1.531s
+2026-11-04T20:41:58.986002+00:00 Reading GET /nodes/pve02/qemu/105/agent/get-fsinfo | timeout 20s
+2026-11-04T20:42:00.710469+00:00 success: GET /nodes/pve02/qemu/105/agent/get-fsinfo | 1.724s
+2026-11-04T20:42:00.710574+00:00 VM 7/13: 106 on pve02
+2026-11-04T20:42:00.710665+00:00 Reading GET /nodes/pve02/qemu/106/config | timeout 20s
+2026-11-04T20:42:02.323551+00:00 success: GET /nodes/pve02/qemu/106/config | 1.613s
+2026-11-04T20:42:02.323633+00:00 Reading GET /nodes/pve02/qemu/106/status/current | timeout 20s
+2026-11-04T20:42:03.863137+00:00 success: GET /nodes/pve02/qemu/106/status/current | 1.539s
+2026-11-04T20:42:03.863320+00:00 Reading GET /nodes/pve02/qemu/106/agent/get-fsinfo | timeout 20s
+2026-11-04T20:42:05.498178+00:00 success: GET /nodes/pve02/qemu/106/agent/get-fsinfo | 1.635s
+2026-11-04T20:42:05.498275+00:00 VM 8/13: 107 on pve02
+2026-11-04T20:42:05.498355+00:00 Reading GET /nodes/pve02/qemu/107/config | timeout 20s
+2026-11-04T20:42:07.071365+00:00 success: GET /nodes/pve02/qemu/107/config | 1.573s
+2026-11-04T20:42:07.071582+00:00 Reading GET /nodes/pve02/qemu/107/status/current | timeout 20s
+2026-11-04T20:42:08.626878+00:00 success: GET /nodes/pve02/qemu/107/status/current | 1.555s
+2026-11-04T20:42:08.627142+00:00 VM 9/13: 108 on pve02
+2026-11-04T20:42:08.627245+00:00 Reading GET /nodes/pve02/qemu/108/config | timeout 20s
+2026-11-04T20:42:10.140470+00:00 success: GET /nodes/pve02/qemu/108/config | 1.513s
+2026-11-04T20:42:10.140794+00:00 Reading GET /nodes/pve02/qemu/108/status/current | timeout 20s
+2026-11-04T20:42:11.709359+00:00 success: GET /nodes/pve02/qemu/108/status/current | 1.569s
+2026-11-04T20:42:11.709558+00:00 VM 10/13: 111 on pve02
+2026-11-04T20:42:11.709647+00:00 Reading GET /nodes/pve02/qemu/111/config | timeout 20s
+2026-11-04T20:42:13.310775+00:00 success: GET /nodes/pve02/qemu/111/config | 1.601s
+2026-11-04T20:42:13.310861+00:00 Reading GET /nodes/pve02/qemu/111/status/current | timeout 20s
+2026-11-04T20:42:14.852864+00:00 success: GET /nodes/pve02/qemu/111/status/current | 1.542s
+2026-11-04T20:42:14.853053+00:00 Reading GET /nodes/pve02/qemu/111/agent/get-fsinfo | timeout 20s
+2026-11-04T20:42:19.515673+00:00 success: GET /nodes/pve02/qemu/111/agent/get-fsinfo | 1.73s
+2026-11-04T20:42:19.515778+00:00 VM 11/13: 112 on pve01
+2026-11-04T20:42:19.515862+00:00 Reading GET /nodes/pve01/qemu/112/config | timeout 20s
+2026-11-04T20:42:20.254543+00:00 success: GET /nodes/pve01/qemu/112/config | 0.739s
+2026-11-04T20:42:20.254626+00:00 Reading GET /nodes/pve01/qemu/112/status/current | timeout 20s
+2026-11-04T20:42:20.926989+00:00 success: GET /nodes/pve01/qemu/112/status/current | 0.672s
+2026-11-04T20:42:20.927229+00:00 VM 12/13: 900 on pve01
+2026-11-04T20:42:20.927325+00:00 Reading GET /nodes/pve01/qemu/900/config | timeout 20s
+2026-11-04T20:42:21.739498+00:00 success: GET /nodes/pve01/qemu/900/config | 0.812s
+2026-11-04T20:42:21.739591+00:00 Reading GET /nodes/pve01/qemu/900/status/current | timeout 20s
+2026-11-04T20:42:22.488097+00:00 success: GET /nodes/pve01/qemu/900/status/current | 0.748s
+2026-11-04T20:42:22.488286+00:00 VM 13/13: 901 on pve02
+2026-11-04T20:42:22.488355+00:00 Reading GET /nodes/pve02/qemu/901/config | timeout 20s
+2026-11-04T20:42:23.931945+00:00 success: GET /nodes/pve02/qemu/901/config | 1.444s
+2026-11-04T20:42:23.932029+00:00 Reading GET /nodes/pve02/qemu/901/status/current | timeout 20s
+2026-11-04T20:42:25.447733+00:00 success: GET /nodes/pve02/qemu/901/status/current | 1.516s
