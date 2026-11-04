@@ -75,12 +75,12 @@ class BackendTests(unittest.TestCase):
         calls = []
         def command(args):
             calls.append(args)
-            return 'a\n' if args == ['hostname', '-s'] else 'pve-vm--100--disk--0: 0 100 thin 10 99\n'
-        client = SimpleNamespace(backend_command=command)
+            return 'a\n' if args == ['hostname', '-s'] else 'b\n' if args[-1] == 'hostname -s' else 'pve-vm--100--disk--0: 0 100 thin 10 99\n'
+        client = SimpleNamespace(backend_command=command, get=lambda path: [dict(type='node', name='b', ip='192.0.2.2')])
         self.assertEqual(inv.read_thin_status(client, 'b')['pve-vm--100--disk--0'], 5120)
         routed = calls[-1]
-        self.assertEqual(routed[:10], inv.cluster_ssh_prefix())
-        self.assertEqual(routed[10:], ['root@b', 'dmsetup status --target thin --noflush'])
+        self.assertEqual(routed[:-1], inv.routed_ssh_prefix('b', '192.0.2.2'))
+        self.assertEqual(routed[-1], 'dmsetup status --target thin --noflush')
         self.assertTrue(inv.approved_backend_command(routed))
         self.assertFalse(inv.approved_backend_command(routed[:-1]+['dmsetup create bad']))
         self.assertFalse(inv.approved_backend_command(['lvchange', '-ay', 'disk']))

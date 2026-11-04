@@ -488,6 +488,18 @@ The PVE node dropdown combines with any search and usage filter. The count line 
 
 ## Storage measurements and timeouts
 
+### Cluster routing (1.3.2)
+
+Host-level storage reads now discover node IPs through the read-only `/cluster/status` endpoint. They connect to the owning node's IP, verify `hostname -s` matches the expected PVE node, and preserve strict SSH host-key checking using the node's host-key alias and Proxmox per-node known-hosts file (with root's existing known-hosts file as an additional source). IPv4 and IPv6 are supported. DNS is unnecessary when you supply an IP for the initial connection and cluster discovery returns usable IPs.
+
+The SSH port is no longer prompted. `--ssh-port`, `PVE_SSH_PORT`, and configuration `ssh_port` still control the initial computer-to-PVE connection. When omitted, OpenSSH configuration/defaults apply. Connections between PVE nodes use that PVE host's OpenSSH configuration/defaults independently; the initial port is not copied to all cluster nodes. Cluster connection attempts have a ten-second connection limit, bounded further by the remaining collection budget in observed runs.
+
+If address discovery is restricted or a different address is needed, add a `node_addresses` object to your existing config, for example `"node_addresses": {"pve02": "192.0.2.22", "pve03": "2001:db8::23"}`. Replace these documentation addresses with reachable addresses. Node identity is still checked; missing or invalid addresses do not trigger hostname guessing. Root SSH trust between PVE nodes and permission to read counters are still required. API tokens alone do not supply host-level thin counters.
+
+Routes and failures are cached only within the current run and rediscovered on the next run. One failed node does not stop other nodes; warnings identify the affected VM/disk counts. Troubleshooting JSON includes source node, destination IP, verified identity and route error. It records that the port comes from OpenSSH configuration/defaults; it does not claim to resolve the effective port from every SSH configuration. VM placement is checked again at collection end; detected migrations or disappearances invalidate affected allocation measurements. Collection is not an atomic cluster snapshot.
+
+To verify this fix, rerun your normal command with `--diagnostics`, and compare the new bundle's `node_routes` and disk results. Automated tests simulate routing failures; successful collection on your actual cluster remains an onsite verification step.
+
 ### Collect troubleshooting files for review
 
 Add `--diagnostics` to your normal command to write a separate folder under **`logs/`**, relative to where you run the script:

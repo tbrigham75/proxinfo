@@ -38,10 +38,10 @@ class MeasurementTests(unittest.TestCase):
         def run(command):
             self.assertTrue(inv.approved_backend_command(command))
             commands.append(command)
-            return '/images/test.raw\n' if 'pvesm' in command[-1] else '81a4|8|512'
-        client = SimpleNamespace(entry_node='a', backend_command=run)
+            return 'b\n' if command[-1] == 'hostname -s' else '/images/test.raw\n' if 'pvesm' in command[-1] else '81a4|8|512'
+        client = SimpleNamespace(entry_node='a', backend_command=run, get=lambda path: [dict(type='node', name='b', ip='2001:db8::2')])
         self.assertEqual(inv.raw_file_allocation(client, 'b', 'local:100/test.raw'), 4096)
-        self.assertTrue(all(command[10] == 'root@b' for command in commands))
+        self.assertTrue(all(command[-2] == 'root@2001:db8::2' for command in commands))
         client.backend_command = lambda command: '/dev/disk' if 'pvesm' in command[-1] else '61a4|8|512'
         with self.assertRaises(inv.ReadError):
             inv.raw_file_allocation(client, 'b', 'local:100/test.raw')

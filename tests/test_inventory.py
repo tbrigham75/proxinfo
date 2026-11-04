@@ -501,11 +501,11 @@ class SSHTests(unittest.TestCase):
     def test_connection_prompts_and_unattended_credentials(self):
         args = SimpleNamespace(no_prompt=False, ssh_host=None, ssh_user=None, ssh_port=None,
                                ssh_key=None, timeout=20, ssh_auth_timeout=120, ssh_sudo=False)
-        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["", "pve", "", "2222"]):
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=["", "pve", ""]):
             settings = inv.ssh_settings(args, lambda name: None)
         self.assertEqual(settings["host"], "pve")
         self.assertEqual(settings["user"], "root")
-        self.assertEqual(settings["port"], 2222)
+        self.assertIsNone(settings["port"])
         self.assertNotIn("password", settings)
         args.no_prompt = True
         with self.assertRaises(ValueError):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only, standard-library PVE cluster VM inventory. Python 3.9+."""
 
+import ipaddress
 import argparse
 import csv
 import getpass
@@ -27,7 +28,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 
 class CronBusy(Exception):
@@ -180,10 +181,12 @@ class ObservedClient:
         return self.observed("GET " + path, lambda: self.client.get(path, **params))
 
     def thin_status(self, node):
-        return self.observed("LVM-thin counters on " + node, lambda: self.client.thin_status(node))
+        return read_thin_status(self, node) if hasattr(self.client, "backend_command") else self.observed("LVM-thin counters on " + node, lambda: self.client.thin_status(node))
 
     def backend_command(self, command):
-        return self.observed('Storage metadata ' + shlex.join(command), lambda: self.client.backend_command(command))
+        node = next((arg.split('=', 1)[1] for arg in command if arg.startswith('HostKeyAlias=')), None)
+        label = ('/nodes/' + node + '/storage/host ') if node else ''
+        return self.observed(label + 'Storage metadata ' + shlex.join(command), lambda: self.client.backend_command(command))
 
 
 NA = "N/A"
@@ -307,7 +310,7 @@ class Client:
     def get(self, path, **params):
         # Fixed GET-only surface, including exactly one read-only guest-agent command.
         allowed = (
-            r"/version", r"/nodes", r"/cluster/resources", r"/cluster/backup",
+            r"/version", r"/nodes", r"/cluster/status", r"/cluster/resources", r"/cluster/backup",
             r"/storage", r"/cluster/backup/[^/]+/included_volumes",
             r"/nodes/[^/]+/qemu/\d+/(?:config|status/current|agent/get-fsinfo)",
             r"/nodes/[^/]+/storage/[^/]+/content/[^/]+",
@@ -468,8 +471,6 @@ def ssh_settings(args, setting):
             host = input("PVE SSH hostname or IP address: ").strip()
         if not args.ssh_user and not setting("ssh_user"):
             user = input(f"SSH username [{user}]: ").strip() or user
-        if not port:
-            port = input("SSH port [SSH config default, normally 22]: ").strip() or None
         if authentication == "key" and not identity:
             identity = input("SSH key file on this computer [Enter to use your existing default SSH keys]: ").strip() or None
         if authentication == "password":
@@ -791,6 +792,18 @@ def cluster_ssh_prefix():
 
 
 def approved_backend_command(command):
+    if len(command) == 16 and command[:1] == ['ssh']:
+        node = command[10].removeprefix('HostKeyAlias=')
+        address = command[14].removeprefix('root@')
+        try:
+            ipaddress.ip_address(address)
+            return (re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', node) is not None
+                    and command[:-1] == routed_ssh_prefix(node, address)
+                    and shlex.split(command[-1])[:1] != ['ssh']
+                    and approved_backend_command(shlex.split(command[-1])))
+        except ValueError:
+            return False
+
     if (len(command) == 3 and command[:2] == ['pvesm', 'path']
             and re.fullmatch(r'[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+', command[2])):
         return True
@@ -832,27 +845,60 @@ class ThinCounters(dict):
         self.errors = {}
 
 
-def read_thin_status(client, node):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", node):
-        raise ReadError("Invalid cluster node name")
-    if not hasattr(client, "entry_node"):
-        client.entry_node = client.backend_command(["hostname", "-s"]).strip()
-    command = ["dmsetup", "status", "--target", "thin", "--noflush"]
-    if node != client.entry_node:
-        command = cluster_ssh_prefix() + ["root@" + node, shlex.join(command)]
-    return parse_thin_status(client.backend_command(command))
-
-
-def raw_file_allocation(client, node, volume):
-    """Read allocation of one raw regular file on its owning host, without opening its image."""
+def node_command(client, node, command):
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', node):
         raise ReadError('Invalid cluster node name')
     if not hasattr(client, 'entry_node'):
         client.entry_node = client.backend_command(['hostname', '-s']).strip()
-    def run(command):
-        if node != client.entry_node:
-            command = cluster_ssh_prefix() + ['root@' + node, shlex.join(command)]
+    if node == client.entry_node:
         return client.backend_command(command)
+    if not hasattr(client, 'node_routes'):
+        client.node_routes = {}
+    if node not in client.node_routes:
+        route = dict(source=client.entry_node, node=node, address=None, verified=False, error=None, connection_timeout_seconds=10, port_source='OpenSSH configuration/default (normally 22)')
+        client.node_routes[node] = route
+        try:
+            if not hasattr(client, 'cluster_addresses'):
+                client.cluster_addresses = {}
+                try:
+                    entries = client.get('/cluster/status')
+                    client.cluster_addresses = {entry['name']: entry.get('ip') for entry in entries
+                                                if entry.get('type') == 'node'}
+                    client.address_error = None
+                except ReadError as exc:
+                    client.address_error = str(exc)
+            address = getattr(client, 'node_address_overrides', {}).get(node) or client.cluster_addresses.get(node)
+            if not address:
+                raise ReadError('Cluster IP unavailable: ' + (getattr(client, 'address_error', None) or node))
+            route['address'] = str(ipaddress.ip_address(address))
+            prefix = routed_ssh_prefix(node, route['address'])
+            actual = client.backend_command(prefix + [shlex.join(['hostname', '-s'])]).strip()
+            if actual != node:
+                raise ReadError(f'Node identity mismatch: expected {node}, received {actual}')
+            route['verified'] = True
+        except (ReadError, ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            route['error'] = str(exc)
+    route = client.node_routes[node]
+    if route['error']:
+        raise ReadError(f"Storage connection {route['source']} -> {node} ({route['address']}): {route['error']}")
+    return client.backend_command(routed_ssh_prefix(node, route['address']) + [shlex.join(command)])
+
+
+def routed_ssh_prefix(node, address):
+    return ['ssh', '-T', '-a', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
+            '-o', 'ConnectTimeout=10', '-o', 'HostKeyAlias=' + node,
+            '-o', 'UserKnownHostsFile=/etc/pve/nodes/' + node + '/ssh_known_hosts /root/.ssh/known_hosts',
+            '--', 'root@' + address]
+
+
+def read_thin_status(client, node):
+    return parse_thin_status(node_command(client, node, ['dmsetup', 'status', '--target', 'thin', '--noflush']))
+
+
+def raw_file_allocation(client, node, volume):
+    """Read allocation of one raw regular file on its owning host, without opening its image."""
+    def run(command):
+        return node_command(client, node, command)
     path = run(['pvesm', 'path', volume]).strip()
     if not path.startswith('/') or '\n' in path:
         raise ReadError('Storage returned an invalid file path')
@@ -1312,6 +1358,21 @@ class Collector:
                             backup=backup, enabled_jobs=match, disabled_jobs=disabled,
                             disks=disks, filesystems=fs, filesystem_reason=fs_reason,
                             config_available=config_ok, notes=[n for n in notes if n]))
+        final_resources, final_error = self.read('/cluster/resources', type='vm')
+        if final_error:
+            self.warnings.append('Could not verify VM placement at collection end; measurements reflect earlier observations')
+        else:
+            final_nodes = {int(r['vmid']): r.get('node') for r in final_resources or [] if r.get('type') == 'qemu'}
+            for vm in vms:
+                if final_nodes.get(vm['vmid']) != vm['node']:
+                    reason = 'VM moved or disappeared during collection; storage measurements withheld; rerun after migration completes'
+                    vm['actual_bytes'] = None
+                    vm['actual_method'] = None
+                    vm['notes'].append(reason)
+                    self.warnings.append(f"VM {vm['vmid']}: {reason}")
+                    for disk in vm['disks']:
+                        if disk['counted']:
+                            disk.update(actual_bytes=None, actual_method=None, actual_reason=reason, measurement_status='placement changed')
         return dict(generated_at=datetime.now(timezone.utc).isoformat(), pve_version=version,
                     vms=vms, nodes=nodes, jobs=jobs, warnings=self.warnings,
                     pbs_destinations=[{k:st.get(k) for k in ("storage","server","datastore","namespace")} for st in storages.values() if st.get("type")=="pbs"],
@@ -2299,7 +2360,7 @@ def write_diagnostics(report, tracker, root, secrets=()):
         vms.append(row)
     data = redact_diagnostics(dict(bundle_schema=1, tool_version=VERSION,
         generated_at=report['generated_at'], pve_version=report.get('pve_version'),
-        scope=report.get('scope'), environment=report.get('environment'),
+        scope=report.get('scope'), environment=report.get('environment'), node_routes=report.get("node_routes", []),
         run=report.get('run'), vms=vms), secrets)
     atomic_text(destination / 'storage-diagnostics.json', json.dumps(data, indent=2))
     rows = [dict(vmid=vm['vmid'], node=vm['node'], vm_status=vm['status'], **disk)
@@ -2444,8 +2505,17 @@ def main(argv=None):
                 tracker = RunTracker(args.output_dir, args.progress, args.max_runtime)
             else:
                 tracker.started = time.monotonic()  # Collection budget begins after authentication.
+            client.node_address_overrides = config.get("node_addresses", {})
+            if not isinstance(client.node_address_overrides, dict):
+                raise ValueError("node_addresses must map PVE node names to IP addresses")
             client = ObservedClient(client, tracker)
             report = Collector(client, not args.no_guest_agent, args.storage_timeout, args.vmid, args.node).collect()
+        report["node_routes"] = [] if args.pbs_only else list(getattr(client, "node_routes", {}).values())
+        for route in report['node_routes']:
+            if route['error']:
+                affected = [v for v in report['vms'] if v['node'] == route['node']]
+                disks = sum(len(unique_disks(v['disks'])) for v in affected)
+                report['warnings'].append(f"Storage connection to {route['node']} failed; affects {len(affected)} VMs and {disks} disks: {route['error']}")
         report["large_vm_bytes"] = int(args.large_vm_gib * 1024**3)
         report["pbs_warning_percent"] = args.pbs_warning_percent
         report["pbs"] = dict(requested=False, status="not requested", datastores=[], groups=[], snapshots=[], warnings=[])
