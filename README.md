@@ -1,10 +1,17 @@
 # ProxInfo environment inventory
 
+On the **VM's** page, click a VM row to open its information. Close the panel with
+**Back To VM List**, the Escape key, or a click on the dimmed area outside it.
+The close button stays visible while scrolling. Keyboard users can focus a row
+and press Enter or Space; closing the panel returns focus to that row. Links and
+expandable explanations inside rows retain their own actions. VM information no
+longer needs a separate table column.
+
 ## PBS sign-in and measured totals
 
 Run manually from WSL/Ubuntu using `python3 pve_inventory.py --ssh --pbs`.
-The PBS connection question comes before PBS credentials: choose `password`
-for a PBS web account, `token` for an API token, or `ssh` for system login.
+The PBS connection question comes before PBS credentials: press Enter for `ssh`
+(the default), choose `password` for a PBS web account, or `token` for an API token.
 SSH then offers password, key, or configured authentication. PBS stays off
 unless requested; complete existing token configurations continue to work.
 

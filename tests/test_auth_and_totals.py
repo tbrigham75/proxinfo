@@ -2,10 +2,24 @@ import io
 import json
 import unittest
 from unittest.mock import patch, MagicMock
+from types import SimpleNamespace
 from test_inventory import inv, collect, FakeClient, GIB
 
 
 class AuthAndTotals(unittest.TestCase):
+    def test_default_pbs_connection_is_ssh(self):
+        args = SimpleNamespace(pbs=True, pbs_url=None, no_prompt=False)
+        config = dict(pbs_ssh_host='pbs', pbs_ssh_user='root', pbs_ssh_auth='key', pbs_ssh_key='/tmp/key')
+        with patch.dict(inv.os.environ, {}, clear=True), patch.object(inv.sys.stdin, 'isatty', return_value=True), patch.object(inv, 'prompt_choice', side_effect=lambda question, options, default: default) as choice:
+            result = inv.pbs_settings(args, config)
+            self.assertEqual(result['auth'], 'ssh')
+            self.assertEqual(choice.call_args.args[1:], (('ssh', 'password', 'token'), 'ssh'))
+        args.no_prompt = True
+        with patch.dict(inv.os.environ, {}, clear=True), patch('builtins.input', side_effect=AssertionError('Unexpected prompt')):
+            self.assertEqual(inv.pbs_settings(args, config)['auth'], 'ssh')
+            token = inv.pbs_settings(args, dict(pbs_token_id='audit@pbs!r', pbs_token_secret='secret', pbs_url='https://pbs:8007'))
+            self.assertEqual(token.get('auth', 'token'), 'token')
+
     def test_partial_total_visible_in_both_reports(self):
         r = collect(FakeClient({'/nodes/b/qemu/101/config': inv.ReadError('offline')}))
         inv.sort_report(r, 'configured')

@@ -20,12 +20,21 @@ assert.equal(result.status,0,result.stderr);const content=JSON.parse(result.stdo
   assert.equal(await page.locator('#table-assigned-total').textContent(),'150.00 GiB');
   assert.equal(await page.locator('#table-used-total').textContent(),'20.00 GiB · Complete');
   assert.equal(await page.locator('[data-page-link="changes"]').count(),0);
-  assert.deepEqual(await page.locator('.nav a').allTextContents(),['Summary','Needs Attention','PVE Hosts','Virtual Machines','Storage','PVE Backup Jobs','PBS Backup Storage','Management Summary','Downloads','Help','IT Reference']);
+  assert.deepEqual(await page.locator('.nav a').allTextContents(),['Summary','Needs Attention','PVE Hosts',"VM's",'Storage','PVE Backup Jobs','PBS Backup Storage','Management Summary','Downloads','Help','IT Reference']);
   await page.evaluate(()=>{const row=document.querySelector('#vms tbody tr');const disks=JSON.parse(row.dataset.disks);disks.push({identity:['missing','disk'],capacity:'1024',used:null,method:null});row.dataset.disks=JSON.stringify(disks);filterRows();});
   assert.equal(await page.locator('#table-used-total').textContent(),'20.00 GiB · Partial');
   assert.equal(await page.locator('#table-ram-total').textContent(),'6.00 GiB');
   await page.selectOption('#global-node-filter','pve01');assert.equal(await page.locator('#table-ram-total').textContent(),'4.00 GiB');assert.equal(await page.locator('#vms tbody tr:visible').count(),1);
-  await page.selectOption('#global-node-filter','');await page.locator('.vm-details summary').first().click();await page.waitForFunction(()=>document.querySelector('.vm-drawer').open);await page.locator('.vm-drawer button').first().click();
+  await page.selectOption('#global-node-filter','');await page.locator('#vms tbody tr').first().locator('td').nth(1).click();await page.waitForFunction(()=>document.querySelector('.vm-drawer').open);await page.locator('.vm-drawer button').first().click();
+  assert.equal(await page.locator('.vm-drawer').evaluate(el=>el.open),false);
+  assert.equal(await page.locator('#vms thead th').count(),11);
+  await page.locator('#vms tbody tr').first().focus();await page.keyboard.press('Enter');
+  await page.waitForFunction(()=>document.querySelector('.vm-drawer').open);
+  await page.keyboard.press('Escape');assert.equal(await page.locator('.vm-drawer').evaluate(el=>el.open),false);
+  await page.locator('#vms tbody tr').first().locator('td').nth(3).click();
+  await page.waitForFunction(()=>document.querySelector('.vm-drawer').open);
+  await page.mouse.click(2,2);assert.equal(await page.locator('.vm-drawer').evaluate(el=>el.open),false);
+
   await page.locator('button[data-col="2"]').click();await page.locator('button[data-col="2"]').click();
   assert.equal(await page.locator('#vms tbody tr').first().getAttribute('data-node'),'pve02');
   await page.evaluate(()=>showPage('pbs'));await page.getByRole('button',{name:'Backups',exact:true}).click();
