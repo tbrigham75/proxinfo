@@ -48,10 +48,11 @@ class AuthAndTotals(unittest.TestCase):
         ssh = MagicMock()
         ssh.ssh_args.return_value = ['ssh']
         ssh.host, ssh.sudo = 'pbs', False
-        with patch.object(inv, 'SSHClient', return_value=ssh), patch.object(inv.subprocess, 'run', return_value=MagicMock(returncode=0, stdout='[]')) as run:
+        ssh.run_pbs.return_value = MagicMock(returncode=0, stdout='[]')
+        with patch.object(inv, 'SSHClient', return_value=ssh):
             client = inv.PBSClient('https://pbs:8007', auth='ssh', ssh_options={})
             self.assertEqual(client.get('/admin/datastore'), [])
-            self.assertIn('PROXMOX_DEBUG_API_CODE=0 proxmox-backup-debug api get', run.call_args.args[0][-1])
+            self.assertEqual(ssh.run_pbs.call_args.args[0][:5], ['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug', 'api', 'get'])
             with self.assertRaises(ValueError):
                 client.get('/admin/datastore/x/prune')
             client.close()

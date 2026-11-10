@@ -3,6 +3,7 @@
 
 import ipaddress
 import argparse
+import base64
 import csv
 import getpass
 import html
@@ -28,7 +29,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 
 class CronBusy(Exception):
@@ -99,7 +100,7 @@ class RunTracker:
         if self.progress != "off":
             print(text, file=sys.stderr, flush=True)
 
-    def query(self, operation, call, timeout=None):
+    def query(self, operation, call, timeout=None, interactive=False):
         if self.max_runtime is not None and time.monotonic() - self.started >= self.max_runtime:
             self.expired = True
         if self.cancelled or self.expired:
@@ -107,10 +108,12 @@ class RunTracker:
         start = time.monotonic()
         stamp = datetime.now(timezone.utc).isoformat()
         stop = threading.Event()
-        self.message("Reading " + operation + (f" | timeout {timeout:g}s" if timeout is not None else ""))
+        self.message("Reading " + operation + (f" | timeout {timeout:g}s" if timeout is not None else "") +
+                     (' | interactive sudo: elapsed time includes any authentication' if interactive else ''))
         def heartbeat():
             while not stop.wait(5):
-                self.message(f"Waiting: {operation} | {time.monotonic()-start:.0f}s elapsed" + (f" | timeout {timeout:g}s" if timeout is not None else ""))
+                if not interactive:
+                    self.message(f"Waiting: {operation} | {time.monotonic()-start:.0f}s elapsed" + (f" | timeout {timeout:g}s" if timeout is not None else ""))
         worker = threading.Thread(target=heartbeat, daemon=True)
         worker.start()
         outcome = "success"
@@ -166,16 +169,28 @@ class ObservedClient:
 
     def observed(self, name, call):
         clients = [self.client] + ([self.client.pvesh] if hasattr(self.client, "pvesh") else [])
+        if getattr(self.client, 'ssh', None) is not None:
+            clients.append(self.client.ssh)
         previous = [(c,c.timeout) for c in clients if hasattr(c,"timeout")]
+        budgets = [(c, getattr(c, 'operation_budget', None)) for c in clients]
+        remaining = float('inf')
         if self.tracker.max_runtime is not None:
             remaining = max(0.01, self.tracker.max_runtime - (time.monotonic()-self.tracker.started))
             for c, timeout in previous:
                 c.timeout = min(timeout, remaining)
+            for c in clients:
+                c.operation_budget = remaining
         try:
-            return self.tracker.query(name, call, getattr(self.client, "timeout", None))
+            interactive = next((c for c in clients if getattr(c, 'sudo_mode', None) == 'interactive'), None)
+            timeout = getattr(self.client, 'timeout', None)
+            if interactive is not None and timeout is not None:
+                timeout = min(timeout + interactive.auth_timeout, remaining)
+            return self.tracker.query(name, call, timeout, interactive=interactive is not None)
         finally:
             for c, timeout in previous:
                 c.timeout = timeout
+            for c, budget in budgets:
+                c.operation_budget = budget
 
     def get(self, path, **params):
         return self.observed("GET " + path, lambda: self.client.get(path, **params))
@@ -344,13 +359,285 @@ class Client:
             raise ReadError(message[:600]) from None
 
 
+class SudoFrameDecoder:
+    """Separate opaque terminal text from tool-generated result frames."""
+    def __init__(self, prefix):
+        self.prefix, self.buffer = prefix, b''
+
+    def feed(self, chunk):
+        self.buffer += chunk
+        events = []
+        while self.buffer:
+            start = self.buffer.find(self.prefix)
+            if start < 0:
+                keep = next((n for n in range(min(len(self.prefix)-1, len(self.buffer)), 0, -1)
+                             if self.buffer.endswith(self.prefix[:n])), 0)
+                size = len(self.buffer) - keep
+                if size:
+                    events.append(('terminal', self.buffer[:size]))
+                    self.buffer = self.buffer[size:]
+                break
+            if start:
+                events.append(('terminal', self.buffer[:start]))
+                self.buffer = self.buffer[start:]
+            end = self.buffer.find(b'\n', len(self.prefix))
+            if end < 0:
+                if len(self.buffer) > 48 * 1024 * 1024:
+                    raise ReadError('Interactive sudo response exceeded the size limit')
+                break
+            try:
+                frame = json.loads(self.buffer[len(self.prefix):end])
+                if not isinstance(frame, dict):
+                    raise ValueError()
+            except (ValueError, UnicodeError):
+                raise ReadError('Interactive sudo response framing failed; reconnect to continue') from None
+            events.append(('frame', frame))
+            self.buffer = self.buffer[end+1:]
+        return events
+
+
+# Runs as the SSH account, NOT as root. No helper file is installed. Forking each
+# sudo from this same process preserves both tty- and parent-based timestamps.
+# Only command stdout is captured; sudo/PAM and command stderr stay on the TTY.
+SUDO_SESSION_HELPER = r'''
+use strict; use warnings; use JSON::PP; use MIME::Base64; use Text::ParseWords qw(shellwords); use Socket qw(AF_INET AF_INET6 inet_pton);
+$| = 1;
+my $prefix = "\x1ePROXINFO:" . shift(@ARGV) . ":";
+my $pid;
+sub send_frame { print $prefix . encode_json($_[0]) . "\n"; }
+sub stop_child { kill 'TERM', $pid if $pid; exit 124; }
+sub approved {
+    my ($c, $nested) = @_;
+    return 0 if grep { /[\x00-\x1f\x7f]/ } @$c;
+    my @a = @$c;
+    my $name = shift @a;
+    if ($name eq 'pvesh') {
+        return 0 unless @a >= 4 && shift(@a) eq 'get';
+        my $path = shift @a;
+        return 0 unless $path =~ m{\A(?:/version|/nodes|/cluster/(?:status|resources|backup)|/storage|/cluster/backup/[^/]+/included_volumes|/nodes/[^/]+/(?:status|storage)|/nodes/[^/]+/qemu/\d+/(?:config|status/current|agent/get-fsinfo)|/nodes/[^/]+/storage/[^/]+/content/.+)\z};
+        return 0 unless shift(@a) eq '--output-format' && shift(@a) eq 'json';
+        return 1 if !@a;
+        return @a == 2 && (($path eq '/cluster/resources' && $a[0] eq '--type' && $a[1] eq 'vm') || ($path =~ m{/config\z} && $a[0] eq '--current' && $a[1] eq '1'));
+    }
+    if ($name eq 'env') {
+        return 0 unless @a >= 7 && shift(@a) eq 'PROXMOX_DEBUG_API_CODE=0' && shift(@a) eq 'proxmox-backup-debug' && shift(@a) eq 'api' && shift(@a) eq 'get';
+        my $path = shift @a;
+        return 0 unless $path =~ m{\A(?:/version|/admin/datastore|/config/datastore/[^/]+|/(?:config|admin)/(?:prune|sync|verify)|/nodes/localhost/tasks|/admin/datastore/[^/]+/(?:status|namespace|groups|snapshots|gc))\z};
+        return 0 unless shift(@a) eq '--output-format' && shift(@a) eq 'json';
+        while (@a) {
+            return 0 unless @a >= 2;
+            my ($key, $value) = splice(@a, 0, 2);
+            if ($path eq '/nodes/localhost/tasks') { return 0 unless $key =~ /^--(?:store|start|limit|since)$/; }
+            elsif ($path =~ m{/namespace\z}) { return 0 unless $key =~ /^--(?:ns|max-depth)$/; }
+            elsif ($path =~ m{/(?:groups|snapshots)\z}) { return 0 unless $key eq '--ns'; }
+            else { return 0; }
+        }
+        return 1;
+    }
+    return @a == 1 && $a[0] eq '-s' if $name eq 'hostname';
+    return join(' ', @a) eq 'status --target thin --noflush' if $name eq 'dmsetup';
+    return @a == 2 && $a[0] eq 'path' && $a[1] =~ /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.\/-]+$/ if $name eq 'pvesm';
+    return @a == 4 && $a[0] eq '-L' && $a[1] eq '--printf=%f|%b|%B' && $a[2] eq '--' && $a[3] =~ m{^/} if $name eq 'stat';
+    return @a == 6 && $a[0] eq '--json' && $a[1] eq '--target' && $a[2] =~ m{^/} && $a[3] eq '--output' && $a[4] eq 'SOURCE,TARGET,FSTYPE,UUID' && $a[5] eq '--first-only' if $name eq 'findmnt';
+    if ($name eq 'ssh' && !$nested && @a == 15) {
+        my ($alias) = $a[9] =~ /^HostKeyAlias=([A-Za-z0-9][A-Za-z0-9_.-]*)$/;
+        return 0 unless defined($alias) && $a[13] =~ /^root\@([A-Fa-f0-9.:]+)$/;
+        my $address = $1;
+        return 0 unless inet_pton(AF_INET, $address) || inet_pton(AF_INET6, $address);
+        return 0 unless join('|', @a[0..8]) eq '-T|-a|-o|BatchMode=yes|-o|StrictHostKeyChecking=yes|-o|ConnectTimeout=10|-o';
+        return 0 unless $a[10] eq '-o' && $a[11] eq "UserKnownHostsFile=/etc/pve/nodes/$alias/ssh_known_hosts /root/.ssh/known_hosts" && $a[12] eq '--';
+        my @inner = shellwords($a[14]);
+        return 0 unless @inner && $inner[0] =~ /^(hostname|dmsetup|pvesm|stat|findmnt)$/;
+        return 0 unless approved(\@inner, 1);
+        # Validation alone is insufficient: ssh interprets its final argument
+        # with a shell. Rebuild it using literal single-quoted arguments.
+        $c->[-1] = join(' ', map { my $v = $_; $v =~ s/'/'"'"'/g; "'$v'" } @inner);
+        return 1;
+    }
+    return 0;
+}
+$SIG{HUP} = $SIG{TERM} = $SIG{ALRM} = \&stop_child;
+send_frame({event=>'ready', uid=>0+$<});
+while (my $line = <STDIN>) {
+    die "Inventory request too large\n" if length($line) > 65536;
+    my $r = eval { decode_json($line) };
+    unless (ref($r) eq 'HASH' && ($r->{id}//'') =~ /^[a-f0-9]{32}$/ &&
+            ref($r->{command}) eq 'ARRAY' && @{$r->{command}} &&
+            !grep { ref($_) || !defined($_) || /\x00/ } @{$r->{command}}) {
+        die "Invalid inventory session request\n";
+    }
+    die "Invalid inventory request deadline\n" unless defined($r->{deadline}) && !ref($r->{deadline}) &&
+        $r->{deadline} =~ /\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\z/ &&
+        $r->{deadline} > 0 && $r->{deadline} < 2147483646;
+    die "Command rejected by read-only inventory session\n" unless approved($r->{command}, 0);
+    my @cmd = @{$r->{command}};
+    unshift @cmd, 'sudo', '--' if $< != 0;
+    pipe(my $reader, my $writer) or die "Inventory output pipe unavailable\n";
+    $pid = fork();
+    defined($pid) or die "Inventory process unavailable\n";
+    if ($pid == 0) {
+        close $reader;
+        open STDOUT, '>&', $writer or exit 126;
+        close $writer;
+        open STDIN, '<', '/dev/null' or exit 126;
+        exec {$cmd[0]} @cmd;
+        exit 127;
+    }
+    close $writer;
+    alarm(int($r->{deadline}) + 1);
+    my $out = '';
+    while (1) {
+        my $count = sysread($reader, my $chunk, 65536);
+        next if !defined($count) && $!{EINTR};
+        defined($count) or die "Inventory output read failed\n";
+        last if !$count;
+        $out .= $chunk;
+        if (length($out) > 32*1024*1024) { stop_child(); }
+    }
+    close $reader;
+    waitpid($pid, 0);
+    my $status = $?;
+    $pid = undef;
+    alarm(0);
+    send_frame({event=>'result', id=>$r->{id}, code=>($status & 127 ? 128+($status & 127) : $status >> 8), stdout=>encode_base64($out, '')});
+}
+'''
+
+
+class InteractiveSudoSession:
+    """A tool-owned remote PTY; authentication is terminal-only, never logged."""
+    def __init__(self, client):
+        self.client = client
+        self.process, self.terminal = None, None
+        self.decoder = SudoFrameDecoder(('\x1ePROXINFO:' + uuid.uuid4().hex + ':').encode())
+        self.ready = False
+
+    def start(self):
+        if os.name != 'posix' or not sys.stdin.isatty():
+            raise ValueError('Interactive sudo requires a WSL/Linux terminal; use noninteractive mode for cron')
+        try:
+            self.terminal = os.open('/dev/tty', os.O_RDWR)
+            nonce = self.decoder.prefix.decode().split(':')[1]
+            remote = 'stty -echo -icanon -onlcr min 1 time 0 && exec ' + shlex.join(['perl', '-e', SUDO_SESSION_HELPER, nonce])
+            args = [arg for arg in self.client.ssh_args() if arg != '-T']
+            self.process = subprocess.Popen(args + ['-tt', '-e', 'none', '-o', 'ControlMaster=no',
+                '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'PermitLocalCommand=no',
+                '--', self.client.host, remote], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, bufsize=0)
+            frame = self._exchange(None, self.client.auth_timeout, False)
+            if frame.get('event') != 'ready' or not isinstance(frame.get('uid'), int):
+                raise ReadError('Interactive sudo startup handshake failed')
+            self.ready = True
+        except BaseException:
+            self.close()
+            raise
+
+    def _exchange(self, payload, timeout, terminal_input):
+        import select
+        import termios
+        previous = None
+        try:
+            if terminal_input:
+                previous = termios.tcgetattr(self.terminal)
+                settings = termios.tcgetattr(self.terminal)
+                settings[3] &= ~(termios.ECHO | termios.ICANON)
+                settings[6][termios.VMIN], settings[6][termios.VTIME] = 1, 0
+                termios.tcsetattr(self.terminal, termios.TCSANOW, settings)
+            if payload is not None:
+                wire = (json.dumps(payload, ensure_ascii=True) + '\n').encode()
+                if len(wire) > 65536:
+                    raise ReadError('Interactive sudo request exceeded the size limit')
+                # Large commands may need several pipe writes.
+                while wire:
+                    sent = os.write(self.process.stdin.fileno(), wire)
+                    if not sent:
+                        raise ReadError('Interactive sudo session disconnected')
+                    wire = wire[sent:]
+            until = time.monotonic() + timeout
+            while True:
+                remaining = until - time.monotonic()
+                if remaining <= 0:
+                    raise ReadError('Interactive sudo command/authentication timed out; no credentials were retried')
+                inputs = [self.process.stdout.fileno()] + ([self.terminal] if terminal_input else [])
+                readable, _, _ = select.select(inputs, [], [], min(remaining, 0.25))
+                if self.process.stdout.fileno() in readable:
+                    chunk = os.read(self.process.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise ReadError('Interactive sudo session ended. Check the terminal message, sudo permissions, and remote Perl JSON::PP/MIME::Base64 availability')
+                    for kind, item in self.decoder.feed(chunk):
+                        if kind == 'terminal':
+                            os.write(self.terminal, item)  # Never pass this to a logger or exception.
+                        else:
+                            if payload is not None and (item.get('event') != 'result' or item.get('id') != payload['id']):
+                                raise ReadError('Interactive sudo response did not match its request')
+                            return item
+                if terminal_input and self.terminal in readable:
+                    typed = os.read(self.terminal, 1024)
+                    if not typed:
+                        raise ReadError('Interactive sudo input closed')
+                    os.write(self.process.stdin.fileno(), typed)
+                    del typed
+        finally:
+            if previous is not None:
+                termios.tcsetattr(self.terminal, termios.TCSAFLUSH, previous)
+
+    def run(self, command, timeout):
+        if not self.ready:
+            raise ReadError('Interactive sudo session unavailable; reconnect to continue')
+        try:
+            print(f'Sudo read on {self.client.host}: enter a fresh password/MFA response only if prompted.', file=sys.stderr)
+            # PAM plugins do not expose a portable authentication-complete event.
+            # Bound the combined read/authentication interval and report it honestly.
+            deadline = min(timeout + self.client.auth_timeout, getattr(self.client, 'operation_budget', None) or float('inf'))
+            frame = self._exchange(dict(id=uuid.uuid4().hex, command=command, deadline=deadline), deadline, True)
+            code = frame.get('code')
+            if not isinstance(code, int) or not isinstance(frame.get('stdout'), str):
+                raise ReadError('Interactive sudo returned an invalid result')
+            output = base64.b64decode(frame['stdout'], validate=True).decode('utf-8', errors='replace')
+            if code != 0:
+                # PAM and command errors intentionally share only the human TTY.
+                # Stop this session rather than risk repeated MFA attempts.
+                self.close()
+            return subprocess.CompletedProcess(command, code, output,
+                '' if code == 0 else 'Sudo or the approved read failed (exit ' + str(code) + '); this session was closed. See the terminal message. Credentials were not retried.')
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self.ready = False
+        try:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        finally:
+            if self.process:
+                for stream in (self.process.stdin, self.process.stdout):
+                    if stream:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                self.process = None
+            if self.terminal is not None:
+                os.close(self.terminal)
+                self.terminal = None
+            self.decoder.buffer = b''
+
+
 class SSHClient(Client):
     """Run allowlisted PVE GETs and exact thin-status reads through an OpenSSH master.
 
     Python and report generation stay local. No code or report is uploaded.
     """
     def __init__(self, host, user="root", port=None, identity=None, timeout=20,
-                 auth_timeout=120, sudo=False, batch=False, authentication="auto"):
+                 auth_timeout=120, sudo=False, batch=False, authentication="auto", sudo_mode=None):
         super().__init__("local", timeout)
         if not host or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", host):
             raise ValueError("SSH host must be a hostname, IP address or SSH config alias, without user@ or a URL")
@@ -360,7 +647,16 @@ class SSHClient(Client):
             raise ValueError("SSH port must be between 1 and 65535")
         self.host, self.user, self.port = host, user, port
         self.identity = str(Path(identity).expanduser().resolve()) if identity else None
-        self.auth_timeout, self.sudo, self.batch = auth_timeout, sudo, batch
+        self.sudo_mode = sudo_mode or ('noninteractive' if sudo else 'none')
+        if self.sudo_mode not in ('none', 'noninteractive', 'interactive'):
+            raise ValueError('SSH sudo mode must be none, noninteractive or interactive')
+        if self.sudo_mode == 'interactive' and batch:
+            raise ValueError('Interactive sudo requires a terminal; cron/--no-prompt cannot supply MFA')
+        self.auth_timeout = float(auth_timeout)
+        if not 0 < self.auth_timeout < float('inf'):
+            raise ValueError('SSH authentication timeout must be positive and finite')
+        self.sudo, self.batch = self.sudo_mode != 'none', batch
+        self.interactive_session = None
         if authentication not in ("auto", "password", "key"):
             raise ValueError("SSH authentication must be auto, password or key")
         if batch and authentication == "password":
@@ -406,6 +702,9 @@ class SSHClient(Client):
             result = subprocess.run(command, timeout=self.auth_timeout, check=False, shell=False)
             if result.returncode:
                 raise ReadError("SSH connection failed. See the SSH message above for authentication, host-key or network details")
+            if self.sudo_mode == 'interactive':
+                self.interactive_session = InteractiveSudoSession(self)
+                self.interactive_session.start()
         except (OSError, subprocess.TimeoutExpired) as exc:
             self.close()
             raise ReadError(f"SSH connection failed: {exc}") from None
@@ -420,6 +719,21 @@ class SSHClient(Client):
         # even though subprocess itself uses shell=False locally.
         if command[:2] != ["pvesh", "get"]:
             raise ValueError("SSH mode accepts only pvesh get commands")
+        return self._run_command(command)
+
+    def run_pbs(self, command):
+        if command[:5] != ['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug', 'api', 'get']:
+            raise ValueError('SSH PBS mode accepts only inventory api get commands')
+        return self._run_command(command)
+
+    def _run_command(self, command):
+        # Callers validate the command before reaching this transport.
+        if self.sudo_mode == 'interactive':
+            if self.interactive_session is None:
+                raise ReadError('Interactive sudo session is not connected')
+            return self.interactive_session.run(command, self.timeout)
+        if not self.control_path:
+            raise ReadError('SSH session is not connected')
         remote = (["sudo", "-n", "--"] if self.sudo else []) + command
         return subprocess.run(self.ssh_args() + ["-o", "ControlMaster=no", "-o", "BatchMode=yes",
                               "-o", "StrictHostKeyChecking=yes", "-o", "PermitLocalCommand=no",
@@ -431,12 +745,8 @@ class SSHClient(Client):
             raise ValueError("Not an approved backend read command")
         if not self.control_path:
             raise ReadError("SSH session is not connected")
-        remote = (["sudo", "-n", "--"] if self.sudo else []) + command
         try:
-            result = subprocess.run(self.ssh_args() + ["-o", "ControlMaster=no", "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=yes", "-o", "PermitLocalCommand=no", "--", self.host,
-                shlex.join(remote)], capture_output=True, text=True, timeout=self.timeout, check=False,
-                shell=False, stdin=subprocess.DEVNULL)
+            result = self._run_command(command)
             if result.returncode:
                 raise ReadError(result.stderr.strip()[:600] or "Backend read failed")
             return result.stdout
@@ -444,6 +754,9 @@ class SSHClient(Client):
             raise ReadError(str(exc)[:600]) from None
 
     def close(self):
+        if self.interactive_session:
+            self.interactive_session.close()
+            self.interactive_session = None
         if self.control_path:
             try:
                 subprocess.run(self.ssh_args() + ["-O", "exit", "--", self.host],
@@ -477,9 +790,24 @@ def ssh_settings(args, setting):
             print("SSH will ask for your account password when it connects. Nothing is displayed while you type it.", file=sys.stderr)
     if not host:
         raise ValueError("SSH mode requires --ssh-host, PVE_SSH_HOST, a config ssh_host, or an interactive hostname prompt")
+    sudo_mode = (getattr(args, 'ssh_sudo_mode', None) or
+                 ('noninteractive' if args.ssh_sudo else setting('ssh_sudo_mode')))
+    sudo_mode = choose_sudo_mode(sudo_mode, user, interactive, args.no_prompt, 'PVE')
     return dict(host=host, user=user, port=int(port) if port is not None else None, identity=identity,
                 timeout=args.timeout, auth_timeout=args.ssh_auth_timeout, sudo=args.ssh_sudo,
-                batch=args.no_prompt, authentication=authentication)
+                batch=args.no_prompt, authentication=authentication, sudo_mode=sudo_mode)
+
+
+def choose_sudo_mode(mode, user, interactive, batch, service):
+    if mode is None and interactive and user != 'root':
+        print(f'{service} administrator access: none = run directly; interactive = sudo password/MFA prompt; noninteractive = sudo already works without prompts.', file=sys.stderr)
+        mode = prompt_choice(service + ' sudo mode', ('interactive', 'noninteractive', 'none'), 'interactive')
+    mode = mode or 'none'
+    if mode not in ('none', 'noninteractive', 'interactive'):
+        raise ValueError(service + ' sudo mode must be none, noninteractive or interactive')
+    if mode == 'interactive' and (batch or not interactive):
+        raise ValueError(service + ' interactive sudo requires a terminal; cron/--no-prompt cannot supply MFA')
+    return mode
 
 
 def api_settings(args, setting):
@@ -516,7 +844,13 @@ class PBSClient:
         self.ssh, self.cookie = None, None
         if auth == 'ssh':
             self.ssh = SSHClient(**ssh_options)
-            self.ssh.connect()
+            try:
+                self.ssh.connect()
+                if self.ssh.sudo_mode == 'interactive':
+                    self.get('/version')  # Verify one permitted read before collecting datastores.
+            except BaseException:
+                self.ssh.close()
+                raise
         elif auth == 'password':
             if not username or '@' not in username or not password:
                 raise ValueError('PBS password login requires username@realm and a password')
@@ -563,12 +897,11 @@ class PBSClient:
                 if not re.fullmatch(r'[a-z][a-z0-9-]*', key):
                     raise ValueError('Invalid PBS query parameter')
                 command += ['--' + key, str(value).lower() if isinstance(value, bool) else str(value)]
-            if self.ssh.sudo:
-                command = ['sudo', '-n', '--'] + command
             try:
-                result = subprocess.run(self.ssh.ssh_args() + ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'PermitLocalCommand=no', '--', self.ssh.host, shlex.join(command)], capture_output=True, text=True, timeout=self.timeout, stdin=subprocess.DEVNULL)
+                self.ssh.timeout = self.timeout
+                result = self.ssh.run_pbs(command)
                 if result.returncode:
-                    raise ReadError('PBS SSH read failed; check root/restricted sudo access and proxmox-backup-debug availability')
+                    raise ReadError('PBS SSH read failed; check sudo permissions and proxmox-backup-debug availability. ' + result.stderr[:300])
                 return json.loads(result.stdout)
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 raise ReadError('PBS SSH query failed or timed out') from None
@@ -620,7 +953,13 @@ def pbs_settings(args, config):
             identity = setting('ssh_key')
             if method == 'key' and interactive and not identity:
                 identity = input('PBS SSH private key file [Enter for configured keys/agent]: ').strip() or None
-            values['ssh_options'] = dict(host=host, user=user, identity=identity, port=setting('ssh_port'), authentication=method, batch=not interactive, timeout=values['timeout'], sudo=bool(config.get('pbs_ssh_sudo', False)))
+            sudo_mode = setting('ssh_sudo_mode') or ('noninteractive' if config.get('pbs_ssh_sudo') else None)
+            sudo_mode = choose_sudo_mode(sudo_mode, user, interactive, args.no_prompt, 'PBS')
+            raw_auth_timeout = setting('ssh_auth_timeout')
+            auth_timeout = float(raw_auth_timeout if raw_auth_timeout is not None else 120)
+            if not 0 < auth_timeout < float('inf'):
+                raise ValueError('PBS SSH authentication timeout must be positive and finite')
+            values['ssh_options'] = dict(host=host, user=user, identity=identity, port=setting('ssh_port'), authentication=method, batch=not interactive, timeout=values['timeout'], sudo_mode=sudo_mode, auth_timeout=auth_timeout)
             if not values['url'] and host:
                 values['url'] = 'https://' + ('[' + host + ']' if ':' in host else host) + ':8007'
         else:
@@ -2345,14 +2684,22 @@ def pbs_jobs_html(report):
 
 
 def pbs_location_details(report, config, args, tracker, existing=None):
-    host = existing.host if existing else config.get('pbs_ssh_host')
+    def setting(key):
+        explicit = getattr(args, 'pbs_' + key, None)
+        return explicit if explicit is not None else os.environ.get('PBS_' + key.upper(), config.get('pbs_' + key))
+    host = existing.host if existing else setting('ssh_host')
     if not host or not report.get('pbs', {}).get('requested'):
         return
-    client = existing or SSHClient(host, user=config.get('pbs_ssh_user', 'root'),
-        port=config.get('pbs_ssh_port'), identity=config.get('pbs_ssh_key'),
-        timeout=args.pbs_timeout, batch=args.no_prompt, authentication='auto')
+    client = existing
     try:
         if not existing:
+            interactive = not args.no_prompt and sys.stdin.isatty()
+            user = setting('ssh_user') or 'root'
+            mode = setting('ssh_sudo_mode') or ('noninteractive' if config.get('pbs_ssh_sudo') else None)
+            mode = choose_sudo_mode(mode, user, interactive, args.no_prompt, 'PBS filesystem lookup')
+            client = SSHClient(host, user=user, port=setting('ssh_port'), identity=setting('ssh_key'),
+                timeout=args.pbs_timeout, batch=not interactive, authentication=setting('ssh_auth') or 'auto',
+                sudo_mode=mode, auth_timeout=setting('ssh_auth_timeout') if setting('ssh_auth_timeout') is not None else 120)
             client.connect()
         client = ObservedClient(client, tracker)
         for store in report['pbs'].get('datastores', []):
@@ -2367,7 +2714,7 @@ def pbs_location_details(report, config, args, tracker, existing=None):
     except (ReadError, ValueError, OSError) as exc:
         report['pbs']['warnings'].append('Optional PBS filesystem lookup unavailable: ' + str(exc))
     finally:
-        if not existing:
+        if not existing and client is not None:
             client.close()
 
 
@@ -2681,7 +3028,8 @@ def main(argv=None):
     parser.add_argument("--ssh-key", help="Local SSH private key path (optional)")
     parser.add_argument("--ssh-auth", choices=("auto", "password", "key"), help="SSH sign-in method (interactive prompt if unspecified)")
     parser.add_argument("--ssh-sudo", action="store_true", help="Prefix remote pvesh commands with sudo -n; requires preconfigured noninteractive sudo")
-    parser.add_argument("--ssh-auth-timeout", type=float, default=120, help="Seconds allowed for initial SSH authentication (default 120)")
+    parser.add_argument('--ssh-sudo-mode', choices=('none', 'noninteractive', 'interactive'), help='PVE privilege mode; interactive allows separate sudo password/MFA prompts')
+    parser.add_argument("--ssh-auth-timeout", type=float, default=120, help="SSH login timeout and additional interactive sudo/MFA allowance per read (default 120 seconds)")
     parser.add_argument("--environment", choices=("auto", "cluster", "standalone"), default="auto")
     parser.add_argument("--no-prompt", action="store_true", help="Use explicit options/detection without startup questions")
     parser.add_argument("--config", type=Path, help="Optional JSON credentials/settings file; environment overrides it")
@@ -2713,6 +3061,8 @@ def main(argv=None):
     parser.add_argument('--pbs-ssh-user', help='PBS system account for SSH')
     parser.add_argument('--pbs-ssh-key', help='Local PBS SSH private key path')
     parser.add_argument('--pbs-ssh-auth', choices=('password', 'key', 'auto'), help='PBS SSH authentication method')
+    parser.add_argument('--pbs-ssh-sudo-mode', choices=('none', 'noninteractive', 'interactive'), help='PBS SSH privilege mode, separate from PVE')
+    parser.add_argument('--pbs-ssh-auth-timeout', type=float, help='PBS SSH login/MFA allowance in seconds (default 120)')
     parser.add_argument('--pbs-ssh-port', type=int, help='Override PBS SSH port; otherwise honor SSH configuration')
     parser.add_argument('--pbs-ca-file', help='Trusted PBS CA certificate for HTTPS')
     parser.add_argument('--pbs-username', help='PBS web account including realm (password is prompted or supplied separately)')
@@ -2769,6 +3119,15 @@ def main(argv=None):
         config = json.loads(args.config.read_text(encoding="utf-8")) if args.config else {}
         def setting(name):
             return os.environ.get("PVE_" + name.upper(), config.get(name))
+        if args.no_prompt:
+            pve_sudo = args.ssh_sudo_mode or ('noninteractive' if args.ssh_sudo else setting('ssh_sudo_mode'))
+            pbs_sudo = args.pbs_ssh_sudo_mode or os.environ.get('PBS_SSH_SUDO_MODE', config.get('pbs_ssh_sudo_mode'))
+            pbs_auth = args.pbs_auth or os.environ.get('PBS_AUTH', config.get('pbs_auth'))
+            if not pbs_auth:
+                pbs_auth = 'token' if os.environ.get('PBS_TOKEN_ID', config.get('pbs_token_id')) and os.environ.get('PBS_TOKEN_SECRET', config.get('pbs_token_secret')) else 'ssh'
+            pbs_ssh_used = pbs_auth == 'ssh' or bool(args.pbs_ssh_host or os.environ.get('PBS_SSH_HOST', config.get('pbs_ssh_host')))
+            if (mode == 'ssh' and pve_sudo == 'interactive') or (args.pbs and pbs_ssh_used and pbs_sudo == 'interactive'):
+                raise ValueError('Interactive sudo cannot run with cron/--no-prompt; use a preconfigured noninteractive method')
         args.output_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=args.output_dir):
             pass
@@ -2786,6 +3145,8 @@ def main(argv=None):
             if mode == "ssh":
                 ssh_client = SSHClient(**ssh_settings(args, setting))
                 ssh_client.connect()
+                if getattr(ssh_client, 'sudo_mode', None) == 'interactive':
+                    ssh_client.get('/version')  # Authenticate using an actual allowlisted read.
                 client = ssh_client
             else:
                 client = (CLIClient(args.timeout) if mode == "cli" else

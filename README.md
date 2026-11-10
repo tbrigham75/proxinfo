@@ -9,7 +9,7 @@ longer needs a separate table column.
 
 ## PBS sign-in and measured totals
 
-Run manually from WSL/Ubuntu using `python3 pve_inventory.py --ssh --pbs`.
+Run manually from WSL/Ubuntu using `python3 pve_inventory.py --mode ssh --pbs`.
 The PBS connection question comes before PBS credentials: press Enter for `ssh`
 (the default), choose `password` for a PBS web account, or `token` for an API token.
 SSH then offers password, key, or configured authentication. PBS stays off
@@ -36,8 +36,11 @@ python3 pve_inventory.py --pbs-only --pbs-auth ssh
 
 Python and output files stay on your machine. PBS must already have
 `proxmox-backup-debug`; the script runs only approved `api get` queries and
-optional `findmnt` reads. Use root or an administrator-configured restricted sudo
-policy (`pbs_ssh_sudo: true`). A PBS web account alone does not grant SSH access.
+optional `findmnt` reads. Use root or an account whose sudo policy permits the
+required commands. For a separate password/MFA prompt, add
+`--pbs-ssh-sudo-mode interactive`. For an existing noninteractive sudo setup,
+use `--pbs-ssh-sudo-mode noninteractive`; the legacy `pbs_ssh_sudo: true` config
+setting retains that noninteractive behavior. A PBS web account alone does not grant SSH access.
 The program does not install tools or change sudo permissions. API password and
 token users need the audit permissions documented below; they do not need root.
 
@@ -134,7 +137,7 @@ For optional backing-filesystem discovery, add these settings to your existing p
 }
 ```
 
-Replace the documentation address with your PBS host. This is separate from the PVE SSH connection. It runs only `findmnt` read queries for configured datastore folders, reporting the observed mount point, filesystem and device/dataset/share. The operator must configure the SSH host to match the PBS API server; the report labels the observation source. It does not recursively inspect physical disks, mount storage or identify S3 bucket usage from a local cache. API-only PBS reports remain supported without these settings. Manual SSH authentication follows OpenSSH; cron requires preconfigured noninteractive keys and host trust. Keep host-specific SSH port changes in `pbs_ssh_port` if needed.
+Replace the documentation address with your PBS host. This is separate from the PVE SSH connection. It runs only `findmnt` read queries for configured datastore folders, reporting the observed mount point, filesystem and device/dataset/share. The operator must configure the SSH host to match the PBS API server; the report labels the observation source. It does not recursively inspect physical disks, mount storage or identify S3 bucket usage from a local cache. API-only PBS reports remain supported without these settings. Manual SSH authentication follows OpenSSH; cron requires preconfigured noninteractive keys and host trust. Keep host-specific SSH port changes in `pbs_ssh_port` if needed. Optional filesystem lookup honors the same PBS SSH sudo flags, environment variables and configuration keys as primary PBS SSH reporting. When primary reporting already uses SSH, it reuses that session instead of opening another login.
 
 An optional locally maintained JSON file can record completed restore tests:
 
@@ -194,7 +197,6 @@ Environment (cluster/standalone) [cluster]: cluster
 SSH sign-in method (password/key/auto) [password]: password
 PVE SSH hostname or IP address: 192.168.1.10
 SSH username [root]:
-SSH port [SSH config default, normally 22]:
 ```
 
 Replace the example address with yours. Press Enter for defaults. For a single server, choose `standalone`. Supplying `--mode ssh` or `--mode api` skips the connection-method question.
@@ -250,13 +252,100 @@ python3 pve_inventory.py --mode ssh --environment cluster --ssh-host pve1 --ssh-
 python3 pve_inventory.py --mode ssh --ssh-host pve1 --ssh-port 2222 --ssh-key ~/.ssh/id_ed25519 --output-dir ./pve-report
 ```
 
-`--ssh-auth-timeout` defaults to 120 seconds for initial authentication; `--timeout` defaults to 20 seconds per query. SSH authenticates once and reuses the connection. On completion, failure or Ctrl+C, the script closes the connection and removes its local temporary socket. A short idle timeout provides fallback cleanup if forcibly terminated. No script or report files are created on PVE.
+`--ssh-auth-timeout` defaults to 120 seconds for SSH authentication; `--timeout` defaults to 20 seconds per query. SSH reuses its connection. Interactive sudo uses a persistent remote terminal session and can request fresh authentication when the server's policy requires it. Its read timeout is the query timeout plus the authentication timeout, capped by the remaining `--max-runtime` budget, because PAM prompts and command execution share the same terminal. On completion, failure or Ctrl+C, the script closes its connection and removes its local temporary socket. No script or report files are created on PVE.
 
-Use `root` on PVE for the simplest setup. Another remote account needs permission to run the commands. With an already configured noninteractive sudo policy, add `--ssh-sudo` to prefix remote commands with `sudo -n --`. The script does not set up sudo or accept a separate sudo password. Without sufficient permission, metrics are N/A or the initial inventory fails. HTTPS API-token mode remains available for server-enforced audit-only access.
+Use `root` on PVE for direct access, or another remote account with permission to run the required commands through sudo. Select `--ssh-sudo-mode interactive` when sudo asks for a password or MFA response. With an already configured noninteractive sudo policy, use `--ssh-sudo-mode noninteractive` or the existing `--ssh-sudo` flag. The script does not configure sudo or grant permissions. Without sufficient permission, metrics remain unavailable or the initial inventory fails. HTTPS API-token mode remains available for server-enforced audit-only access.
 
 Use `--ssh-auth password`, `--ssh-auth key` or `--ssh-auth auto` to preselect the SSH sign-in method. Optional environment variables are `PVE_SSH_HOST`, `PVE_SSH_USER`, `PVE_SSH_PORT`, `PVE_SSH_KEY`, `PVE_SSH_AUTH`; corresponding JSON settings are `ssh_host`, `ssh_user`, `ssh_port`, `ssh_key`, `ssh_auth`. Command-line SSH fields override environment/config settings. SSH config aliases and identities are supported; the default username is root unless overridden. `--no-prompt` also enables SSH batch mode: configure key authentication and establish host trust beforehand. Explicit password login is incompatible with `--no-prompt`.
 
 For SSH failures, read the SSH error above the script's failure message and check address, account, credentials and network access. A missing `pvesh` command usually means the target is not a PVE host. Launch this mode from WSL rather than native PowerShell, because it uses POSIX OpenSSH connection multiplexing. **Regular Ubuntu and WSL use the same script and options.** Live testing against your PVE environment remains outstanding.
+
+### Separate sudo password or Okta authentication
+
+Available in ProxInfo 1.5.0. Check your installed copy with
+`python3 pve_inventory.py --version` after pulling the update.
+
+SSH login and sudo authentication are separate steps. If you normally SSH as your
+own account and then enter a password and Okta token when running sudo, use:
+
+```bash
+python3 pve_inventory.py --mode ssh --ssh-user your-user --ssh-sudo-mode interactive
+```
+
+For PBS SSH reporting with the same kind of workflow:
+
+```bash
+python3 pve_inventory.py --pbs-only --pbs-auth ssh --pbs-ssh-user your-user --pbs-ssh-sudo-mode interactive
+```
+
+After SSH authentication, follow the remote sudo/PAM prompts. If your organization
+requires `password,Okta-token`, enter the entire response in the hidden prompt
+exactly as you normally would. The script does not split, save, or replay that
+response, and does not reuse the SSH password. Multiple authentication prompts
+are supported. Never put the password/token in a command, configuration file, or
+report. Use a normal interactive WSL/Ubuntu terminal for this mode.
+
+Manual runs ask which sudo mode to use for a non-root account, with `interactive`
+as the suggested choice. Explicit flags or saved settings skip that question.
+An account running as root does not need sudo. SSH authentication can use a key
+even when sudo still needs a separate password/MFA response.
+
+Interactive sudo keeps one unprivileged remote terminal session open and runs
+approved inventory commands through sudo in that session. It does not start a
+persistent root shell or alter the server's sudo policy. The account must already
+be allowed to run the needed commands; a successful password/MFA challenge does
+not grant commands denied by sudoers.
+
+This mode checks that the remote server already has Perl and its core `JSON::PP`,
+`MIME::Base64`, `Text::ParseWords` and `Socket` modules. It never installs missing tools. No remote Python,
+uploaded helper file, or report file is required; the session helper runs in
+memory, and command output is returned to the local script for report generation.
+An actual read-only `/version` query checks access before the PVE or PBS inventory
+starts, so an unusable session is identified early.
+
+Your policy determines how long authentication can be reused. A short timeout or
+per-command authentication policy may require another fresh response during the
+run. Each actual sudo command follows that policy; the script does not depend on
+a separate `sudo -v` establishing authorization for later commands. Query start
+and completion remain visible, but repeated waiting messages pause for the entire
+interactive read so they cannot interrupt prompts. Query timings include any
+password/MFA prompt time. Authentication input/transcripts are excluded from
+collection logs, diagnostics and reports. Remote sudo/PAM prompts and command
+error output are displayed live in the terminal, not saved as captured transcripts.
+Any failed interactive sudo/read command closes that host's session. The tool
+cannot reliably distinguish an authentication failure from a command failure
+using an opaque terminal conversation, so it stops using that session rather
+than attempting another command. Already collected data is preserved; later
+reads needing that session are marked unavailable. Check the live terminal
+message, correct the cause, and rerun. Connection loss, cancellation and timeouts
+also close the session; credentials and failed queries are not automatically replayed.
+
+PVE and PBS use separate sessions and permissions. Sudo on the entry PVE node does
+not authenticate a different node: host-level reads on other cluster members still
+depend on the existing cluster routing and trust described below.
+
+Use `none` for direct execution without sudo, `interactive` for manual password/MFA
+prompts, or `noninteractive` when the required sudo commands already work without
+prompts. `--cron` and `--no-prompt` reject interactive sudo before collection.
+For scheduled runs, use local PVE access, an API token, or SSH keys together with
+already configured noninteractive command permissions.
+
+PVE settings can use `--ssh-sudo-mode`, environment variable `PVE_SSH_SUDO_MODE`,
+or JSON key `ssh_sudo_mode`. PBS uses `--pbs-ssh-sudo-mode`,
+`PBS_SSH_SUDO_MODE`, or `pbs_ssh_sudo_mode`. Command-line values take precedence
+over environment variables and config values. Existing `--ssh-sudo` and
+`pbs_ssh_sudo: true` retain their noninteractive meaning.
+
+For slower authentication, increase `--ssh-auth-timeout` on PVE or
+`--pbs-ssh-auth-timeout` on PBS; both default to 120 seconds. Interactive PBS reads
+use the PBS query timeout (`--pbs-timeout`) plus that authentication timeout.
+The remaining `--max-runtime` collection budget caps that combined wait.
+These are bounded waits, not guarantees that the server will allow more time;
+server-side authentication policies still apply.
+
+Tests use simulated sessions. Before relying on this workflow in production, run
+a small manual inventory against your Linux/Okta environment and confirm both
+the initial sudo prompt and any policy-required reauthentication work correctly.
 
 ## Alternative: run directly on PVE (no Python experience needed)
 
@@ -735,9 +824,9 @@ python3 pve_inventory.py --mode ssh --max-runtime 600 --no-pbs
 
 VM IDs are combined as a selection; node names are combined as a selection. When both are supplied, a VM must match both. Detailed queries are limited to selected VMs. Shared metadata queries still run. Unknown selections never fall back to a full inventory. Selected reports and their totals describe only selected VMs. PBS, if explicitly enabled, retains its separately labeled datastore scope.
 
-Progress shows the current read, selected-VM count, elapsed query time, and timeout where available. Slow requests receive updates every five seconds. `--progress off` suppresses progress output; `--progress plain` and the default `auto` use readable lines, including when redirected. Authentication runs before the progress worker, so password prompts are not interrupted. Collection duration excludes sign-in; total runtime includes setup. Durations measure local request time, not isolated server processing time.
+Progress shows the current read, selected-VM count, elapsed query time, and timeout where available. Slow requests normally receive updates every five seconds. `--progress off` suppresses progress output; `--progress plain` and the default `auto` use readable lines, including when redirected. Initial SSH authentication occurs before collection. Interactive-sudo reads suppress repeated waiting messages for the whole read, preserving the remote password/MFA conversation; their elapsed times include prompt time. Query start and completion remain recorded. Collection duration excludes initial sign-in, but includes sudo prompts during collection; total runtime includes setup. Durations measure local request time, not isolated server processing time.
 
-`collection.log` and `query_timings.csv` are written incrementally. They contain safe operation labels and outcomes, not raw authentication headers or exception text. Exact backend messages remain in the report's IT reference. `run_info.csv` and `inventory.json` record the run ID, version, settings, selection, timings, and failure groups. The HTML IT reference lists slow queries. Keep files from the same run together.
+`collection.log` and `query_timings.csv` are written incrementally. They contain safe operation labels and outcomes, not raw authentication headers or exception text. Backend messages normally remain in the report's IT reference. Interactive-sudo authentication and command-error transcripts are displayed live only and are not copied into reports; those reads record safe status summaries. `run_info.csv` and `inventory.json` record the run ID, version, settings, selection, timings, and failure groups. The HTML IT reference lists slow queries. Keep files from the same run together.
 
 Ctrl+C during a query saves unavailable placeholders for remaining discovered VMs and finishes an incomplete report (exit 130). The overall time limit stops new requests and reduces supported command timeouts to the remaining budget. Export may extend beyond that budget. Discovery failure cannot produce a reliable VM report; its diagnostic log is retained. A second interrupt may stop recovery/export immediately. File-stat system calls may not be interruptible promptly by the operating system.
 
@@ -795,7 +884,7 @@ printf 'Exit status: %s\n' "$?"
 
 The command must run without prompts. Check both nodes' VM counts, remaining measurement gaps, and the result files. An incomplete report can be useful and has exit status 3 in cron mode.
 
-`--cron` requires an explicit `--mode` and an **absolute** `--output-root`. It implies `--no-prompt`, selects plain progress by default, keeps PBS off unless `--pbs` is supplied, and defaults to a 3,600-second collection budget unless overridden. `--output-root` and `--output-dir` are mutually exclusive. The time budget applies to collection, not authentication or export; some underlying system calls may finish later. No remote query is automatically repeated after a timeout.
+`--cron` requires an explicit `--mode` and an **absolute** `--output-root`. It implies `--no-prompt`, selects plain progress by default, keeps PBS off unless `--pbs` is supplied, and defaults to a 3,600-second collection budget unless overridden. `--output-root` and `--output-dir` are mutually exclusive. The time budget applies to collection, not initial authentication or export; some underlying system calls may finish later. In manual interactive-sudo mode, prompt time during a query is included in collection timing. No remote query is automatically repeated after a timeout.
 
 ### 3. Add the schedule
 
@@ -851,15 +940,15 @@ The lock is held until collection, export, and connection cleanup finish. The OS
 
 ### Optional remote authentication and PBS
 
-Cron mode also supports `--mode api` with a token or `--mode ssh --ssh-auth key` with unattended key authentication. Password prompts and unverified-host prompts cannot be answered by cron. Encrypted keys require an agent that is available to the scheduled account; local PVE mode avoids this setup entirely. SSH sudo, if used, must already work noninteractively. TLS certificate and SSH host-key verification remain enabled.
+Cron mode also supports `--mode api` with a token or `--mode ssh --ssh-auth key` with unattended key authentication. Password prompts and unverified-host prompts cannot be answered by cron. Encrypted keys require an agent that is available to the scheduled account; local PVE mode avoids this setup entirely. SSH sudo, if used, must already work noninteractively. Set `--ssh-sudo-mode noninteractive` for PVE or `--pbs-ssh-sudo-mode noninteractive` for PBS. Interactive sudo is rejected with `--cron` or `--no-prompt`; the script never waits for an Okta response in a scheduled run. TLS certificate and SSH host-key verification remain enabled.
 
 API/PBS credentials use the existing environment variables or `--config /etc/proxinfo/scheduled.json`. Protect that file with owner-only permissions (`chmod 600 /etc/proxinfo/scheduled.json`) and keep it outside Git. Use the example configuration files for field names and the API permissions sections above for audit access. Tokens/passwords do not belong in a crontab command or diagnostic log. The connected account still needs permission to read the selected objects.
 
-PBS remains off by default even if credentials are saved. To include it, replace `--no-pbs` with `--pbs` and provide its separate token, URL, and trusted CA settings. Local PVE permissions do not supply PBS API authentication.
+PBS remains off by default even if credentials are saved. To include it, replace `--no-pbs` with `--pbs` and provide its separate API-token or unattended SSH settings. Local PVE permissions do not supply PBS authentication.
 
 ## PBS investigation tools (1.3)
 
-PBS is still optional and off by default. The new PBS-only mode connects **only to PBS**, using its own audit token. It needs no PVE connection, SSH login, or PVE API credentials:
+PBS is still optional and off by default. PBS-only mode connects **only to PBS**, using the selected PBS authentication method. It needs no PVE connection or PVE API credentials. Manual runs support PBS SSH, a web-account password, or an API token:
 
 ```sh
 python3 pve_inventory.py --pbs-only --pbs-store backups
@@ -875,7 +964,10 @@ Datastore and namespace options can be repeated. Without namespace selection, al
 
 ### PBS-only cron on PVE
 
-Root on PVE still needs a **separate PBS API token**. Save it in the protected configuration file described above. A planned nightly entry can use this actual command (absolute paths required for cron output root):
+Root on PVE still needs separate PBS authentication: an API token or an SSH key
+with the required noninteractive permissions. Save non-secret connection settings
+and any API credentials in the protected configuration file described above.
+A planned nightly entry can use this actual command (absolute paths required for cron output root):
 
 ```sh
 /usr/bin/python3 /opt/proxinfo/pve_inventory.py --cron --pbs-only --config /etc/proxinfo/scheduled.json --output-root /var/lib/proxinfo/pbs-reports --pbs-history --max-runtime 1800
