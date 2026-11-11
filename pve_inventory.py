@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 
 class CronBusy(Exception):
@@ -86,6 +86,7 @@ class RunTracker:
         self.cancelled = False
         self.expired = False
         self.queries = []
+        self.skipped_reasons = set()
         self.log = (self.directory / "collection.log").open("w", encoding="utf-8")
         self.stream = (self.directory / "query_timings.csv").open("w", newline="", encoding="utf-8-sig")
         self.writer = csv.DictWriter(self.stream, fieldnames=["run_id", "operation", "started_at", "elapsed_seconds", "outcome"])
@@ -125,7 +126,8 @@ class RunTracker:
             raise ReadError("Cancelled during query; remaining measurements were not requested") from None
         except Exception as exc:
             reason = str(exc).lower()
-            outcome = ("timeout" if "timeout" in reason or "timed out" in reason else
+            outcome = (exc.outcome if isinstance(exc, (SessionUnavailable, OptionalMetricUnavailable, StorageObjectMissing)) else
+                       "timeout" if "timeout" in reason or "timed out" in reason else
                        "access denied" if "403" in reason or "permission denied" in reason else "failed")
             raise
         finally:
@@ -138,10 +140,26 @@ class RunTracker:
             self.stream.flush()
             self.message(f"{outcome}: {operation} | {row['elapsed_seconds']}s")
 
+    def skip(self, operation, error):
+        """Record a local skip without pretending to send another remote query."""
+        if self.max_runtime is not None and time.monotonic() - self.started >= self.max_runtime:
+            self.expired = True
+        row = dict(run_id=self.run_id, operation=operation,
+                   started_at=datetime.now(timezone.utc).isoformat(),
+                   elapsed_seconds=0.0, outcome="not collected")
+        self.queries.append(row)
+        self.writer.writerow({k: csv_cell(v) for k, v in row.items()})
+        self.stream.flush()
+        reason = str(error)
+        if reason not in self.skipped_reasons:
+            self.skipped_reasons.add(reason)
+            self.message(reason + '; later dependent reads will be recorded as not collected.')
+        raise error
+
     def metadata(self):
         groups = Counter()
         for query in self.queries:
-            if query['outcome'] != 'success':
+            if query['outcome'] not in ('success', 'not collected', 'optional metric unavailable'):
                 node = re.search(r"/nodes/([^/]+)", query['operation'])
                 storage = re.search(r"/storage/([^/]+)", query['operation'])
                 groups[(node[1] if node else 'general') + '/' + (storage[1] if storage else 'general') + ': ' + query['outcome']] += 1
@@ -149,6 +167,7 @@ class RunTracker:
                     finished_at=datetime.now(timezone.utc).isoformat(), elapsed_seconds=round(time.monotonic()-self.started, 3),
                     cancelled=self.cancelled, time_limit_reached=self.expired,
                     query_outcomes=dict(Counter(q['outcome'] for q in self.queries)),
+                    skipped_query_count=sum(q['outcome'] == 'not collected' for q in self.queries),
                     slowest_queries=sorted(self.queries, key=lambda q:q['elapsed_seconds'], reverse=True)[:10])
 
     def close(self):
@@ -171,6 +190,11 @@ class ObservedClient:
         clients = [self.client] + ([self.client.pvesh] if hasattr(self.client, "pvesh") else [])
         if getattr(self.client, 'ssh', None) is not None:
             clients.append(self.client.ssh)
+        for client in clients:
+            if getattr(client, 'sudo_mode', None) == 'interactive':
+                session = getattr(client, 'interactive_session', None)
+                if isinstance(session, InteractiveSudoSession) and not session.ready:
+                    return self.tracker.skip(name, session.unavailable_error())
         previous = [(c,c.timeout) for c in clients if hasattr(c,"timeout")]
         budgets = [(c, getattr(c, 'operation_budget', None)) for c in clients]
         remaining = float('inf')
@@ -278,7 +302,19 @@ def segment(value):
 
 
 class ReadError(Exception):
-    pass
+    outcome = "failed"
+
+
+class OptionalMetricUnavailable(ReadError):
+    outcome = "optional metric unavailable"
+
+
+class StorageObjectMissing(ReadError):
+    outcome = "disk not found"
+
+
+class SessionUnavailable(ReadError):
+    outcome = "not collected"
 
 
 class NoRedirect(request.HTTPRedirectHandler):
@@ -457,6 +493,22 @@ sub approved {
     }
     return 0;
 }
+# Only exact, bounded diagnostics from the matching GET endpoint qualify.
+# Never send terminal diagnostics (which can contain PAM text) in result frames.
+sub failure_kind {
+    my ($command, $diagnostic, $overflow) = @_;
+    return '' if $overflow || length($diagnostic) > 4096 || @$command < 3;
+    return '' unless $command->[0] eq 'pvesh' && $command->[1] eq 'get';
+    if ($command->[2] =~ m{\A/nodes/[^/]+/qemu/\d+/agent/get-fsinfo\z} &&
+        $diagnostic =~ /\A(?:proxy handler failed: )?(?:No QEMU guest agent configured|QEMU guest agent is not running)\r?\n?\z/) {
+        return 'guest-agent-unavailable';
+    }
+    if ($command->[2] =~ m{\A/nodes/[^/]+/storage/[^/]+/content/.+\z} &&
+        $diagnostic =~ /\A(?:proxy handler failed: )?zfs error: cannot open '[A-Za-z0-9_.:\/-]+': dataset does not exist\r?\n?\z/) {
+        return 'storage-object-missing';
+    }
+    return '';
+}
 $SIG{HUP} = $SIG{TERM} = $SIG{ALRM} = \&stop_child;
 send_frame({event=>'ready', uid=>0+$<});
 while (my $line = <STDIN>) {
@@ -493,7 +545,7 @@ while (my $line = <STDIN>) {
     alarm(int($r->{deadline}) + 1);
     my $out = '';
     # Forward stderr live, retaining at most one short diagnostic temporarily.
-    # Only an exact guest-agent diagnostic can make a failed read recoverable.
+    # Only an exact reviewed diagnostic can make a failed read recoverable.
     # PAM text is never included in a result frame or saved as a transcript.
     my $diagnostic = '';
     my $overflow = 0;
@@ -516,16 +568,13 @@ while (my $line = <STDIN>) {
             }
         }
     }
-    my $guest_failure = !$overflow && @{$r->{command}} >= 3 &&
-        $r->{command}[0] eq 'pvesh' && $r->{command}[1] eq 'get' &&
-        $r->{command}[2] =~ m{\A/nodes/[^/]+/qemu/\d+/agent/get-fsinfo\z} &&
-        $diagnostic =~ /\A(?:proxy handler failed: )?(?:No QEMU guest agent configured|QEMU guest agent is not running)\r?\n?\z/;
+    my $kind = failure_kind($r->{command}, $diagnostic, $overflow);
     $diagnostic = '';
     waitpid($pid, 0);
     my $status = $?;
     $pid = undef;
     alarm(0);
-    send_frame({event=>'result', id=>$r->{id}, code=>($status & 127 ? 128+($status & 127) : $status >> 8), stdout=>encode_base64($out, ''), failure_kind=>($guest_failure ? 'guest-agent-unavailable' : '')});
+    send_frame({event=>'result', id=>$r->{id}, code=>($status & 127 ? 128+($status & 127) : $status >> 8), stdout=>encode_base64($out, ''), failure_kind=>$kind});
 }
 '''
 
@@ -537,6 +586,13 @@ class InteractiveSudoSession:
         self.process, self.terminal = None, None
         self.decoder = SudoFrameDecoder(('\x1ePROXINFO:' + uuid.uuid4().hex + ':').encode())
         self.ready = False
+        self.prompt_notice_shown = False
+        self.failed_operation = None
+
+    def unavailable_error(self):
+        cause = (' after ' + self.failed_operation) if self.failed_operation else ' after an earlier failure'
+        return SessionUnavailable('Not Collected — Connection Unavailable; the shared interactive session on '
+                                  + self.client.host + ' closed' + cause + '. Reconnect to continue')
 
     def start(self):
         if os.name != 'posix' or not sys.stdin.isatty():
@@ -609,9 +665,11 @@ class InteractiveSudoSession:
 
     def run(self, command, timeout):
         if not self.ready:
-            raise ReadError('Not Collected — Connection Unavailable; the interactive sudo session closed after an earlier failure. Reconnect to continue')
+            raise self.unavailable_error()
         try:
-            print(f'Sudo read on {self.client.host}: enter a fresh password/MFA response only if prompted.', file=sys.stderr)
+            if not self.prompt_notice_shown:
+                print(f'Sudo session on {self.client.host}: enter a fresh password/MFA response only if prompted.', file=sys.stderr)
+                self.prompt_notice_shown = True
             # PAM plugins do not expose a portable authentication-complete event.
             # Bound the combined read/authentication interval and report it honestly.
             deadline = min(timeout + self.client.auth_timeout, getattr(self.client, 'operation_budget', None) or float('inf'))
@@ -620,20 +678,37 @@ class InteractiveSudoSession:
             if not isinstance(code, int) or not isinstance(frame.get('stdout'), str):
                 raise ReadError('Interactive sudo returned an invalid result')
             output = base64.b64decode(frame['stdout'], validate=True).decode('utf-8', errors='replace')
-            guest_failure = (code in (1, 255) and frame.get('failure_kind') == 'guest-agent-unavailable'
-                             and len(command) >= 3 and command[:2] == ['pvesh', 'get']
+            kind = frame.get('failure_kind', '')
+            pve_get = len(command) >= 3 and command[:2] == ['pvesh', 'get']
+            guest_failure = (code in (1, 255) and kind == 'guest-agent-unavailable' and pve_get
                              and re.fullmatch(r'/nodes/[^/]+/qemu/\d+/agent/get-fsinfo', command[2]))
-            if code != 0 and not guest_failure:
-                # Unclassified failures may be sudo/PAM failures: never retry them.
+            storage_failure = (code in (1, 255) and kind == 'storage-object-missing' and pve_get
+                               and re.fullmatch(r'/nodes/[^/]+/storage/[^/]+/content/.+', command[2]))
+            recoverable = guest_failure or storage_failure
+            if code != 0 and not recoverable:
+                self._record_failure(command)
                 self.close()
             error = ('' if code == 0 else
                      'QEMU guest agent is not configured or not running; other inventory reads will continue'
                      if guest_failure else
+                     'PVE could not find this disk backing ZFS dataset; other inventory reads will continue'
+                     if storage_failure else
                      'Sudo or the approved read failed (exit ' + str(code) + '); this session was closed. See the terminal message. Credentials were not retried.')
-            return subprocess.CompletedProcess(command, code, output, error)
+            result = subprocess.CompletedProcess(command, code, output, error)
+            result.failure_kind = kind if recoverable else ''
+            return result
         except BaseException:
+            self._record_failure(command)
             self.close()
             raise
+
+    def _record_failure(self, command):
+        if self.failed_operation is None:
+            # Paths come from our approved request, never from a PAM transcript.
+            path = (command[2] if command[:2] == ['pvesh', 'get'] and len(command) > 2 else
+                    command[5] if command[:5] == ['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug', 'api', 'get'] and len(command) > 5 else
+                    'a storage metadata read')
+            self.failed_operation = re.sub(r'[\x00-\x1f\x7f-\x9f]', '?', path)
 
     def close(self):
         self.ready = False
@@ -762,7 +837,13 @@ class SSHClient(Client):
         if self.sudo_mode == 'interactive':
             if self.interactive_session is None:
                 raise ReadError('Interactive sudo session is not connected')
-            return self.interactive_session.run(command, self.timeout)
+            result = self.interactive_session.run(command, self.timeout)
+            kind = getattr(result, 'failure_kind', '')
+            if result.returncode and kind == 'guest-agent-unavailable':
+                raise OptionalMetricUnavailable(result.stderr)
+            if result.returncode and kind == 'storage-object-missing':
+                raise StorageObjectMissing(result.stderr)
+            return result
         if not self.control_path:
             raise ReadError('SSH session is not connected')
         remote = (["sudo", "-n", "--"] if self.sudo else []) + command
@@ -1056,17 +1137,273 @@ def pbs_relationships(report, instance, overrides):
                     status='Matching group visible; ownership unconfirmed' if found else 'No matching group visible in checked namespace; permissions may hide backups' if checked else 'Destination coverage unavailable'))
 
 
+def capacity_job_scope(report):
+    """Logical scope only; never allocate shared PBS chunks to a backup job."""
+    rows = []
+    memberships = report.get('backup_job_members', {})
+    destinations = {d['storage']: d for d in report.get('pbs_destinations', [])}
+    for job in report.get('jobs') or []:
+        job_id = str(job['id'])
+        members = memberships.get(job_id)
+        selected = [v for v in report.get('vms', []) if
+                    str(v['vmid']) in members] if members is not None else [
+                    v for v in report.get('vms', []) if job_id in v.get('enabled_jobs', []) + v.get('disabled_jobs', [])]
+        complete = members is not None and {str(v['vmid']) for v in selected} == set(members)
+        notes = ['Assigned disk space describes logical backup scope, not physical PBS storage or next-backup size.']
+        if not complete:
+            notes.append('Job membership or selected guest details are incomplete; other guests, including containers, may be excluded from these counts.')
+        disks, excluded = [], 0
+        for vm in selected:
+            complete = complete and bool(vm.get('config_available'))
+            for disk in vm.get('disks', []):
+                if not disk.get('counted'):
+                    continue
+                if disk.get('backup_disk') is False:
+                    excluded += 1
+                    continue
+                if disk.get('backup_disk') is not True:
+                    complete = False
+                    continue
+                if not disk.get('identity'):
+                    # Unknown identities cannot establish a deduplicated total.
+                    complete = False
+                    continue
+                disks.append(disk)
+        counted = unique_disks(disks)
+        complete = complete and all(d.get('capacity_bytes') is not None for d in counted)
+        known = sum(d['capacity_bytes'] for d in counted if d.get('capacity_bytes') is not None)
+        destination = destinations.get(job.get('storage'), {})
+        if destination and destination.get('server') != report.get('pbs', {}).get('server'):
+            notes.append('Destination server identity is not confirmed against this PBS connection; matching a datastore name alone does not establish ownership.')
+        if not destination:
+            notes.append('This job destination was not identified as PBS storage in the visible PVE configuration.')
+        rows.append(dict(id=job_id, storage=job.get('storage'), datastore=destination.get('datastore'),
+                         namespace=destination.get('namespace') or '', enabled=enabled(job.get('enabled', 1)),
+                         schedule=schedule_description(job), selected_vm_count=len(selected) if members is not None or selected else None,
+                         selection_complete=complete, known_configured_bytes=known if counted or complete else None,
+                         excluded_disk_count=excluded, retention=job.get('prune-backups'), notes=notes))
+    return rows
+
+
+def capacity_history_policy(report, store):
+    """Start a fresh trend when visible retention or job scope changes."""
+    def policy(record):
+        return {k: v for k, v in record.items() if k.startswith('keep-') or
+                k in ('id', 'store', 'ns', 'max-depth', 'disable', 'schedule', 'prune-schedule', 'gc-schedule')}
+    destinations = {d['storage'] for d in report.get('pbs_destinations', []) if d.get('datastore') == store['store']}
+    jobs = [{k: v for k, v in job.items() if k in ('id', 'enabled', 'storage', 'schedule', 'all', 'vmid', 'exclude', 'pool', 'node', 'prune-backups')}
+            for job in report.get('jobs') or [] if job.get('storage') in destinations]
+    scopes = sorted([row for row in capacity_job_scope(report) if row.get('datastore') == store['store']], key=lambda row: row['id'])
+    return dict(version=1, retention=store.get('datastore_retention'),
+                prune=None if store.get('prune_config') is None else sorted([policy(j) for j in store['prune_config']], key=lambda j: str(j.get('id'))),
+                jobs=sorted(jobs, key=lambda j: str(j.get('id'))), job_scope=scopes,
+                memberships={str(j['id']): report.get('backup_job_members', {}).get(str(j['id'])) for j in jobs},
+                pve_requested=not report.get('scope', {}).get('pbs_only'),
+                pve_selection=report.get('scope', {}).get('vmids'), pve_nodes=report.get('scope', {}).get('nodes'))
+
+
+def parse_growth_overrides(values):
+    result = {}
+    for value in values or []:
+        name, separator, raw = value.rpartition('=')
+        if not separator or not name.strip() or name.strip() in result:
+            raise ValueError('Growth assumptions must be unique DATASTORE=GIB_PER_DAY entries')
+        try:
+            rate = float(raw)
+        except ValueError:
+            raise ValueError('Growth assumptions require a finite nonnegative GiB/day number') from None
+        if not 0 <= rate <= 10**9:
+            raise ValueError('Growth assumptions must be between 0 and 1,000,000,000 GiB/day')
+        result[name.strip()] = rate
+    return result
+
+
+def _capacity_timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _capacity_bytes(value):
+    """Reject malformed measurements instead of treating them as zero."""
+    from decimal import Decimal, InvalidOperation
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = Decimal(str(value))
+        return int(result) if result.is_finite() and 0 <= result <= 2**80 and result == result.to_integral_value() else None
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+
+
+def build_capacity_plan(report, reserve_percent=20.0, growth_overrides=None):
+    """Filesystem capacity scenarios; shared PBS chunks are never assigned to jobs."""
+    from decimal import Decimal, InvalidOperation, ROUND_CEILING
+    from math import isfinite
+    try:
+        reserve = Decimal(str(reserve_percent))
+    except InvalidOperation:
+        raise ValueError('Capacity reserve percentage must be finite and between 0 and 100') from None
+    if isinstance(reserve_percent, bool) or not reserve.is_finite() or not 0 <= reserve < 100:
+        raise ValueError('Capacity reserve percentage must be finite and between 0 and 100')
+    overrides = {}
+    for name, value in (growth_overrides or {}).items():
+        try:
+            rate = Decimal(str(value))
+        except InvalidOperation:
+            raise ValueError('Growth assumptions must be finite nonnegative GiB/day values') from None
+        if isinstance(value, bool) or not rate.is_finite() or not 0 <= rate <= 10**9:
+            raise ValueError('Growth assumptions must be between 0 and 1,000,000,000 GiB/day')
+        overrides[str(name)] = rate * 1024**3
+    horizons = [30, 90, 180]
+    plan = dict(reserve_percent=float(reserve), horizons_days=horizons, stores=[], notes=[
+        'Datastore capacities can describe the same backing filesystem; never add these forecasts together.',
+        'Growth is net filesystem usage change, including other data and observed cleanup, not a per-job or per-VM footprint.',
+        'Forecasts assume comparable backup scope, retention and workload. No unverified cleanup recovery is subtracted.',
+        'Required total = (currently unavailable space + daily growth × days) / (1 − reserve percentage).',
+        'Illustrative rates are examples, not observed growth, probability bounds or recommended purchase sizes.',
+        'Targets describe reported filesystem capacity, not raw disks before RAID, replication or overhead. Currently reserved bytes are treated as fixed; verify usable capacity and reservation policy before expanding.',
+    ])
+    now = _capacity_timestamp(report.get('generated_at'))
+    stores = report.get('pbs', {}).get('datastores', [])
+    unmatched = set(overrides) - {str(s.get('store')) for s in stores}
+    if unmatched:
+        plan['notes'].append('Growth assumptions did not match a collected datastore: ' + ', '.join(sorted(unmatched)))
+    for store in stores:
+        name = str(store.get('store', 'Unknown datastore'))
+        observed_at = _capacity_timestamp(store.get('capacity_observed_at')) or now
+        total, used, available = (_capacity_bytes(store.get(key)) for key in ('total_bytes', 'used_bytes', 'available_bytes'))
+        item = dict(store=name, total_bytes=total, used_bytes=used, available_bytes=available,
+                    occupied_bytes=None, status='unavailable', confidence='Unavailable', basis='No usable capacity reading',
+                    history_count=0, history_days=0.0, history_start=None, history_end=None,
+                    observed_growth_bytes_per_day=None, days_until_full=None, days_until_reserve=None,
+                    immediate_required_total_bytes=None, immediate_additional_bytes=None,
+                    projections=[], assumptions=[], management_text='', primary_scenario=None)
+        plan['stores'].append(item)
+        if total is None or total <= 0 or used is None or available is None or used > total or available > total or used + available > total:
+            item['assumptions'].append('Capacity is missing or inconsistent; no growth forecast or purchase estimate can be calculated.')
+            item['management_text'] = name + ': capacity planning unavailable because the filesystem capacity reading is missing or inconsistent.'
+            continue
+        occupied = total - available
+        item.update(occupied_bytes=occupied, status='available')
+        item['assumptions'].append('Currently unavailable space includes used space and any filesystem-reserved space: total minus available.')
+        factor = 1 - reserve / 100
+        def required(rate, days):
+            needed = int(((Decimal(occupied) + rate * days) / factor).to_integral_value(rounding=ROUND_CEILING))
+            return needed, max(0, needed - total)
+        item['immediate_required_total_bytes'], item['immediate_additional_bytes'] = required(Decimal(0), 0)
+        # Conflicting timestamps cannot establish a reading. One sample per UTC
+        # day prevents repeated manual runs from inflating the evidence count.
+        samples, conflicts = {}, set()
+        for reading in store.get('capacity_history', []) or []:
+            if not isinstance(reading, dict):
+                continue
+            stamp = _capacity_timestamp(reading.get('time'))
+            value, free = (_capacity_bytes(reading.get(k)) for k in ('used_bytes', 'available_bytes'))
+            if stamp is None or observed_at is None or stamp > observed_at or value is None or free is None or value + free > total:
+                continue
+            if stamp in samples and samples[stamp] != (value, free):
+                conflicts.add(stamp)
+            samples[stamp] = (value, free)
+        daily = {}
+        for stamp, values in sorted(samples.items()):
+            if stamp not in conflicts:
+                daily[stamp.date()] = (stamp, values[0])
+        readings = sorted(daily.values())
+        span = (readings[-1][0] - readings[0][0]).total_seconds() / 86400 if len(readings) > 1 else 0.0
+        item.update(history_count=len(readings), history_days=round(span, 3),
+                    history_start=readings[0][0].isoformat() if readings else None,
+                    history_end=readings[-1][0].isoformat() if readings else None)
+        enough = len(readings) >= 3 and span >= 7 and (observed_at - readings[-1][0]).total_seconds() <= 7 * 86400
+        observed, peak = None, None
+        if enough:
+            net = Decimal(readings[-1][1] - readings[0][1]) / Decimal(str(span))
+            observed = max(Decimal(0), net)
+            peak = max([Decimal(0)] + [Decimal(b[1] - a[1]) / Decimal(str((b[0] - a[0]).total_seconds() / 86400))
+                                          for a, b in zip(readings, readings[1:])])
+            item['observed_growth_bytes_per_day'] = float(observed)
+            item['assumptions'].append('Observed growth uses the first and last valid daily readings; it is a net trend, not the size of the next backup.')
+            if net <= 0:
+                item['assumptions'].append('Usage was flat or declined in this window. A zero-growth baseline does not establish that future backups need no additional space.')
+        else:
+            item['assumptions'].append('Observed forecast needs at least three distinct daily readings over seven days, with the latest no older than seven days.')
+        if name in overrides:
+            scenarios = [('User Growth Assumption', 'user assumption', overrides[name])]
+            primary = overrides[name]
+            item.update(basis='User-supplied growth assumption', confidence='Assumption, not measured growth', primary_scenario='User Growth Assumption')
+        elif observed is not None:
+            scenarios = [('Observed Net Growth', 'observed', observed)]
+            if peak > observed:
+                scenarios.append(('Highest Sampled Interval', 'observed', peak))
+                item['assumptions'].append('Highest sampled interval is a sensitivity scenario, not a statistical upper bound or guaranteed maximum.')
+            primary = observed
+            item.update(basis='Observed net filesystem growth', confidence='Limited: historical trend, not a guarantee', primary_scenario='Observed Net Growth')
+        else:
+            scenarios = [('No Net Growth', 'illustrative', Decimal(0))] + [
+                (str(rate) + ' GiB/Day Example', 'illustrative', Decimal(rate * 1024**3)) for rate in (5, 10, 20)]
+            primary = None
+            item.update(basis='Illustrative planning scenarios; growth not measured', confidence='Not an evidence-based forecast')
+        for label, source, rate in scenarios:
+            for days in horizons:
+                needed, additional = required(rate, days)
+                item['projections'].append(dict(scenario=label, source=source, growth_bytes_per_day=float(rate),
+                                                days=days, required_total_bytes=needed, additional_bytes=additional))
+        def days_remaining(space):
+            value = float(Decimal(space) / primary)
+            return value if isfinite(value) else None
+        if available == 0:
+            item['days_until_full'] = 0.0
+            item['assumptions'].append('The datastore is already full. Space-constrained runs may suppress measured growth; it cannot establish unconstrained future demand.')
+        elif primary is not None and primary > 0:
+            item['days_until_full'] = days_remaining(available)
+        reserve_gap = Decimal(available) - Decimal(total) * reserve / 100
+        if reserve_gap <= 0:
+            item['days_until_reserve'] = 0.0
+        elif primary is not None and primary > 0:
+            item['days_until_reserve'] = days_remaining(reserve_gap)
+        cleanup = cleanup_state(store.get('gc'))
+        prune_states = [cleanup_state(job) for job in store.get('prune_status') or [] if isinstance(job, dict)]
+        uncertain_cleanup = (cleanup != 'success' or store.get('prune_status') is None
+                             or any(state != 'success' for state in prune_states))
+        if uncertain_cleanup:
+            item['assumptions'].append('Cleanup is failed, running, unknown or has warnings. Forecasts do not assume that its repair will recover any particular amount of space.')
+        if available == 0 or uncertain_cleanup:
+            item['confidence'] += '; reduced reliability because storage is full or cleanup is not confirmed successful'
+        text = (name + ': restoring a ' + f'{float(reserve):g}%' + ' free-space reserve at current occupancy requires '
+                + human(item['immediate_required_total_bytes']) + ' total capacity ('
+                + human(item['immediate_additional_bytes']) + ' additional). ')
+        if primary is not None:
+            needed, extra = required(primary, 90)
+            text += ('For 90 days at ' + human(float(primary)) + '/day (' + item['basis'].lower() + '), plan for '
+                     + human(needed) + ' total (' + human(extra) + ' additional). ')
+        else:
+            text += 'Future growth is not established; illustrated growth scenarios are assumptions for discussion, not a measured purchase recommendation. '
+        item['management_text'] = text + 'No potential cleanup recovery is credited. Separate datastore forecasts must not be added together.'
+    if not stores:
+        plan['notes'].append('Include PBS and a readable datastore capacity to calculate expansion scenarios.')
+    return plan
+
+
 def pbs_history(report, root, instance):
     root.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(root / 'pbs-history.sqlite3', timeout=10)) as db:
         db.execute('CREATE TABLE IF NOT EXISTS readings (run TEXT, scope TEXT, stamp TEXT, used INTEGER, available INTEGER, PRIMARY KEY(run,scope))')
         for store in report['pbs']['datastores']:
-            scope = json.dumps([instance,store['store'],store.get('backend_type'),store.get('backing_scope'),store['total_bytes']])
+            scope = json.dumps([instance,store['store'],store.get('backend_type'),store.get('backing_scope'),store['total_bytes'],
+                                capacity_history_policy(report, store)], sort_keys=True)
             if store['used_bytes'] is not None and store['available_bytes'] is not None:
-                db.execute('INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?)', (report['run']['run_id'],scope,report['generated_at'],store['used_bytes'],store['available_bytes']))
-            rows = db.execute('SELECT stamp,used,available FROM readings WHERE scope=? ORDER BY stamp DESC LIMIT 90',(scope,)).fetchall()[::-1]
+                db.execute('INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?)', (report['run']['run_id'],scope,store.get('capacity_observed_at') or report['generated_at'],store['used_bytes'],store['available_bytes']))
+            # Keep one latest reading per UTC day in the forecast. Frequent cron
+            # runs must not crowd a week of observations out of a 90-row window.
+            rows = db.execute('SELECT stamp,used,available FROM readings WHERE scope=? AND stamp IN '
+                              '(SELECT MAX(stamp) FROM readings WHERE scope=? GROUP BY substr(stamp,1,10)) '
+                              'ORDER BY stamp DESC LIMIT 90', (scope,scope)).fetchall()[::-1]
             store['capacity_history'] = [dict(time=r[0],used_bytes=r[1],available_bytes=r[2]) for r in rows]
-            store['change_since_previous_bytes'] = rows[-1][1]-rows[-2][1] if len(rows)>1 and rows[-1][0]==report['generated_at'] else None
+            store['change_since_previous_bytes'] = rows[-1][1]-rows[-2][1] if len(rows)>1 and rows[-1][0]==(store.get('capacity_observed_at') or report['generated_at']) else None
 
         db.commit()
 
@@ -1088,10 +1425,11 @@ class PBSCollector:
             return result
         except ReadError as exc:
             detail = str(exc)
-            state = ("permission denied" if "403" in detail else "authentication failed" if "401" in detail else
+            state = ("not collected" if isinstance(exc, SessionUnavailable) else
+                     "permission denied" if "403" in detail else "authentication failed" if "401" in detail else
                      "unsupported or unavailable endpoint" if "404" in detail else "timed out" if "timed out" in detail or "timeout" in detail.lower() else "unavailable")
             self.checks.append(dict(path=path, status=state))
-            if "Not Collected — Connection Unavailable" not in detail:
+            if not isinstance(exc, SessionUnavailable):
                 self.warnings.append(f"GET {path}: {exc}")
             return None
 
@@ -1109,6 +1447,7 @@ class PBSCollector:
             print(f"Reading PBS datastore {store}...", file=sys.stderr)
             base = "/admin/datastore/" + segment(store)
             capacity = self.read(base + "/status", dict)
+            capacity_observed_at = datetime.now(timezone.utc).isoformat()
             config = self.read("/config/datastore/" + segment(store), dict)
             gc = self.read(base + "/gc", dict)
             tasks, task_complete = [], False
@@ -1223,7 +1562,7 @@ class PBSCollector:
                 cleanup_history=latest_cleanup,
                 verification_jobs=[j for j in verify_status or [] if j.get("store")==store] if verify_status is not None else None,
                 verification_config=[j for j in verify_config or [] if j.get("store")==store] if verify_config is not None else None,
-                store=store, total_bytes=number((capacity or {}).get("total")),
+                store=store, capacity_observed_at=capacity_observed_at, total_bytes=number((capacity or {}).get("total")),
                 used_bytes=number((capacity or {}).get("used")), available_bytes=number((capacity or {}).get("avail")),
                 capacity_scope="Underlying filesystem reported by PBS; may include other data or be shared with another datastore. Do not sum datastore capacities.",
                 namespaces=sorted(scope), namespace_enumeration_available=namespaces is not None,
@@ -1576,7 +1915,7 @@ class Collector:
             return self.client.get(path, **params), None
         except ReadError as exc:
             message = f"GET {path}: {exc}"
-            if "Not Collected — Connection Unavailable" not in str(exc):
+            if not isinstance(exc, SessionUnavailable):
                 self.warnings.append(message)
             return None, message
 
@@ -1589,7 +1928,8 @@ class Collector:
         try:
             return operation()
         except (ReadError, OSError, subprocess.TimeoutExpired) as exc:
-            raise ReadError(f"{context}; storage query budget {self.storage_timeout:g}s: {exc}") from None
+            error_type = type(exc) if isinstance(exc, ReadError) else ReadError
+            raise error_type(f"{context}; storage query budget {self.storage_timeout:g}s: {exc}") from None
         finally:
             for client, timeout in previous:
                 client.timeout = timeout
@@ -1640,7 +1980,8 @@ class Collector:
                 err = None
             except ReadError as exc:
                 info, err = None, str(exc)
-                self.warnings.append(err)
+                if not isinstance(exc, SessionUnavailable):
+                    self.warnings.append(err)
             used = number((info or {}).get("used"))
             source = (info or {}).get("_allocation_source", path + " used")
             reason = f"{method}; source {source}" if used is not None else f"N/A: {err or 'volume API did not return used bytes'}"
@@ -1845,6 +2186,7 @@ class Collector:
                             disk.update(actual_bytes=None, actual_method=None, actual_reason=reason, measurement_status='placement changed')
         return dict(generated_at=datetime.now(timezone.utc).isoformat(), pve_version=version,
                     vms=vms, nodes=nodes, jobs=jobs, warnings=self.warnings,
+                    backup_job_members={job: sorted(members) if members is not None else None for job, members in job_members.items()},
                     hosts=[dict(node=n["node"], address=host_addresses.get(n["node"]), status=n.get("status"), details=self.read("/nodes/" + segment(n["node"]) + "/status")[0] if n.get("status") != "offline" else None, storage=self.read("/nodes/" + segment(n["node"]) + "/storage")[0] if n.get("status") != "offline" else None) for n in nodes or [] if (not self.selected_nodes or n["node"] in self.selected_nodes) and not getattr(self.client, "container_count_unknown", False)],
                     pbs_destinations=[{k:st.get(k) for k in ("storage","server","datastore","namespace")} for st in storages.values() if st.get("type")=="pbs"],
                     scope=dict(targeted=bool(self.vmids or self.selected_nodes), vmids=sorted(self.vmids), nodes=sorted(self.selected_nodes), discovered=len(visible), selected=len(selected)),
@@ -1897,7 +2239,8 @@ def disk_outcome(value, reason, excluded=False):
         return 'measured'
     reason = (reason or '').lower()
     for category, fragments in (
-        ('not collected', ('not queried', 'cancelled', 'time limit reached', 'runtime budget')),
+        ('not collected', ('not queried', 'not collected', 'cancelled', 'time limit reached', 'runtime budget')),
+        ('disk not found', ('could not find this disk backing zfs dataset',)),
         ('timeout', ('timed out', 'timeout')),
         ('access denied', ('permission denied', '403')),
         ('backend failure', ('target reported failure',)),
@@ -1955,14 +2298,43 @@ def disk_bucket_totals(disks, missing_configs=0):
     sizes = [r["capacity"] for r in records.values()]
     measured = [r for r in records.values() if r["used"] is not None and r["method"]]
     methods = {r["method"] for r in measured}
+    subtotals = {method: sum(r["used"] for r in measured if r["method"] == method) for method in sorted(methods)}
     known_size = sum(size for size in sizes if size is not None)
     full_size = not missing_configs and not unidentified and all(size is not None for size in sizes)
     full_used = bool(records) and not missing_configs and not unidentified and len(measured) == len(records) and len(methods) == 1
     return dict(unique_disk_count=len(records), configured_bytes=known_size if full_size else None,
                 known_configured_bytes=known_size if any(size is not None for size in sizes) or full_size else None,
                 actual_bytes=sum(r["used"] for r in measured) if full_used else None,
+                known_actual_bytes=next(iter(subtotals.values())) if len(subtotals) == 1 else None,
+                measured_subtotals=subtotals,
                 measured_disk_count=len(measured), actual_methods=sorted(methods), unidentified_disk_references=unidentified,
                 missing_vm_configs=missing_configs)
+
+
+def partial_capacity_label(total, known):
+    if total is not None:
+        return human(total)
+    return human(known) + ' · Partial' if known is not None else 'N/A'
+
+
+def bucket_usage_label(row):
+    if row['actual_bytes'] is not None:
+        return human(row['actual_bytes']) + ' · Complete'
+    groups = row.get('measured_subtotals', {})
+    if len(groups) == 1:
+        return human(next(iter(groups.values()))) + ' · Partial'
+    if groups:
+        return '; '.join(method + ': ' + human(value) for method, value in groups.items()) + ' · Separate Subtotals'
+    return 'No Measurements Collected'
+
+
+def bucket_coverage_label(row):
+    text = f"{row['measured_disk_count']} of {row['unique_disk_count']} identified disks measured"
+    if row['missing_vm_configs']:
+        text += f"; {row['missing_vm_configs']} VM configurations unavailable; their disk counts are unknown"
+    if row['unidentified_disk_references']:
+        text += f"; {row['unidentified_disk_references']} disk references could not be identified"
+    return text
 
 
 def storage_breakdowns(report):
@@ -1993,13 +2365,29 @@ def storage_breakdowns(report):
     return rows
 
 
+def review_priority(item):
+    """Keep actionable server problems ahead of repeated measurement gaps."""
+    return {'pbs-capacity-full': 0, 'pbs-cleanup-failure': 1,
+            'inventory-interrupted': 2, 'pbs-capacity': 3,
+            'pbs-cleanup-warning': 4}.get(item.get('rule'),
+                {'Cleanup': 4, 'Capacity': 5, 'Backup': 6,
+                 'Review': 7, 'Data gap': 8}.get(item.get('category'), 9))
+
+
 def review_items(report):
     threshold = report.get("large_vm_bytes", 500 * 1024**3)
     result = []
+    interruptions = {}
     def add(rule, vm, title, evidence, follow_up, category="Review"):
         result.append(dict(rule=rule, category=category, vmid=vm.get("vmid"), name=vm.get("name"),
                            node=vm.get("node"), title=title, evidence=evidence, follow_up=follow_up))
     for vm in report["vms"]:
+        incident = next((str(note).partition('Not Collected — Connection Unavailable')[2]
+                         for note in vm.get('notes', [])
+                         if 'Not Collected — Connection Unavailable' in str(note)), None)
+        interrupted = not vm['config_available'] and incident is not None
+        if interrupted:
+            interruptions.setdefault(incident, []).append(vm['vmid'])
         large = vm["configured_bytes"] is not None and vm["configured_bytes"] >= threshold
         if large:
             add("large-vm", vm, "Large assigned disk space", human(vm["configured_bytes"]) + " assigned; review threshold is " + human(threshold),
@@ -2014,31 +2402,50 @@ def review_items(report):
         if excluded:
             add("excluded-disks", vm, "Disk marked excluded from backups", "backup=0 on " + ", ".join(excluded),
                 "Confirm with the owner that these exclusions are intentional. A VM being scheduled does not mean every disk is included.")
-        if vm["actual_bytes"] is None:
+        if vm["actual_bytes"] is None and not interrupted:
             add("missing-measurement", vm, "Storage usage could not be fully measured", " ".join(allocation_vm_reason(vm)),
                 "Review data availability before using a full storage-used total.", "Data gap")
-        if not vm["config_available"] or vm["backup"] == NA:
+        if (not vm["config_available"] or vm["backup"] == NA) and not interrupted:
             add("unreadable-settings", vm, "Some settings could not be read", "VM configuration or backup selection is unavailable",
                 "Ask IT to check account permissions and host connectivity.", "Data gap")
+    for incident, vmids in interruptions.items():
+        vmids = sorted(set(vmids))
+        add('inventory-interrupted', dict(name='PVE inventory', node='Shared session'),
+            'Collection stopped before all VM settings could be read',
+            f"{len(vmids)} VM configurations were not collected. VM IDs: " + ', '.join(map(str, vmids)) +
+            '. Not Collected — Connection Unavailable' + incident,
+            'Review the original session failure and rerun collection. These gaps do not establish separate host or permissions failures.', 'Data gap')
     for store in report.get("pbs", {}).get("datastores", []):
         target = dict(name=store["store"], node="PBS")
         total, used = store["total_bytes"], store["used_bytes"]
         warning = report.get("pbs_warning_percent", 90)
-        if total and used is not None and 100 * used / total >= warning:
+        if store.get('available_bytes') == 0:
+            add("pbs-capacity-full", target, "Backup storage has no available space",
+                f"PBS reports 0 bytes available on the filesystem for {store['store']}; reported used: {human(used)}",
+                "Ask IT to review capacity and the latest backup and cleanup results. Successful pruning alone does not establish that space was reclaimed.", "Capacity")
+        elif total and used is not None and 100 * used / total >= warning:
             add("pbs-capacity", target, "Backup storage near its review threshold",
                 f"{100*used/total:.1f}% used on the filesystem reported for {store['store']}; review threshold {warning}%",
                 "Check retention, backup scope and cleanup results. Other data on the same filesystem can also contribute.", "Capacity")
         for kind, jobs in (("Prune", store.get("prune_status") or []), ("Garbage collection", [store.get("gc") or {}])):
             for job in jobs:
+                outcome = cleanup_state(job)
                 state = str(job.get("last-run-state", ""))
-                if state and ("error" in state.lower() or "fail" in state.lower()):
-                    add("pbs-cleanup-failure", target, kind + " reported a failure", state,
+                evidence = state + "; recorded completion: " + utc_time(job.get('last-run-endtime'))
+                task = job.get('last-run-upid')
+                if task:
+                    evidence += "; task: " + str(task)
+                if outcome == 'failed':
+                    add("pbs-cleanup-failure", target, kind + " reported a failure", evidence,
                         "Ask IT to inspect the task log and resolve the cause before considering cleanup changes.", "Cleanup")
+                elif outcome == 'warnings':
+                    add("pbs-cleanup-warning", target, kind + " completed with warnings", evidence,
+                        "Review the task warnings in PBS. A warning is distinct from a failed task or a clean success.", "Cleanup")
     for group in report.get('pbs',{}).get('groups',[]):
         for reason in group.get('review_reasons',[]):
             add('pbs-backup-review', dict(name=group['store']+'/'+group['namespace']+'/'+group['backup_type']+'/'+group['backup_id'],node='PBS'), reason,
                 'Based on visible snapshot metadata', 'Review the group in PBS. No verification or restore was started.', 'Backup')
-    return result
+    return sorted(result, key=review_priority)
 
 
 def summary(report):
@@ -2115,11 +2522,12 @@ def summary(report):
               complete_coverage=False, notes="Known volumes with this metric only; not a full inventory total. " + accounting_note)
          for method, subtotal in subtotals.items()]
     values = [
-        ("Unique configured logical capacity", human(known) if full else "N/A (incomplete identity/configuration/size coverage)"),
+        ("Unique configured logical capacity", partial_capacity_label(known if full else None, report["storage_totals"][0]["known_subtotal_bytes"])),
         ("Total measured VM disk allocation", human(allocation_total) if allocation_complete else
-         "N/A — " + " ".join(reasons)),
+         measured_total_label(report["storage_totals"]) if subtotals else "N/A — " + " ".join(reasons)),
         ("Allocation volume coverage", f"{len(measured)}/{len(volumes)} volumes with known identity; "
-         f"{missing} missing VM configurations; unidentified volumes={'yes' if identity_unknown else 'no'}"),
+         f"{missing} missing VM configurations" + (" (their disk counts are unknown)" if missing else "") +
+         f"; unidentified volumes={'yes' if identity_unknown else 'no'}"),
         ("Storage accounting", accounting_note),
     ] + [("Known allocation subtotal: " + method, human(subtotal)) for method, subtotal in subtotals.items()] + [
         ("Visible QEMU VMs (templates included)", str(len(vms))),
@@ -2179,7 +2587,18 @@ def terminal_report(report):
                        ("Known RAM assigned", "Known allocated RAM subtotal"),
                        ("Known RAM in use", "Known current PVE memory-use subtotal"),
                        ("Known vCPUs assigned", "Known allocated vCPU subtotal")):
-        lines.append(f"{label}: {report['summary'][key]}")
+        value = report['summary'][key]
+        totals = report.get('storage_totals', [])
+        if totals and not report.get('scope', {}).get('pbs_only'):
+            if key == 'Total measured VM disk allocation':
+                value = measured_total_label(totals)
+            elif key == 'Unique configured logical capacity':
+                value = partial_capacity_label(totals[0]['total_bytes'], totals[0]['known_subtotal_bytes'])
+        lines.append(f"{label}: {value}")
+    missing = sum(not vm['config_available'] for vm in report['vms'])
+    if missing:
+        lines.append(f"VM configurations collected: {len(report['vms']) - missing} of {len(report['vms'])}. "
+                     f"Disk counts for the {missing} unread configurations are unknown and excluded from identified-disk coverage.")
     lines.extend(f"{key}: {value}" for key, value in report["summary"].items() if key.startswith("Known allocation subtotal:"))
     lines.append("Configured disks, measured usage and guest filesystem space describe different things. PBS capacity is reported separately.")
     lines.extend(["", "  VMID  NODE / NAME / STATUS | CONFIGURED | ACTUAL | RAM allocated / PVE used | vCPU | BACKUP"])
@@ -2210,7 +2629,8 @@ def terminal_report(report):
     if not report.get("review_items"):
         lines.append("No items met the configured review rules. This does not confirm backup health.")
     lines.extend(["", "STORAGE BY HOST AND LOCATION"])
-    lines.extend(f"- {r['grouping']} / {r['name']} / {r['host']}: assigned={human(r['configured_bytes'])}; measured={human(r['actual_bytes'])}; {r['scope']}" for r in report.get("storage_breakdowns", []))
+    lines.extend(f"- {r['grouping']} / {r['name']} / {r['host']}: assigned={partial_capacity_label(r['configured_bytes'], r['known_configured_bytes'])}; "
+                 f"measured={bucket_usage_label(r)}; {bucket_coverage_label(r)}; {r['scope']}" for r in report.get("storage_breakdowns", []))
     pbs = report.get("pbs", {})
     lines.extend(["", "PBS BACKUP STORAGE", "Collection status: " + pbs.get("status", "not requested")])
     for store in pbs.get("datastores", []):
@@ -2311,8 +2731,8 @@ function updateStorageTotals(rows){const label=document.querySelector('#table-to
  rows.forEach(row=>{if(row.dataset.configAvailable!=='true')missingConfig=true;JSON.parse(row.dataset.disks).forEach(d=>{if(!d.identity){unknownIdentity=true;return;}const key=JSON.stringify(d.identity);if(disks.has(key)){const old=disks.get(key);if(old.capacity!==d.capacity)old.capacity=null;if(old.used!==d.used||old.method!==d.method){old.used=null;old.method=null;}}else disks.set(key,{...d});});});
  let assignedKnown=0n,usedKnown=0n,sizes=0,measurements=0;const methods=new Set();disks.forEach(d=>{if(d.capacity!==null){assignedKnown+=BigInt(d.capacity);sizes++;}if(d.used!==null&&d.method){usedKnown+=BigInt(d.used);measurements++;methods.add(d.method);}});
  const fullSizes=!missingConfig&&!unknownIdentity&&sizes===disks.size,fullUsage=disks.size>0&&!missingConfig&&!unknownIdentity&&measurements===disks.size&&methods.size===1;
- assigned.textContent=fullSizes?humanBytes(assignedKnown):'N/A';used.textContent=fullUsage?humanBytes(usedKnown)+' · Complete':measurements&&methods.size===1?humanBytes(usedKnown)+' · Partial':measurements?'Separate Measurement Totals':'No Measurements Collected';
- const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');const partial=new Map();disks.forEach(d=>{if(d.used!==null&&d.method)partial.set(d.method,(partial.get(d.method)||0n)+BigInt(d.used));});if(methods.size>1)used.textContent=Array.from(partial,([method,amount])=>method+': '+humanBytes(amount)).join('; ');if(!fullUsage)partial.forEach((amount,method)=>messages.push('Measured subtotal ('+method+'): '+humanBytes(amount)+'.'));messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig||unknownIdentity)messages.push('Some disk settings or storage locations are unavailable.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
+ assigned.textContent=fullSizes?humanBytes(assignedKnown):sizes?humanBytes(assignedKnown)+' · Partial':'N/A';used.textContent=fullUsage?humanBytes(usedKnown)+' · Complete':measurements&&methods.size===1?humanBytes(usedKnown)+' · Partial':measurements?'Separate Measurement Totals':'No Measurements Collected';
+ const messages=[];if(!fullSizes&&sizes)messages.push('Known assigned subtotal: '+humanBytes(assignedKnown)+'.');const partial=new Map();disks.forEach(d=>{if(d.used!==null&&d.method)partial.set(d.method,(partial.get(d.method)||0n)+BigInt(d.used));});if(methods.size>1)used.textContent=Array.from(partial,([method,amount])=>method+': '+humanBytes(amount)).join('; ');if(!fullUsage)partial.forEach((amount,method)=>messages.push('Measured subtotal ('+method+'): '+humanBytes(amount)+'.'));messages.push(`Storage used measured for ${measurements} of ${disks.size} identified disks.`);if(missingConfig)messages.push('Unread VM configurations may contain additional disks; their disk counts and locations are unknown.');if(unknownIdentity)messages.push('Some disk references could not be identified and are excluded.');if(methods.size>1)messages.push('The storage systems count space differently; a combined usage total is unavailable.');messages.push('Shared disk IDs count once. Missing values are not zero.');note.textContent=messages.join(' ');
 }
 const search=document.querySelector('#search'),nodeFilter=document.querySelector('#node-filter'),missingOnly=document.querySelector('#missing-only'),resultCount=document.querySelector('#result-count');
 function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const match=row.dataset.search.includes(search.value.toLowerCase().trim())&&(!nodeFilter.value||row.dataset.node===nodeFilter.value)&&(!missingOnly.checked||row.dataset.missingAllocation==='true');row.hidden=!match;if(match)shown.push(row);});const active=[search.value.trim()?'Search: '+search.value.trim():'',nodeFilter.value?'PVE node: '+nodeFilter.value:'',missingOnly.checked?'Usage unavailable':''].filter(Boolean);resultCount.textContent=`${shown.length} of ${body.rows.length} machines shown`+(active.length?' — '+active.join(' · '):' — All VMs');document.querySelector('#no-results').hidden=shown.length!==0;updateStorageTotals(shown);}
@@ -2392,12 +2812,20 @@ def schedule_description(job):
 def allocation_vm_reason(vm):
     reasons = []
     if not vm["config_available"]:
-        reasons.append("This machine's disk settings could not be read. Ask IT to check access to its host server.")
+        if any('Not Collected — Connection Unavailable' in note for note in vm.get('notes', [])):
+            reasons.append("This machine's disk settings were not collected because the shared inventory connection closed after an earlier failure. "
+                           "Review the original connection incident; this does not establish a problem with this VM's host.")
+        else:
+            reasons.append("This machine's disk settings could not be read. Review the query result in IT Reference to determine whether access, connectivity, or another condition prevented collection.")
     for index, disk in enumerate(unique_disks(vm["disks"]), 1):
         if disk["actual_bytes"] is None:
             raw = disk["actual_reason"] or "No measurement was returned"
             backend = re.search(r"backend (\S+) has no validated", raw)
-            if backend:
+            if 'Not Collected — Connection Unavailable' in raw:
+                reason = "This disk was not queried because the shared inventory connection closed after an earlier failure. Review the original connection incident."
+            elif 'backing ZFS dataset' in raw or 'dataset does not exist' in raw:
+                reason = "PVE could not find the backing ZFS dataset for this disk. Check its configured reference and storage location; this lookup does not prove the disk was deleted."
+            elif backend:
                 reason = f"This tool cannot yet measure storage used on the {backend[1]} storage system. The disk's assigned size is shown separately."
             elif "403" in raw or "permission denied" in raw.lower():
                 reason = "Access to this storage was denied. Ask IT to check the account's permissions."
@@ -2501,21 +2929,40 @@ def breakdown_page_html(report):
     tables = []
     for grouping, title, note in (("host", "Storage by host server", "Host rows include local disks only. Shared disks have their own row so they are not counted on every host. A host with no local disks may still use shared storage. Machine counts can repeat in the shared row."),
                                   ("storage", "Storage by location", "Local storage with the same name on different hosts is listed separately. Shared disks are counted once. A machine with disks in several locations can appear in more than one machine count.")):
-        rows = ''.join('<tr><td><strong>' + esc(r["name"]) + '</strong><small>' + esc(r["scope"]) + '</small></td><td>' + esc(r["host"]) + '</td><td>' + str(r["vm_count"]) + '</td><td>' + human(r["configured_bytes"]) + ('<small>Known subtotal: ' + human(r["known_configured_bytes"]) + '</small>' if r["configured_bytes"] is None else '') + '</td><td>' + human(r["actual_bytes"]) + '</td><td>' + str(r["measured_disk_count"]) + ' of ' + str(r["unique_disk_count"]) + ' identified disks</td></tr>' for r in report.get("storage_breakdowns", []) if r["grouping"] == grouping)
+        rows = ''.join('<tr><td><strong>' + esc(r["name"]) + '</strong><small>' + esc(r["scope"]) + '</small></td><td>' + esc(r["host"]) + '</td><td>' + str(r["vm_count"]) + '</td><td>' + esc(partial_capacity_label(r["configured_bytes"], r["known_configured_bytes"])) + '</td><td>' + esc(bucket_usage_label(r)) + '</td><td>' + esc(bucket_coverage_label(r)) + '</td></tr>' for r in report.get("storage_breakdowns", []) if r["grouping"] == grouping)
         tables.append('<section class="panel"><h2>' + title + '</h2><p class="hint">' + note + '</p><div class="table-wrap"><table><thead><tr><th>Host or storage location</th><th>Host scope</th><th>Machines</th><th>Assigned space</th><th>Measured usage</th><th>Measurements available</th></tr></thead><tbody>' + rows + '</tbody></table></div></section>')
-    return ''.join(tables) + '<p class="hint">These are attached VM disk totals, not whole-pool capacity or PBS usage. N/A totals can reflect missing settings or different measurement methods. Storage aliases pointing at the same underlying disks cannot be detected automatically.</p>'
+    return ''.join(tables) + '<p class="hint">These are attached VM disk totals, not whole-pool capacity or PBS usage. Partial totals include known disks only. Different measurement methods have separate subtotals. Missing VM configurations can hide additional disks; their disk counts and storage locations are unknown. Storage aliases pointing at the same underlying disks cannot be detected automatically.</p>'
+
+
+def cleanup_state(job):
+    """PBS TaskState uses OK, WARNINGS: n, unknown, or an error message.
+
+    See proxmox-rest-server/src/worker_task.rs::TaskState. Scheduled jobs
+    expose a started UPID without an end time or result while running.
+    The GC statistics' separate `upid` can be old; never infer running from it.
+    """
+    job = job or {}
+    state = job.get('last-run-state')
+    if state is None or state == '':
+        return 'running' if job.get('last-run-upid') and job.get('last-run-endtime') is None else 'unknown'
+    if not isinstance(state, str):
+        return 'unknown'
+    state = state.strip()
+    if state == 'OK':
+        return 'success'
+    if state.lower() in ('running', 'started'):
+        return 'running'
+    if not state or state.lower() == 'unknown':
+        return 'unknown'
+    if re.fullmatch(r'WARNINGS: \d+', state):
+        return 'warnings'
+    return 'failed'
 
 
 def cleanup_result(job):
-    state = (job or {}).get("last-run-state")
-    if not state:
-        return "Not available"
-    state = str(state)
-    if state == "OK":
-        return "Succeeded"
-    if "fail" in state.lower() or "error" in state.lower():
-        return "Failure reported; ask IT to inspect the task"
-    return str(state)
+    return {'success': 'Succeeded', 'warnings': 'Completed with warnings; review the task log',
+            'failed': 'Failure reported; ask IT to inspect the task',
+            'running': 'Running; no final result yet', 'unknown': 'Not available'}[cleanup_state(job)]
 
 
 def gc_measurement(gc, key):
@@ -2629,6 +3076,8 @@ def title_controls(markup):
 
 def management_body(report):
     markup = _management_body(report)
+    if report.get('capacity_plan'):
+        markup = markup.replace('</article>', capacity_management_html(report) + '</article>')
     if report.get('scope', {}).get('pbs_only'):
         return markup
     counts = report['allocation_diagnostics']
@@ -2642,8 +3091,10 @@ def management_body(report):
 def _management_body(report):
     esc = lambda value: html.escape(display(value), quote=True)
     totals = report['storage_totals']
+    findings = sorted(report.get('review_items', []), key=review_priority)
+    findings_html = ''.join('<li><strong>' + esc(r['name']) + ': ' + esc(r['title']) + '.</strong> ' + esc(r['follow_up']) + '</li>' for r in findings[:5]) or '<li>No findings met the review rules. This does not confirm backup health.</li>'
     if report.get('scope', {}).get('pbs_only'):
-        return '<article class="management-sheet"><h1>PBS backup review</h1><p>PVE inventory was not requested. Collected '+esc(report['generated_at'])+'</p>'+''.join('<h2>'+esc(d['store'])+'</h2><p>Reported used: '+human(d['used_bytes'])+'; available: '+human(d['available_bytes'])+'</p><p>Visible groups: '+esc(d['visible_group_count'])+'; snapshot records: '+esc(d['listed_snapshot_count'])+'</p>' for d in report.get('pbs',{}).get('datastores',[]))+'<p>Filesystem capacities may overlap. See the full report for cleanup, protection, verification and data gaps.</p></article>'
+        return '<article class="management-sheet"><h1>PBS backup review</h1><p>PVE inventory was not requested. Collected '+esc(report['generated_at'])+'</p><h2>Priority questions</h2><ol>'+findings_html+'</ol><p class="management-note">Showing up to 5 of '+str(len(findings))+' findings.</p>'+''.join('<h2>'+esc(d['store'])+'</h2><p>Reported used: '+human(d['used_bytes'])+'; available: '+human(d['available_bytes'])+'</p><p>Visible groups: '+esc(d['visible_group_count'])+'; snapshot records: '+esc(d['listed_snapshot_count'])+'</p>' for d in report.get('pbs',{}).get('datastores',[]))+'<p>Filesystem capacities may overlap. See the full report for cleanup, protection, verification and data gaps.</p></article>'
     try:
         collected = datetime.fromisoformat(report['generated_at']).astimezone(timezone.utc).strftime('%b %d, %Y at %H:%M UTC')
     except (ValueError, TypeError):
@@ -2651,13 +3102,11 @@ def _management_body(report):
     pbs = report.get('pbs', {})
     vms = report['vms']
     # Keep a concise overview, allowing readable pagination for long content.
-    findings = sorted(report.get('review_items', []), key=lambda r: {'Cleanup': 0, 'Capacity': 1, 'Review': 2, 'Data gap': 3}.get(r['category'], 4))
-    findings_html = ''.join('<li><strong>' + esc(r['name']) + ': ' + esc(r['title']) + '.</strong> ' + esc(r['follow_up']) + '</li>' for r in findings[:5]) or '<li>No findings met the review rules. This does not confirm backup health.</li>'
     metric = report['sort_metric'] + '_bytes'
     top = [v for v in vms if v[metric] is not None][:5]
     top_rows = ''.join('<tr><td>' + esc(v['name']) + ' (#' + esc(v['vmid']) + ')</td><td>' + human(v[metric]) + '</td><td>' + power_state(v['status']) + '</td><td>' + ('Unknown' if v['backup'] == NA else v['backup']) + '</td></tr>' for v in top)
     capacity = '; '.join(s['store'] + ': ' + human(s['used_bytes']) + ' used, ' + human(s['available_bytes']) + ' available' for s in pbs.get('datastores', [])[:3]) or 'No PBS capacity data collected.'
-    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management Summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + human(totals[0]['total_bytes']) + '</strong><span>assigned disk space</span></div><div><strong>' + esc(measured_total_label(totals)) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage includes available disk readings. Partial totals exclude unreadable disks. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><p>Partial storage measurements: ' + esc('; '.join(str(v['vmid']) + ': ' + measurement_label(v) for v in vms if measurement_details(v)['measurement_status'] == 'partial') or 'None') + '</p><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
+    return '<article class="management-sheet"><p class="meta">' + esc(('SELECTED VMS ONLY' if report.get('scope', {}).get('targeted') else 'All visible VMs') + ' | Run ' + report.get('run', {}).get('run_id', 'N/A') + ' | ' + report.get('run', {}).get('status', '')) + '</p><p class="eyebrow">Management Summary · ProxInfo</p><h1>VM storage and backup review</h1><p class="meta">Collected ' + esc(collected) + '</p><div class="management-metrics"><div><strong>' + str(len(vms)) + '</strong><span>machines reviewed</span></div><div><strong>' + esc(partial_capacity_label(totals[0]['total_bytes'], totals[0]['known_subtotal_bytes'])) + '</strong><span>assigned disk space</span></div><div><strong>' + esc(measured_total_label(totals)) + '</strong><span>measured VM disk usage</span></div><div><strong>' + str(sum(v['backup'] == 'Yes' for v in vms)) + ' of ' + str(len(vms)) + '</strong><span>scheduled for backup</span></div></div><p class="management-note">Assigned space is disk capacity given to VMs, including empty space. Measured usage includes available disk readings. Partial totals exclude unreadable disks. N/A means unavailable, not zero. Scheduled does not mean the backup succeeded.</p><h2>Priority questions</h2><ol>' + findings_html + '</ol><p class="management-note">Showing up to 5 of ' + str(len(findings)) + ' findings. Large-machine review threshold: ' + human(report.get('large_vm_bytes', 500*1024**3)) + ' assigned.</p><h2>Five largest machines</h2><table><thead><tr><th>Machine</th><th>' + ('Assigned space' if metric == 'configured_bytes' else 'Measured usage') + '</th><th>Power</th><th>Scheduled backup</th></tr></thead><tbody>' + top_rows + '</tbody></table><p>Partial storage measurements: ' + esc('; '.join(str(v['vmid']) + ': ' + measurement_label(v) for v in vms if measurement_details(v)['measurement_status'] == 'partial') or 'None') + '</p><h2>Backup server</h2><p>PBS collection: <strong>' + esc(pbs.get('status', 'not requested')) + '</strong>. ' + esc(capacity) + '</p><p class="management-note">Up to 3 datastores shown. Capacities describe underlying filesystems and may overlap. Do not add datastore figures together. VM disk sizes and logical backup sizes do not establish physical PBS consumption.</p><p class="management-note">Next step: confirm backup scope, retention rules, and recent prune/garbage-collection results with IT. No configurations or backups were changed. See inventory.html for the full report and measurement gaps.</p></article>'
 
 
 def management_summary_html(report):
@@ -2759,10 +3208,196 @@ def pbs_location_details(report, config, args, tracker, existing=None):
             client.close()
 
 
+def capacity_days_label(value):
+    if value is None:
+        return "N/A — no reliable growth rate"
+    if value <= 0:
+        return "Already reached"
+    return f"About {value:.0f} days" if value >= 1 else "Less than 1 day"
+
+
+def capacity_policy_text(store):
+    """Human-readable evidence, not an inferred effective retention policy."""
+    lines = ['Latest garbage collection: ' + str((store.get('gc') or {}).get('last-run-state') or 'Unavailable')]
+    if store.get('datastore_retention') is None:
+        lines.append('Datastore retention settings unavailable.')
+    else:
+        rules = {k: v for k, v in store['datastore_retention'].items() if k.startswith('keep-')}
+        if rules:
+            lines.append('Datastore retention: ' + retention_description({'prune-backups': rules}))
+    if store.get('prune_config') is None:
+        lines.append('PBS prune policies unavailable.')
+    elif not store['prune_config']:
+        lines.append('No PBS prune jobs visible; other pruning may still exist.')
+    for job in store.get('prune_config') or []:
+        rules = {k: v for k, v in job.items() if k.startswith('keep-')}
+        lines.append('PBS prune job ' + str(job.get('id', 'unnamed')) +
+                     (' (disabled)' if enabled(job.get('disable', 0)) else '') +
+                     ', namespace ' + (job.get('ns') or '/') + ', depth ' + str(job.get('max-depth', 'all')) +
+                     ', schedule ' + str(job.get('schedule', 'not set')) + ': ' + retention_description({'prune-backups': rules}))
+    for job in store.get('prune_status') or []:
+        lines.append('Prune result ' + str(job.get('id', 'unnamed')) + ': ' + str(job.get('last-run-state') or 'Unavailable'))
+    return lines
+
+
+def capacity_page_html(report):
+    """Explain evidence, planning assumptions and capacity targets separately."""
+    esc = lambda value: html.escape(display(value), quote=True)
+    plan = report.get('capacity_plan') or {}
+    reserve = plan.get('reserve_percent', 20)
+    stores = plan.get('stores') or []
+    out = ['<p class="eyebrow">Storage expansion evidence</p><h2 tabindex="-1">Capacity Planning</h2>'
+           '<p class="page-intro">See the space needed to restore a free-space reserve now, '
+           'then compare 30-, 90-, and 180-day growth scenarios. These are capacity targets '
+           'for the reported PBS filesystem, not measurements of one backup job.</p>'
+           '<div class="callout">Free-space reserve target: <strong>' + esc(reserve) + '%</strong>. '
+           'A reserve leaves room for upcoming writes; it is not additional data already stored. '
+           'Datastores may share a filesystem, so their capacity figures must not be added together.</div>']
+    if not stores:
+        out.append('<section class="panel"><h3>Capacity evidence is unavailable</h3><p>'
+                   'Include PBS reporting to read its capacity. If PBS was requested, review its '
+                   'collection messages. VM disk sizes alone cannot establish the required PBS capacity.</p></section>')
+    for store in stores:
+        out.append('<section class="panel"><div class="section-head"><div><h3>' + esc(store.get('store')) +
+                   '</h3><p class="meta">' + esc(store.get('status')) + ' · Confidence: ' +
+                   esc(store.get('confidence')) + '</p></div></div><div class="cards">')
+        for label, key, note in (
+                ('Current capacity', 'total_bytes', 'Capacity reported by PBS'),
+                ('Available now', 'available_bytes', 'Space PBS reports available for writes'),
+                ('Minimum total to restore reserve', 'immediate_required_total_bytes', 'Based on current occupied or unavailable space'),
+                ('Additional capacity for reserve now', 'immediate_additional_bytes', 'Before adding future growth')):
+            out.append('<article class="card"><div class="label">' + label + '</div><div class="value">' +
+                       human(store.get(key)) + '</div><p>' + note + '</p></article>')
+        out.append('</div><div class="two-col"><article class="panel"><h3>What was measured</h3><p>'
+                   'Reported used space: <strong>' + human(store.get('used_bytes')) + '</strong><br>'
+                   'Occupied or unavailable space: <strong>' + human(store.get('occupied_bytes')) + '</strong></p>'
+                   '<p class="hint">Occupied or unavailable space is total capacity minus available capacity. '
+                   'It may include space reserved by the filesystem, so it can differ from reported used space.</p>'
+                   '<p>History: ' + esc(store.get('history_count', 0)) + ' usable readings over ' +
+                   esc(round(store.get('history_days') or 0, 1)) + ' days.<br>Observed net growth: ' +
+                   human(store.get('observed_growth_bytes_per_day')) + ' per day.</p></article>'
+                   '<article class="panel"><h3>Planning basis</h3><p>' + esc(store.get('basis')) + '</p>'
+                   '<p>Time until full: <strong>' + esc(capacity_days_label(store.get('days_until_full'))) +
+                   '</strong><br>Time until the free-space reserve is reached: <strong>' +
+                   esc(capacity_days_label(store.get('days_until_reserve'))) + '</strong></p>'
+                   '<p class="hint">A date is not a guarantee. Full storage can hide unmet backup demand, '
+                   'and failed cleanup can distort growth. No expected cleanup savings are deducted.</p></article></div>')
+        evidence = next((s for s in report.get('pbs', {}).get('datastores', []) if s.get('store') == store.get('store')), {})
+        out.append('<details><summary>Current Retention And Cleanup</summary><ul>' +
+                   ''.join('<li>' + esc(line) + '</li>' for line in capacity_policy_text(evidence)) +
+                   '</ul><p>These are visible policy settings, not a calculation of an effective retention count. '
+                   'Overlapping policies, protected backups and other backup clients can affect retained data. '
+                   '<a href="inventory.html#pbs">View PBS Evidence</a>.</p></details>')
+        if any(row.get('source') == 'illustrative' for row in store.get('projections') or []):
+            out.append('<p class="callout"><strong>Illustrative scenarios — not a measured forecast.</strong> '
+                       'These example growth rates help compare expansion sizes. They are not estimates of '
+                       'your daily backup changes. Replace them with an explicit planning assumption or collect more history.</p>')
+        rows = []
+        for row in store.get('projections') or []:
+            values = (row.get('scenario'), row.get('source'), human(row.get('growth_bytes_per_day')) + '/day',
+                      str(row.get('days')) + ' days', human(row.get('required_total_bytes')),
+                      human(row.get('additional_bytes')))
+            rows.append('<tr>' + ''.join('<td>' + esc(value) + '</td>' for value in values) + '</tr>')
+        out.append('<h3>Capacity targets by scenario</h3><div class="table-wrap"><table><thead><tr>'
+                   '<th>Scenario</th><th>Evidence type</th><th>Net growth assumed</th><th>Planning horizon</th>'
+                   '<th>Total capacity needed</th><th>Additional capacity needed</th></tr></thead><tbody>' +
+                   (''.join(rows) if rows else '<tr><td colspan="6">N/A — capacity or planning inputs are unavailable.</td></tr>') +
+                   '</tbody></table></div><p class="hint">Targets include the free-space reserve. '
+                   'Different scenarios are alternatives, not amounts to add together.</p>'
+                   '<details><summary>Assumptions And Calculation</summary><p>'
+                   'Total capacity needed = (occupied or unavailable space + daily net growth × days) '
+                   '÷ (1 − reserve percentage / 100). Additional capacity is the amount above current capacity, '
+                   'with a minimum of zero.</p><ul class="reason-list">' +
+                   ''.join('<li>' + esc(note) + '</li>' for note in store.get('assumptions') or []) +
+                   '</ul><p>Historical growth reflects the combined effect of backups, retention, cleanup '
+                   'and any other data on this filesystem. Changing those conditions can invalidate the estimate. '
+                   'Retention counts are not multiplied by VM sizes or logical snapshot sizes.</p></details>'
+                   '<article class="panel"><h3>Expansion request wording</h3><p>' +
+                   esc(store.get('management_text') or 'No defensible capacity statement is available from these readings.') +
+                   '</p><p class="hint">Keep the assumptions and evidence type with this statement when sharing it.</p></article></section>')
+    out.append('<section class="panel"><h3>Existing backup-job scope</h3><p>'
+               'This describes what the PVE jobs select. Assigned disk capacity is logical space, including empty space. '
+               'It is not the amount a job uses on PBS; shared backup data cannot reliably be assigned to individual jobs.</p>')
+    jobs = plan.get('jobs') or []
+    if not jobs:
+        out.append('<p>No PVE backup-job scope was available. PBS-only collection does not read PVE jobs; '
+                   'capacity planning can still use datastore measurements.</p>')
+    else:
+        out.append('<div class="table-wrap"><table><thead><tr><th>Job</th><th>Destination</th><th>Schedule</th>'
+                   '<th>Selected VMs</th><th>Known assigned disk capacity</th><th>Retention And Coverage</th></tr></thead><tbody>')
+        for job in jobs:
+            state = 'Enabled' if job.get('enabled') is True else 'Disabled' if job.get('enabled') is False else 'State unavailable'
+            destination = display(job.get('datastore')) + ' / ' + (job.get('namespace') or '/')
+            retention = job.get('retention')
+            if not isinstance(retention, str):
+                retention = retention_description({'prune-backups': retention}) if retention is not None else 'Not set in PVE job; review PBS policies above and storage-level settings.'
+            count = display(job.get('selected_vm_count')) + (' (selection incomplete)' if not job.get('selection_complete') else '')
+            out.append('<tr><td>' + esc(job.get('id')) + '<small>' + state + '</small></td><td>' + esc(destination) +
+                       '<small>PVE storage: ' + esc(job.get('storage')) + '</small></td><td>' + esc(job.get('schedule')) +
+                       '</td><td>' + esc(count) + '</td><td>' + human(job.get('known_configured_bytes')) +
+                       '<small>Logical; known included disks only</small></td><td>' + esc(retention) +
+                       '<small>Disks marked excluded: ' + esc(job.get('excluded_disk_count')) + '</small>' +
+                       ''.join('<small>' + esc(note) + '</small>' for note in job.get('notes') or []) + '</td></tr>')
+        out.append('</tbody></table></div>')
+    out.append('</section><section class="panel"><h3>How to use these numbers</h3><ul class="reason-list">' +
+               ''.join('<li>' + esc(note) + '</li>' for note in plan.get('notes') or []) +
+               '<li>Existing backups are already part of measured storage usage; do not add VM or snapshot totals again.</li>'
+               '<li>A larger datastore can provide room, but does not repair failed cleanup or establish that backups are succeeding.</li>'
+               '</ul></section>')
+    return ''.join(out)
+
+
+def capacity_management_html(report):
+    plan = report.get('capacity_plan') or {}
+    stores = plan.get('stores') or []
+    if not stores:
+        return '<section><h2>Backup Capacity Planning</h2><p>PBS capacity measurements are needed before an expansion target can be calculated.</p></section>'
+    esc = lambda value: html.escape(display(value), quote=True)
+    out = ['<section><h2>Backup Capacity Planning</h2><p>Free-space reserve target: ' +
+           esc(plan.get('reserve_percent', 20)) + '%. Datastore capacities may overlap and are not summed.</p>']
+    for store in stores:
+        out.append('<p><strong>' + esc(store.get('store')) + ':</strong> ' + esc(store.get('management_text')) + '</p>'
+                   '<p class="management-note">Additional capacity to restore the reserve now: ' +
+                   human(store.get('immediate_additional_bytes')) + '. Basis: ' + esc(store.get('basis')) +
+                   '. Confidence: ' + esc(store.get('confidence')) + '.</p>')
+        evidence = next((s for s in report.get('pbs', {}).get('datastores', []) if s.get('store') == store.get('store')), {})
+        out.append('<p class="management-note">Latest garbage collection: ' + esc((evidence.get('gc') or {}).get('last-run-state')) + '.</p>')
+    out.append('<p class="management-note">Growth scenarios are conditional on their stated assumptions. '
+               'No cleanup recovery is assumed. See Capacity Planning in the full report for horizons, '
+               'backup-job scope, and calculation details.</p></section>')
+    return ''.join(out)
+
+
+def capacity_terminal_text(report):
+    plan = report.get('capacity_plan') or {}
+    stores = plan.get('stores') or []
+    lines = ['PBS CAPACITY PLANNING', 'Free-space reserve target: ' + str(plan.get('reserve_percent', 20)) + '%; datastore capacities are not summed.']
+    if not stores:
+        lines.append('N/A: PBS capacity measurements are unavailable or PBS was not requested.')
+    for store in stores:
+        lines.extend(['- ' + str(store.get('store')) + ': ' + str(store.get('status')),
+                      '  Current total=' + human(store.get('total_bytes')) + '; available=' + human(store.get('available_bytes')) +
+                      '; additional capacity for reserve now=' + human(store.get('immediate_additional_bytes')),
+                      '  Basis: ' + str(store.get('basis')) + '; confidence=' + str(store.get('confidence')),
+                      '  Until full: ' + capacity_days_label(store.get('days_until_full')) +
+                      '; until reserve: ' + capacity_days_label(store.get('days_until_reserve'))])
+        for row in store.get('projections') or []:
+            lines.append('  ' + str(row.get('scenario')) + ' [' + str(row.get('source')) + '], ' +
+                         human(row.get('growth_bytes_per_day')) + '/day, ' + str(row.get('days')) +
+                         ' days: total needed=' + human(row.get('required_total_bytes')) +
+                         '; additional=' + human(row.get('additional_bytes')))
+        lines.append('  Expansion wording: ' + str(store.get('management_text') or 'N/A'))
+        lines.extend('  Assumption: ' + str(note) for note in store.get('assumptions') or [])
+    lines.append('Illustrative rates are examples, not measured forecasts. Existing data is already included; no cleanup savings are deducted.')
+    return '\n'.join(lines)
+
+
 def downloads_html():
     files = [('Host inventory', 'hosts.csv'), ('VM spreadsheet', 'vms.csv'), ('Disk spreadsheet', 'disks.csv'),
              ('Full inventory', 'inventory.json'), ('Printable summary', 'management-summary.html'),
-             ('PBS backup groups', 'pbs_groups.csv'), ('PBS snapshots', 'pbs_snapshots.csv')]
+             ('PBS backup groups', 'pbs_groups.csv'), ('PBS snapshots', 'pbs_snapshots.csv'),
+             ('Capacity planning spreadsheet', 'capacity_planning.csv'), ('Backup job scope', 'backup_job_scope.csv'),
+             ('Printable capacity plan', 'capacity-plan.html'), ('Storage expansion justification', 'capacity-justification.txt')]
     return '<h2>Downloads</h2><p>These files cover the entire collected report, regardless of browser filters. Keep them alongside this HTML file.</p><section class="panel">' + ''.join('<p><a href="' + path + '">' + label + '</a></p>' for label, path in files) + '</section>'
 
 
@@ -2803,7 +3438,7 @@ def _html_report(report, include_scopes=True):
     method_label = lambda method: {"file allocated bytes": "Disk-file measurements", "ZFS usedbydataset": "ZFS storage measurements", "LVM-thin mapped bytes (active volumes)": "Active LVM-thin mapped data", "Ceph RBD image allocated bytes": "Ceph RBD disk allocation"}.get(method, "Other storage measurements")
     card_data = [
         ("Virtual Machines reviewed", str(count), f"Across {len(nodes)} host servers", "Includes " + str(sum(v["template"] for v in vms)) + " saved machine templates. Only machines this account can view are included.", "machines"),
-        ("Assigned disk space", human(totals[0]["total_bytes"]), "All disk sizes available" if totals[0]["complete_coverage"] else "Partial data; known space: " + human(totals[0]["known_subtotal_bytes"]), "Disk space made available to the machines, including space they have not filled.", "assigned"),
+        ("Assigned disk space", partial_capacity_label(totals[0]["total_bytes"], totals[0]["known_subtotal_bytes"]), "All disk sizes available" if totals[0]["complete_coverage"] else "Partial data; known space: " + human(totals[0]["known_subtotal_bytes"]), "Disk space made available to the machines, including space they have not filled.", "assigned"),
         ("Measured storage used", esc(measured_total_label(totals)), f"{measured} of {identified} identified disks measured", "Space reported as used by VM disks. Partial totals include the disks successfully measured; see Storage for missing disks and separate measurement types. Guest tools are not required.", "measured"),
         ("Scheduled for backup", f"{yes} of {count}", f"{no} not selected · {unknown} unknown", "Machines selected by an active PVE backup schedule. Successful backups have not been checked.", "backups"),
     ]
@@ -2861,7 +3496,7 @@ def _html_report(report, include_scopes=True):
         search = ' '.join(display(vm[key]) for key in ("vmid", "name", "node", "tags")).lower()
         klass = (' class="top"' if vm["vmid"] in report["top_vmids"] else '') + ' tabindex="0" aria-haspopup="dialog" aria-label="' + esc('Open details for ' + str(vm['name']) + ', VM ' + str(vm['vmid'])) + '"'
         rows.append('<tr' + klass + ' data-search="' + esc(search) + '" data-node="' + esc(vm["node"]) + '" data-config-available="' + str(vm["config_available"]).lower() + '" data-disks="' + esc(json.dumps(disk_records)) + '" data-missing-allocation="' + str(vm["actual_bytes"] is None).lower() + '">' + ''.join(cells) + '</tr>')
-    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + human(totals[0]["total_bytes"]) + '</td><td id="table-used-total">' + esc(measured_total_label(totals)) + '</td><td id="table-ram-total">' + human(complete_sum([v['ram_bytes'] for v in vms])) + '</td><td colspan="3"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
+    footer = '<tfoot><tr><th colspan="5" scope="row"><strong id="table-total-label">Storage total for all shown machines</strong><small>Shared disks count once</small></th><td id="table-assigned-total">' + partial_capacity_label(totals[0]["total_bytes"], totals[0]["known_subtotal_bytes"]) + '</td><td id="table-used-total">' + esc(measured_total_label(totals)) + '</td><td id="table-ram-total">' + human(complete_sum([v['ram_bytes'] for v in vms])) + '</td><td colspan="3"><span id="table-total-note">Totals use the machines currently shown. Missing values are not treated as zero.</span> ' + report_help_link("measured", "Explain these totals") + '</td></tr></tfoot>'
     machines = '<p class="eyebrow">Machine list</p><h2 tabindex="-1">Virtual Machines</h2><p class="page-intro">Click a VM row to open its information. Use Back To VM List, Escape, or click outside the panel to return. Keyboard users can focus a row and press Enter. Click a heading to sort, or its ? link for an explanation. ' + report_help_link("units", "Explain the size units") + '</p><section class="panel" id="inventory"><div class="toolbar"><label class="sr-only" for="search">Search name, ID, host or label</label><input id="search" type="search" placeholder="Search name, ID, host or label…"><label class="sr-only" for="node-filter">Filter by host server</label><select id="node-filter"><option value="">All PVE nodes</option>' + ''.join('<option value="' + esc(n) + '">' + esc(n) + '</option>' for n in nodes) + '</select><button id="clear-filters" class="button" type="button">Show all VMs / Clear filters</button><label><input type="checkbox" id="missing-only">Usage not available</label><label><input type="checkbox" id="show-resources" checked>Show memory &amp; CPUs</label></div><p class="meta" id="result-count" aria-live="polite">' + str(count) + ' machines</p><div class="table-wrap"><table id="vms" data-resources="true"><thead><tr>' + headers + '</tr></thead><tbody>' + ''.join(rows) + '</tbody>' + footer + '</table></div><p id="no-results" class="hint" hidden>No machines match these filters.</p><p class="hint">Totals update when you filter. RAM assigned includes the displayed stopped machines and templates; it is not host memory usage. RAM in use is a snapshot at collection time. Assigned space and measured usage are separate totals; neither is PBS backup usage. On small screens, scroll the table sideways to see every column.</p></section>'
     jobs = report["jobs"]
     if jobs is None:
@@ -2897,6 +3532,7 @@ def _html_report(report, include_scopes=True):
     views = [("overview", "Summary", overview), ("review", "Needs Attention", review_page_html(report)),
              ("hosts", "PVE Hosts", hosts_page_html(report)), ("machines", "VM's", machines), ("storage", "Storage", storage),
              ("backups", "PVE Backup Jobs", backups), ("pbs", "PBS Backup Storage", pbs_page_html(report) if include_scopes else ""),
+             ("capacity", "Capacity Planning", capacity_page_html(report)),
              ("management", "Management Summary", management), ("downloads", "Downloads", downloads_html()), ("help", "Help", help_page), ("technical", "IT Reference", technical)]
     scope_views = {}
     if include_scopes and not report.get('scope', {}).get('pbs_only'):
@@ -2946,9 +3582,34 @@ def _export_report(report, directory):
     write_csv(directory / 'hosts.csv', ['node','address','status','details','storage'], report.get('hosts', []))
     write_csv(directory / 'changes.csv', ['vmid','change','previous','current'], report.get('changes', {}).get('items', []))
     terminal = terminal_report(report)
+    if report.get('capacity_plan'):
+        terminal += '\n\n' + capacity_terminal_text(report)
     (directory / "inventory.txt").write_text(terminal, encoding="utf-8")
     (directory / "inventory.html").write_text(html_report(report), encoding="utf-8")
     (directory / "management-summary.html").write_text(management_summary_html(report), encoding="utf-8")
+    (directory / 'capacity-plan.html').write_text('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo Capacity Planning</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><div class="print-toolbar"><button class="button" onclick="window.print()">Print / Save As PDF</button> <a href="inventory.html#capacity">Open Full Report</a></div>' + capacity_page_html(report) + '</main></body></html>', encoding='utf-8')
+    plan = report.get('capacity_plan') or {}
+    justification = ['ProxInfo Storage Expansion Planning', 'Collected: ' + str(report.get('generated_at')),
+                     'Reserve target: ' + str(plan.get('reserve_percent', 20)) + '% (planning assumption).']
+    for store in plan.get('stores', []):
+        justification.extend(['', store['management_text'], 'Confidence: ' + store['confidence']])
+        evidence = next((s for s in report.get('pbs', {}).get('datastores', []) if s.get('store') == store.get('store')), {})
+        justification.extend(capacity_policy_text(evidence))
+        justification.extend('- ' + note for note in store.get('assumptions', []))
+    justification.extend([''] + plan.get('notes', []))
+    (directory / 'capacity-justification.txt').write_text('\n'.join(justification), encoding='utf-8')
+    projection_rows = []
+    for store in plan.get('stores', []):
+        for projection in store['projections'] or [dict(scenario='Unavailable', source='unavailable')]:
+            projection_rows.append(dict(projection, store=store['store'], reserve_percent=plan['reserve_percent'],
+                                        current_total_bytes=store['total_bytes'], current_available_bytes=store['available_bytes'],
+                                        confidence=store['confidence'], history_days=store['history_days'],
+                                        history_count=store['history_count'], assumptions=store['assumptions']))
+    write_csv(directory / 'capacity_planning.csv', ['store', 'scenario', 'source', 'reserve_percent', 'growth_bytes_per_day', 'days',
+              'current_total_bytes', 'current_available_bytes', 'required_total_bytes', 'additional_bytes', 'confidence',
+              'history_days', 'history_count', 'assumptions'], projection_rows)
+    write_csv(directory / 'backup_job_scope.csv', ['id', 'storage', 'datastore', 'namespace', 'enabled', 'schedule',
+              'selected_vm_count', 'selection_complete', 'known_configured_bytes', 'excluded_disk_count', 'retention', 'notes'], plan.get('jobs', []))
     (directory / "inventory.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     rows = []
     for vm in report["vms"]:
@@ -2970,7 +3631,7 @@ def _export_report(report, directory):
                                                 "known_identity_volumes", "complete_coverage", "notes"], report["storage_totals"])
     write_csv(directory / "review_items.csv", ["rule", "category", "vmid", "name", "node", "title", "evidence", "follow_up"], report.get("review_items", []))
     write_csv(directory / "storage_breakdowns.csv", ["grouping", "name", "host", "scope", "vm_count", "unique_disk_count",
-        "configured_bytes", "known_configured_bytes", "actual_bytes", "measured_disk_count", "actual_methods", "unidentified_disk_references", "missing_vm_configs"], report.get("storage_breakdowns", []))
+        "configured_bytes", "known_configured_bytes", "actual_bytes", "known_actual_bytes", "measured_subtotals", "measured_disk_count", "actual_methods", "unidentified_disk_references", "missing_vm_configs"], report.get("storage_breakdowns", []))
     pbs = report.get("pbs", {})
     datastore_rows = [dict(s, gc_last_result=(s.get('gc') or {}).get('last-run-state'),
         gc_last_completed=(s.get('gc') or {}).get('last-run-endtime'), gc_removed_bytes=gc_measurement(s.get('gc'), 'removed-bytes'),
@@ -3095,7 +3756,12 @@ def main(argv=None):
     parser.add_argument("--pbs-task-limit", type=int, default=1000)
     parser.add_argument("--pbs-verification-days", type=float, help="Optional age threshold for recorded verification-job completion")
     parser.add_argument("--pbs-fresh-hours", type=float, help="Optional backup age expectation in hours")
-    parser.add_argument("--pbs-history", action="store_true", help="Save local capacity history under --output-root")
+    history_flags = parser.add_mutually_exclusive_group()
+    history_flags.add_argument("--pbs-history", action="store_true", default=True, help="Save local PBS capacity history (enabled by default when PBS is included)")
+    history_flags.add_argument("--no-pbs-history", dest="pbs_history", action="store_false", help="Do not read or save local PBS capacity history")
+    parser.add_argument('--pbs-history-dir', type=Path, help='Stable local history folder; default --output-root or .proxinfo beside report folders')
+    parser.add_argument('--pbs-reserve-percent', type=float, default=20, help='Capacity planning free-space reserve target (default 20 percent; planning assumption)')
+    parser.add_argument('--pbs-growth-gib-per-day', action='append', metavar='DATASTORE=GIB_PER_DAY', help='Explicit net growth assumption for a datastore; repeat for other datastores')
     parser.add_argument("--pbs-url", help="PBS HTTPS URL; credentials use PBS_TOKEN_ID / PBS_TOKEN_SECRET")
     parser.add_argument('--pbs-auth', choices=('ssh', 'password', 'token'), help='PBS sign-in method (default: SSH unless existing token credentials are configured); PBS remains optional')
     parser.add_argument('--pbs-ssh-host', help='PBS SSH hostname, IP or configured alias')
@@ -3129,8 +3795,14 @@ def main(argv=None):
         parser.error("Verification days must be positive and finite")
     if args.pbs_fresh_hours is not None and not 0 < args.pbs_fresh_hours < float('inf'):
         parser.error("PBS freshness hours must be positive and finite")
-    if args.pbs_history and (args.output_root is None or args.pbs is False):
-        parser.error("--pbs-history requires --output-root and enabled PBS")
+    if not 0 <= args.pbs_reserve_percent < 100:
+        parser.error('--pbs-reserve-percent must be finite and in [0,100)')
+    try:
+        growth_overrides = parse_growth_overrides(args.pbs_growth_gib_per_day)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.pbs_history_dir is not None and not args.pbs_history:
+        parser.error('--pbs-history-dir cannot combine with --no-pbs-history')
     if args.cron:
         if not (args.mode or args.pbs_only) or args.output_root is None or not args.output_root.is_absolute():
             parser.error("--cron requires --mode and an absolute --output-root")
@@ -3260,25 +3932,33 @@ def main(argv=None):
                     reason = (disk['actual_reason'] or '').lower()
                     category = ('timeout' if 'timed out' in reason or 'timeout' in reason else
                                 'unsupported' if 'no validated' in reason else
-                                'not queried' if 'not queried' in reason or 'cancelled' in reason else
+                                'not queried' if 'not queried' in reason or 'not collected' in reason or 'cancelled' in reason else
+                                'disk not found' if 'could not find this disk backing zfs dataset' in reason else
                                 'access denied' if '403' in reason or 'permission denied' in reason else 'unavailable')
                     gaps[category] += 1
         report['run']['unmeasured_disk_references'] = dict(gaps)
-        if report['run']['status'] == 'finished' and (report['warnings'] or gaps or report['pbs'].get('warnings')):
+        if report['run']['status'] == 'finished' and (report['warnings'] or gaps or report['pbs'].get('warnings') or any(not v['config_available'] for v in report['vms'])):
             report['run']['status'] = 'finished with missing measurements'
         if args.pbs_only:
             report['summary'] = {key: 'N/A (PVE inventory not requested)' for key in report['summary']}
             for total in report['storage_totals']:
                 total['total_bytes'] = total['known_subtotal_bytes'] = None
-        if args.pbs_history and report['pbs']['requested'] and pbs_config:
+        if args.pbs_history and report['pbs'].get('datastores') and pbs_config and pbs_config.get('url'):
             try:
-                pbs_history(report, args.output_root, pbs_config['url'].rstrip('/'))
+                history_root = args.pbs_history_dir or args.output_root or (args.output_dir.parent / '.proxinfo')
+                pbs_history(report, history_root, pbs_config['url'].rstrip('/'))
+                report['run']['capacity_history_directory'] = str(history_root.resolve())
             except (OSError, sqlite3.Error) as exc:
                 report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
                 report['run']['status'] = 'finished with history unavailable'
         if not tracker.cancelled and not tracker.expired:
             if (pbs_config or {}).get('auth') != 'ssh':
                 pbs_location_details(report, config, args, tracker)
+        report['capacity_plan'] = build_capacity_plan(report, args.pbs_reserve_percent, growth_overrides)
+        report['capacity_plan']['jobs'] = capacity_job_scope(report)
+        report['capacity_plan']['history_enabled'] = args.pbs_history
+        if not args.pbs_history:
+            report['capacity_plan']['notes'].append('Local capacity history was disabled for this run.')
         report['changes'] = compare_inventory(report, args.previous_report)
         report['restore_tests'] = []
         if args.restore_tests:

@@ -317,7 +317,7 @@ class GuestAgentRecoveryTests(unittest.TestCase):
     def test_closed_session_does_not_repeat_warning_for_every_read(self):
         client = MagicMock()
         client.get.side_effect = [inv.ReadError('original failure'),
-                                 inv.ReadError('Not Collected — Connection Unavailable')]
+                                 inv.SessionUnavailable('Not Collected — Connection Unavailable')]
         collector = inv.Collector(client)
         collector.read('/version')
         _, reason = collector.read('/nodes')

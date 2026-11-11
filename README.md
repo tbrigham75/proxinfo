@@ -318,21 +318,62 @@ or unreadable agent setting leaves guest filesystem usage unavailable; disk,
 RAM and CPU collection continues. `--no-guest-agent` skips these optional queries
 entirely. Guest tools are not required to measure storage-side disk allocation.
 
-The interactive session also recognizes the specific PVE errors “No QEMU guest
-agent configured” and “QEMU guest agent is not running,” including the proxy
-handler prefix. These leave the session open so later VMs can be collected.
-Only a short, exact diagnostic from the guest-filesystem endpoint qualifies;
-the report receives a fixed explanation, never a captured authentication transcript.
+Starting with ProxInfo 1.5.2, these recognized PVE query failures leave the
+interactive session open so other disks, VMs and hosts can still be collected:
 
-Other failed interactive reads remain conservative: if the tool cannot establish
-that the error is one of those guest-agent failures, it closes that host's session.
-This includes unrecognized errors from an enabled but unresponsive agent. Sudo/PAM
-failures, connection loss, cancellation and timeouts also stop the session;
-credentials and failed queries are never automatically replayed. Already collected
-data is preserved. Subsequent reads are marked “Not Collected — Connection
-Unavailable” without repeating the original failure in the warning list. Check
-the live terminal message, correct the cause, and rerun. PBS uses the same
-conservative handling; PVE's guest-agent exception does not apply to PBS commands.
+- Guest filesystem reads: “No QEMU guest agent configured” or “QEMU guest agent
+  is not running,” including the proxy-handler form.
+- Storage-content reads: ZFS reports “cannot open …: dataset does not exist,”
+  including the proxy-handler form. This applies to any node/storage name and
+  includes EFI disks. Only that disk's measured usage is unavailable; its known
+  assigned capacity remains in the report.
+
+These exceptions require a short, exact diagnostic from the appropriate endpoint.
+Logs receive a fixed explanation and the requested resource identity, never the
+captured sudo/PAM conversation. A missing-dataset lookup does not establish whether
+that disk was deleted, moved, or incorrectly referenced. ProxInfo does not recreate
+disks, change references, activate volumes, or repair storage.
+
+Other failed interactive reads remain conservative: unrecognized errors,
+sudo/PAM failures, connection loss, cancellation and timeouts close the session.
+Credentials and failed queries are never automatically replayed. Already collected
+data is preserved. Later reads needing the closed session are recorded as
+“not collected,” with the original failed operation identified, rather than counted
+as new remote failures. The report groups the affected VMs under that interruption.
+PBS uses a separate session; these PVE exceptions do not apply to PBS commands.
+
+Query outcomes distinguish successful reads, optional metrics unavailable, disks
+not found, failed requests and reads not collected. The sudo/MFA reminder appears
+once per session; actual authentication prompts still appear whenever the server
+requires them. Query timing still includes time spent at authentication prompts.
+
+Partial storage totals show compatible known readings and their coverage across
+terminal, HTML and CSV reports. For example, “121 of 122 identified disks; 31 VM
+configurations unavailable” means the number of disks in those 31 VMs is unknown.
+It does not mean all but one disk in the cluster was measured. Known subtotals are
+not complete physical-pool usage or PBS consumption; incompatible methods remain
+separate, and missing values are never substituted with zero or assigned capacity.
+
+PBS alerts explicitly flag zero available capacity and unsuccessful cleanup tasks,
+including locking errors such as ENOLCK. These are prioritized in Needs Attention
+and the Management Summary. “PBS collection succeeded” means the status could be
+read, not that the server's backup/cleanup jobs succeeded. Old GC statistics are
+not proof of how much a later successful cleanup would free. ProxInfo does not
+run prune/GC, remove locks, or change retention.
+
+For a manual check after updating, verify the version and run:
+
+```bash
+python3 pve_inventory.py --version
+python3 pve_inventory.py --mode ssh --ssh-sudo-mode interactive --no-pbs
+```
+
+Leave off `--no-pbs` to choose whether to include PBS during setup. An unavailable
+guest agent or missing ZFS disk should leave a specific report entry while later
+VM configurations and host reads continue. If the session actually closes, the
+report should identify the original operation and show the remaining reads as
+not collected. Live Linux/SSH/Okta verification is performed in your environment.
+
 
 PVE and PBS use separate sessions and permissions. Sudo on the entry PVE node does
 not authenticate a different node: host-level reads on other cluster members still
@@ -1024,7 +1065,80 @@ Verification states are passed, failed, explicitly not verified, or unavailable.
 
 ### Local capacity history
 
-Enable with `--pbs-history --output-root ...`. A local SQLite file (Python standard library) stores valid readings under that root; no third-party Python package is required. Readings are keyed by PBS URL, datastore, backend, backing path, and reported total capacity. Changing that scope starts a separate series. Repeated run IDs are deduplicated and writes use database transactions. Each report includes up to 90 comparable readings.
+Capacity history is saved automatically when PBS is included, starting with 1.6.0. Use `--output-root ...` for a stable report/history folder, or `--pbs-history-dir ...` to choose a separate history folder. Without either, history is saved in `.proxinfo` beside the report folders. `--no-pbs-history` disables reading and saving it. The existing `--pbs-history` flag remains accepted.
+
+A local SQLite file (Python standard library) stores valid readings; no third-party Python package is required. Readings are keyed by PBS URL, datastore, backend, backing path, total capacity, and visible retention/job scope. Changes start a separate series rather than mixing unlike observations. Repeated run IDs are deduplicated and writes use database transactions. Reports include the latest reading from each of up to 90 UTC dates. Use the same connection address, selection and history folder across runs. Reading unavailable settings can interrupt the comparable series; the script does not assume they stayed unchanged.
+
+## Capacity Planning and storage-expansion requests
+
+ProxInfo 1.6.0 adds a **Capacity Planning** page, printable plan, management-summary section, spreadsheets and copyable expansion-request text. It requires PBS capacity readings; PVE disk sizes alone cannot establish physical backup-storage needs. Python dependencies and server permissions are unchanged. All server operations remain read-only.
+
+Run from the folder containing `pve_inventory.py`, using your normal connection and authentication prompts:
+
+```bash
+python3 pve_inventory.py --mode ssh --ssh-sudo-mode interactive --pbs --output-root ./reports
+```
+
+For PBS capacity only, without connecting to PVE:
+
+```bash
+python3 pve_inventory.py --pbs-only --output-root ./reports
+```
+
+Open `inventory.html` in the newly created report folder and select **Capacity Planning**. PBS-only runs cannot show PVE job selection. To inspect existing job scope alongside PBS, use the first command.
+
+The report contains:
+
+- Current PBS filesystem capacity, used space and available space.
+- Additional capacity needed **now** to restore a free-space reserve, default **20%**. This is an editable planning assumption, not a Proxmox requirement.
+- Total and additional capacity for **30, 90 and 180 days**, with evidence type and confidence shown.
+- Estimated time until full or until the reserve is reached, when a usable growth rate exists. N/A is not an assurance that space will never run out.
+- Existing PVE job destinations, schedules, visible VM selection, included logical disk capacity and disk exclusions. These are backup scope, not per-job physical PBS usage. Missing VM configurations or invisible/container members make scope incomplete.
+- Visible PBS retention policies and latest cleanup results. The model assumes comparable workload, scope and retention; it does not simulate changing retention policies or multiply logical snapshot sizes by retention counts.
+
+### First run versus measured history
+
+On the first run, the immediate reserve requirement can be calculated from current capacity. Future growth needs more evidence. Until history contains at least **three distinct daily readings spanning seven days**, with the latest no older than seven days, the report shows explicitly illustrative **0, 5, 10 and 20 GiB/day** scenarios. These numbers are examples, not measurements of your environment or purchase recommendations.
+
+With enough comparable history, the baseline uses first-to-last net growth. A highest-sampled-interval sensitivity scenario is also shown when higher; it is not a statistical confidence interval or guaranteed upper bound. Flat or declining history does not prove future demand is zero. A full datastore can suppress successful backups and hide unmet demand. Failed or unknown cleanup lowers confidence; the model credits **no unverified space recovery**.
+
+You can supply an explicit planning assumption instead of waiting for history. For example, only if **10 GiB/day** is a rate you intend to evaluate for datastore `TrueNAS`:
+
+```bash
+python3 pve_inventory.py --mode ssh --ssh-sudo-mode interactive --pbs --output-root ./reports --pbs-growth-gib-per-day TrueNAS=10 --pbs-reserve-percent 20
+```
+
+Replace `TrueNAS` with the datastore's exact name. Repeat `--pbs-growth-gib-per-day OTHER_STORE=NUMBER` for other stores. Rates must be finite and between 0 and 1,000,000,000 GiB/day; a zero rate is a valid no-net-growth assumption. Unknown datastore names are called out in the plan and are not silently applied elsewhere. Reserve percentage must be between 0 inclusive and 100 exclusive. Command-line assumptions are labeled as assumptions, not historical evidence.
+
+History works with normal manual runs and existing cron options. Cron does not gain any new prompts. Give scheduled runs a stable absolute `--output-root` and use the established noninteractive authentication options. Keep history enabled if you want measured growth to become available.
+
+### Calculation and limits
+
+```text
+Occupied or unavailable space = reported total − reported available
+Required total = (occupied or unavailable space + daily net growth × days)
+                 / (1 − reserve percentage / 100)
+Additional capacity = max(required total − current total, 0)
+```
+
+For example, a completely full **2 TiB** filesystem needs **2.5 TiB total**, or **0.5 TiB additional**, to provide a 20% reserve before allowing for future growth. At an explicitly assumed 10 GiB/day for 90 days, the target becomes about **3.60 TiB total**, or **1.60 TiB additional**. This is a hypothetical example, not your measured requirement.
+
+Targets are usable/reportable filesystem capacity, **not raw disk purchases before RAID, replication or filesystem overhead**. Currently reserved/unavailable bytes are treated as fixed; percentage-based reservations may increase after expansion. Verify the storage system's resulting usable capacity. Existing backups are already included in current usage; do not add VM/snapshot sizes again. Do not sum datastore targets because datastores can share a filesystem. The model does not estimate the unique physical size of the next individual backup.
+
+PBS shares chunks across snapshots, so logical backup sizes cannot establish unique physical per-job consumption. Pruning removes backup references; garbage collection reclaims eligible unreferenced chunks. See the official [technical overview](https://pbs.proxmox.com/docs/technical-overview.html) and [maintenance documentation](https://pbs.proxmox.com/docs/maintenance.html).
+
+### Files to share with management
+
+| File | Purpose |
+| --- | --- |
+| `management-summary.html` | Printable summary with reserve requirement, conditional 90-day target, confidence and cleanup result |
+| `capacity-plan.html` | Standalone printable evidence, assumptions and scenario tables |
+| `capacity-justification.txt` | Copyable expansion-request wording, policy context and limitations |
+| `capacity_planning.csv` | Per-datastore/scenario/horizon totals and additional bytes, reserve, rate, confidence and history coverage |
+| `backup_job_scope.csv` | Visible job selection and known included logical capacity, kept separate from physical forecasts |
+| `inventory.json` | Full machine-readable evidence and `capacity_plan` |
+
+CSV capacity/rate fields are bytes or bytes/day; HTML uses labeled binary units (GiB/TiB), which differ from decimal GB/TB on storage products. Keep the assumptions with any estimate you copy. Expanding storage does not fix failed cleanup or establish that backups are succeeding.
 
 The chart plots successive valid observations, with exact timestamps and values below it. Gaps are not filled with zero and points are not joined to imply continuous measurements. Changes are observed differences, not proof that cleanup caused them. The first reading has no previous-change value. No per-VM physical attribution or date-when-full forecast is calculated. Failed local history writes are reported while the inventory can still be exported.
 

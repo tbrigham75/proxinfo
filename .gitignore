@@ -9,3 +9,4 @@ config.*.json
 *.secret.json
 
 pbs-history.sqlite3*
+.proxinfo/

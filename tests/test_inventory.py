@@ -121,7 +121,7 @@ class AccountingTests(unittest.TestCase):
         self.assertFalse(any("/storage/thin/" in p for p, _ in client.calls))
         inv.sort_report(report, "configured")
         self.assertEqual(report["vms"][-1]["vmid"], 101)
-        self.assertTrue(report["summary"]["Unique configured logical capacity"].startswith("N/A"))
+        self.assertEqual(report["summary"]["Unique configured logical capacity"], "150.00 GiB · Partial")
         with self.assertRaises(ValueError):
             inv.sort_report(report, "actual")
 
@@ -226,7 +226,7 @@ class AccountingTests(unittest.TestCase):
         report = collect(client)
         self.assertIsNone(report["vms"][0]["configured_bytes"])
         inv.sort_report(report, "configured")
-        self.assertTrue(report["summary"]["Unique configured logical capacity"].startswith("N/A"))
+        self.assertEqual(report["summary"]["Unique configured logical capacity"], "50.00 GiB · Partial")
 
     def test_cluster_list_failure_is_fatal(self):
         with self.assertRaises(inv.ReadError):
