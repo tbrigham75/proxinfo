@@ -312,13 +312,27 @@ interactive read so they cannot interrupt prompts. Query timings include any
 password/MFA prompt time. Authentication input/transcripts are excluded from
 collection logs, diagnostics and reports. Remote sudo/PAM prompts and command
 error output are displayed live in the terminal, not saved as captured transcripts.
-Any failed interactive sudo/read command closes that host's session. The tool
-cannot reliably distinguish an authentication failure from a command failure
-using an opaque terminal conversation, so it stops using that session rather
-than attempting another command. Already collected data is preserved; later
-reads needing that session are marked unavailable. Check the live terminal
-message, correct the cause, and rerun. Connection loss, cancellation and timeouts
-also close the session; credentials and failed queries are not automatically replayed.
+Starting with ProxInfo 1.5.1, a running VM is queried for guest filesystems only
+when its current configuration enables the QEMU guest agent. A missing, disabled,
+or unreadable agent setting leaves guest filesystem usage unavailable; disk,
+RAM and CPU collection continues. `--no-guest-agent` skips these optional queries
+entirely. Guest tools are not required to measure storage-side disk allocation.
+
+The interactive session also recognizes the specific PVE errors “No QEMU guest
+agent configured” and “QEMU guest agent is not running,” including the proxy
+handler prefix. These leave the session open so later VMs can be collected.
+Only a short, exact diagnostic from the guest-filesystem endpoint qualifies;
+the report receives a fixed explanation, never a captured authentication transcript.
+
+Other failed interactive reads remain conservative: if the tool cannot establish
+that the error is one of those guest-agent failures, it closes that host's session.
+This includes unrecognized errors from an enabled but unresponsive agent. Sudo/PAM
+failures, connection loss, cancellation and timeouts also stop the session;
+credentials and failed queries are never automatically replayed. Already collected
+data is preserved. Subsequent reads are marked “Not Collected — Connection
+Unavailable” without repeating the original failure in the warning list. Check
+the live terminal message, correct the cause, and rerun. PBS uses the same
+conservative handling; PVE's guest-agent exception does not apply to PBS commands.
 
 PVE and PBS use separate sessions and permissions. Sudo on the entry PVE node does
 not authenticate a different node: host-level reads on other cluster members still

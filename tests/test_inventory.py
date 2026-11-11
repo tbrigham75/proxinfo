@@ -40,7 +40,7 @@ class FakeClient:
             "/cluster/backup/nightly/included_volumes": {"children": [{"id": 100}]},
             "/cluster/backup/disabled/included_volumes": {"children": [{"id": 101}]},
             "/nodes/a/qemu/100/config": {
-                "memory": 4096, "cores": 4, "tags": "prod;db",
+                "memory": 4096, "cores": 4, "tags": "prod;db", "agent": "enabled=1",
                 "scsi0": "shared:100/vm-100-disk-0.raw,size=100G,backup=0",
                 "scsi1": "shared:100/vm-100-disk-0.raw,size=100G",  # duplicate attachment
                 "scsi2": "local:100/vm-100-disk-1.raw,size=50G",

@@ -252,5 +252,78 @@ class InteractiveSudoProtocolTests(unittest.TestCase):
         close.assert_called_once()
 
 
+class GuestAgentRecoveryTests(unittest.TestCase):
+    def test_configuration_gates_optional_reads(self):
+        client = MagicMock()
+        client.get.return_value = {"result": [{"name": "root", "used-bytes": 1, "total-bytes": 2}]}
+        collector = inv.Collector(client)
+        for config in (None, {}, {"agent": 0}, {"agent": "0,fstrim_cloned_disks=1"},
+                       {"agent": "enabled=0,type=virtio"}, {"agent": "type=virtio"}, {"agent": "unknown"}):
+            with self.subTest(config=config):
+                filesystems, reason = collector.filesystems('/nodes/pve/qemu/101', 'running', config)
+                self.assertEqual(filesystems, [])
+                self.assertIn('N/A', reason)
+        client.get.assert_not_called()
+        for value in (1, '1', '1,fstrim_cloned_disks=1', 'enabled=1,type=virtio', 'type=virtio,enabled=1'):
+            filesystems, _ = collector.filesystems('/nodes/pve/qemu/101', 'running', {'agent': value})
+            self.assertEqual(filesystems[0]['free_bytes'], 1)
+        client.reset_mock()
+        collector.filesystems('/nodes/pve/qemu/101', 'stopped', {'agent': 1})
+        collector.guest_agent = False
+        collector.filesystems('/nodes/pve/qemu/101', 'running', {'agent': 1})
+        client.get.assert_not_called()
+
+    def session(self):
+        session = inv.InteractiveSudoSession(SimpleNamespace(host='pve', auth_timeout=30))
+        session.ready = True
+        return session
+
+    def test_guest_error_then_next_vm_succeeds(self):
+        for code in (1, 255):
+            session = self.session()
+            frames = [dict(code=code, stdout='', failure_kind='guest-agent-unavailable'),
+                      dict(code=0, stdout=base64.b64encode(b'{"memory":4096}').decode())]
+            with patch.object(session, '_exchange', side_effect=frames) as exchange, \
+                 contextlib.redirect_stderr(io.StringIO()):
+                failed = session.run(['pvesh', 'get', '/nodes/pve/qemu/101/agent/get-fsinfo'], 10)
+                self.assertIn('other inventory reads will continue', failed.stderr)
+                result = session.run(['pvesh', 'get', '/nodes/pve/qemu/102/config'], 10)
+                self.assertEqual(json.loads(result.stdout)['memory'], 4096)
+                self.assertEqual(exchange.call_count, 2)
+                self.assertTrue(session.ready)
+
+    def test_ambiguous_and_pbs_failures_close_without_retry(self):
+        commands = [['pvesh', 'get', '/nodes/pve/qemu/101/agent/get-fsinfo'],
+                    ['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug', 'api', 'get', '/version']]
+        for command in commands:
+            for kind in ('', 'unknown'):
+                session = self.session()
+                with patch.object(session, '_exchange', return_value=dict(code=1, stdout='', failure_kind=kind)) as exchange, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    session.run(command, 10)
+                    with self.assertRaisesRegex(inv.ReadError, 'Not Collected.*Connection Unavailable'):
+                        session.run(command, 10)
+                    exchange.assert_called_once()
+
+    def test_guest_exception_cannot_apply_to_pbs_or_signal_exit(self):
+        for command, code in ((['env', 'PROXMOX_DEBUG_API_CODE=0', 'proxmox-backup-debug'], 1),
+                              (['pvesh', 'get', '/nodes/pve/qemu/101/agent/get-fsinfo'], 143)):
+            session = self.session()
+            with patch.object(session, '_exchange', return_value=dict(code=code, stdout='', failure_kind='guest-agent-unavailable')), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                session.run(command, 10)
+            self.assertFalse(session.ready)
+
+    def test_closed_session_does_not_repeat_warning_for_every_read(self):
+        client = MagicMock()
+        client.get.side_effect = [inv.ReadError('original failure'),
+                                 inv.ReadError('Not Collected — Connection Unavailable')]
+        collector = inv.Collector(client)
+        collector.read('/version')
+        _, reason = collector.read('/nodes')
+        self.assertIn('Not Collected', reason)
+        self.assertEqual(len(collector.warnings), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

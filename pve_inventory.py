@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 
 class CronBusy(Exception):
@@ -398,9 +398,10 @@ class SudoFrameDecoder:
 
 # Runs as the SSH account, NOT as root. No helper file is installed. Forking each
 # sudo from this same process preserves both tty- and parent-based timestamps.
-# Only command stdout is captured; sudo/PAM and command stderr stay on the TTY.
+# Only command stdout enters result frames; stderr is forwarded live and briefly
+# checked for an exact, recoverable guest-agent diagnostic, never logged.
 SUDO_SESSION_HELPER = r'''
-use strict; use warnings; use JSON::PP; use MIME::Base64; use Text::ParseWords qw(shellwords); use Socket qw(AF_INET AF_INET6 inet_pton);
+use strict; use warnings; use IO::Select; use JSON::PP; use MIME::Base64; use Text::ParseWords qw(shellwords); use Socket qw(AF_INET AF_INET6 inet_pton);
 $| = 1;
 my $prefix = "\x1ePROXINFO:" . shift(@ARGV) . ":";
 my $pid;
@@ -473,10 +474,14 @@ while (my $line = <STDIN>) {
     my @cmd = @{$r->{command}};
     unshift @cmd, 'sudo', '--' if $< != 0;
     pipe(my $reader, my $writer) or die "Inventory output pipe unavailable\n";
+    pipe(my $errors, my $error_writer) or die "Inventory error pipe unavailable\n";
     $pid = fork();
     defined($pid) or die "Inventory process unavailable\n";
     if ($pid == 0) {
         close $reader;
+        close $errors;
+        open STDERR, '>&', $error_writer or exit 126;
+        close $error_writer;
         open STDOUT, '>&', $writer or exit 126;
         close $writer;
         open STDIN, '<', '/dev/null' or exit 126;
@@ -484,22 +489,43 @@ while (my $line = <STDIN>) {
         exit 127;
     }
     close $writer;
+    close $error_writer;
     alarm(int($r->{deadline}) + 1);
     my $out = '';
-    while (1) {
-        my $count = sysread($reader, my $chunk, 65536);
-        next if !defined($count) && $!{EINTR};
-        defined($count) or die "Inventory output read failed\n";
-        last if !$count;
-        $out .= $chunk;
-        if (length($out) > 32*1024*1024) { stop_child(); }
+    # Forward stderr live, retaining at most one short diagnostic temporarily.
+    # Only an exact guest-agent diagnostic can make a failed read recoverable.
+    # PAM text is never included in a result frame or saved as a transcript.
+    my $diagnostic = '';
+    my $overflow = 0;
+    my $stdout_fd = fileno($reader);
+    my $streams = IO::Select->new($reader, $errors);
+    while ($streams->count) {
+        for my $stream ($streams->can_read) {
+            my $count = sysread($stream, my $chunk, 65536);
+            next if !defined($count) && $!{EINTR};
+            defined($count) or die "Inventory output read failed\n";
+            if (!$count) { $streams->remove($stream); close $stream; next; }
+            if (fileno($stream) == $stdout_fd) {
+                $out .= $chunk;
+                if (length($out) > 32*1024*1024) { stop_child(); }
+            } else {
+                print STDERR $chunk;
+                if (!$overflow && length($diagnostic) + length($chunk) <= 4096) {
+                    $diagnostic .= $chunk;
+                } else { $diagnostic = ''; $overflow = 1; }
+            }
+        }
     }
-    close $reader;
+    my $guest_failure = !$overflow && @{$r->{command}} >= 3 &&
+        $r->{command}[0] eq 'pvesh' && $r->{command}[1] eq 'get' &&
+        $r->{command}[2] =~ m{\A/nodes/[^/]+/qemu/\d+/agent/get-fsinfo\z} &&
+        $diagnostic =~ /\A(?:proxy handler failed: )?(?:No QEMU guest agent configured|QEMU guest agent is not running)\r?\n?\z/;
+    $diagnostic = '';
     waitpid($pid, 0);
     my $status = $?;
     $pid = undef;
     alarm(0);
-    send_frame({event=>'result', id=>$r->{id}, code=>($status & 127 ? 128+($status & 127) : $status >> 8), stdout=>encode_base64($out, '')});
+    send_frame({event=>'result', id=>$r->{id}, code=>($status & 127 ? 128+($status & 127) : $status >> 8), stdout=>encode_base64($out, ''), failure_kind=>($guest_failure ? 'guest-agent-unavailable' : '')});
 }
 '''
 
@@ -583,7 +609,7 @@ class InteractiveSudoSession:
 
     def run(self, command, timeout):
         if not self.ready:
-            raise ReadError('Interactive sudo session unavailable; reconnect to continue')
+            raise ReadError('Not Collected — Connection Unavailable; the interactive sudo session closed after an earlier failure. Reconnect to continue')
         try:
             print(f'Sudo read on {self.client.host}: enter a fresh password/MFA response only if prompted.', file=sys.stderr)
             # PAM plugins do not expose a portable authentication-complete event.
@@ -594,12 +620,17 @@ class InteractiveSudoSession:
             if not isinstance(code, int) or not isinstance(frame.get('stdout'), str):
                 raise ReadError('Interactive sudo returned an invalid result')
             output = base64.b64decode(frame['stdout'], validate=True).decode('utf-8', errors='replace')
-            if code != 0:
-                # PAM and command errors intentionally share only the human TTY.
-                # Stop this session rather than risk repeated MFA attempts.
+            guest_failure = (code in (1, 255) and frame.get('failure_kind') == 'guest-agent-unavailable'
+                             and len(command) >= 3 and command[:2] == ['pvesh', 'get']
+                             and re.fullmatch(r'/nodes/[^/]+/qemu/\d+/agent/get-fsinfo', command[2]))
+            if code != 0 and not guest_failure:
+                # Unclassified failures may be sudo/PAM failures: never retry them.
                 self.close()
-            return subprocess.CompletedProcess(command, code, output,
-                '' if code == 0 else 'Sudo or the approved read failed (exit ' + str(code) + '); this session was closed. See the terminal message. Credentials were not retried.')
+            error = ('' if code == 0 else
+                     'QEMU guest agent is not configured or not running; other inventory reads will continue'
+                     if guest_failure else
+                     'Sudo or the approved read failed (exit ' + str(code) + '); this session was closed. See the terminal message. Credentials were not retried.')
+            return subprocess.CompletedProcess(command, code, output, error)
         except BaseException:
             self.close()
             raise
@@ -1060,7 +1091,8 @@ class PBSCollector:
             state = ("permission denied" if "403" in detail else "authentication failed" if "401" in detail else
                      "unsupported or unavailable endpoint" if "404" in detail else "timed out" if "timed out" in detail or "timeout" in detail.lower() else "unavailable")
             self.checks.append(dict(path=path, status=state))
-            self.warnings.append(f"GET {path}: {exc}")
+            if "Not Collected — Connection Unavailable" not in detail:
+                self.warnings.append(f"GET {path}: {exc}")
             return None
 
     def collect(self):
@@ -1544,7 +1576,8 @@ class Collector:
             return self.client.get(path, **params), None
         except ReadError as exc:
             message = f"GET {path}: {exc}"
-            self.warnings.append(message)
+            if "Not Collected — Connection Unavailable" not in str(exc):
+                self.warnings.append(message)
             return None, message
 
     def storage_read(self, operation, context):
@@ -1652,11 +1685,19 @@ class Collector:
                               backup_disk=(enabled(options.get("backup", 1)) if not excluded else None)))
         return sorted(disks, key=lambda item: item["slot"])
 
-    def filesystems(self, path, status):
+    def filesystems(self, path, status, config=None):
         if not self.guest_agent:
             return [], "N/A: guest-agent collection disabled with --no-guest-agent"
         if status != "running":
             return [], "N/A: VM is not confirmed running; guest agent was not queried"
+        if config is None:
+            return [], "N/A: VM configuration unavailable; guest-agent setting could not be checked"
+        agent = str(config.get("agent", "0")).strip()
+        parts = [part.strip() for part in agent.split(",")]
+        options = dict(part.split("=", 1) for part in parts if "=" in part)
+        setting = options.get("enabled", parts[0] if "=" not in parts[0] else "0")
+        if setting.strip().lower() not in ("1", "true", "yes", "on"):
+            return [], "N/A: QEMU guest agent is not confirmed enabled in the VM configuration; guest filesystems were not queried"
         data, err = self.read(path + "/agent/get-fsinfo")
         if err:
             return [], "N/A: guest agent unavailable, unsupported or inaccessible; " + err
@@ -1743,7 +1784,7 @@ class Collector:
                 notes.append("N/A actual total: disks have different allocation metric meanings")
             if any(d["counted"] and d["backup_disk"] is False for d in disks):
                 notes.append("One or more attached disks have backup=0; VM job membership does not imply disk coverage")
-            fs, fs_reason = self.filesystems(path, status.get("status"))
+            fs, fs_reason = self.filesystems(path, status.get("status"), config if config_ok else None)
             match, disabled, unknown = [], [], bool(jobs_err)
             for job in jobs or []:
                 members = job_members[str(job["id"])]

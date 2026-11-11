@@ -172,6 +172,35 @@ class SudoPTYIntegrationTests(unittest.TestCase):
     def command(self, marker='inventory'):
         return ['pvesh', 'get', '/cluster/resources' if marker == 'second' else '/version', '--output-format', 'json']
 
+    def test_guest_errors_are_classified_without_closing_transport(self):
+        diagnostics = [
+            ('proxy handler failed: No QEMU guest agent configured\n', True),
+            ('QEMU guest agent is not running\n', True),
+            ('proxy handler failed: QEMU guest agent is not running\n', True),
+            ('sudo: authentication failure\n', False),
+            ('sudo: authentication failure\nNo QEMU guest agent configured\n', False),
+            ('No QEMU guest agent configured extra text\n', False),
+            ('x' * 5000, False),
+        ]
+        with tempfile.TemporaryDirectory() as directory, LocalHelper(directory, cache=True) as helper:
+            helper.query(self.command(), [(b'Password,Okta token: ', b'password,123456')])
+            for diagnostic, expected in diagnostics:
+                script = ("#!/usr/bin/env python3\nimport sys\n"
+                          "if sys.argv[2].endswith('/agent/get-fsinfo'):\n"
+                          " sys.stderr.write(" + repr(diagnostic) + "); sys.exit(255)\n"
+                          "print('{}')\n")
+                (Path(directory) / 'pvesh').write_bytes(script.encode())
+                result, output, terminal = helper.query(['pvesh', 'get', '/nodes/pve/qemu/101/agent/get-fsinfo', '--output-format', 'json'])
+                self.assertEqual(result['failure_kind'], 'guest-agent-unavailable' if expected else '')
+                self.assertEqual(output, b'')
+                self.assertIn(diagnostic.encode(), terminal)
+                self.assertNotIn(diagnostic, json.dumps(result))
+                # Python decides whether to stop on ambiguous errors. The remote
+                # dispatcher itself stays usable after a completed child command.
+                later, output, _ = helper.query(self.command('second'))
+                self.assertEqual(later['code'], 0)
+                self.assertEqual(json.loads(output), {})
+
     def test_cached_authentication_reuses_same_helper_parent(self):
         with tempfile.TemporaryDirectory() as directory, LocalHelper(directory, cache=True) as helper:
             first, output, terminal = helper.query(self.command(), [(b'Password,Okta token: ', b'password,123456')])
