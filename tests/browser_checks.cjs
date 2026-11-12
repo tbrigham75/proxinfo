@@ -77,6 +77,17 @@ assert.equal(result.status,0,result.stderr);const content=JSON.parse(result.stdo
   assert.ok((await page.locator('#backup-scenario-total').textContent()).includes('150.00 GiB'));
   await page.selectOption('#global-node-filter','');
   await page.locator('#selected-backup-table th button').first().click();
+  await page.locator('#include-backup-scenario').check();
+  const reportPopupPromise=page.waitForEvent('popup');
+  await page.getByRole('button',{name:'Export Backup Capacity Report',exact:true}).click();
+  const pdfReport=await reportPopupPromise;
+  assert.ok((await pdfReport.locator('body').textContent()).includes('Backup Capacity Report'));
+  assert.equal(await pdfReport.locator('#pdf-scenario').isVisible(),true);
+  assert.equal(await pdfReport.locator('#pdf-appendix').isVisible(),false);
+  await pdfReport.getByLabel('Include Selected VM Appendix').check();
+  assert.equal(await pdfReport.locator('#pdf-appendix').isVisible(),true);
+  for(const format of ['Letter','A4'])assert.ok((await pdfReport.pdf({format})).length>1000);
+  await pdfReport.close();
   const popupPromise=page.waitForEvent('popup');
   await page.getByRole('button',{name:'Print Scenario',exact:true}).click();
   const popup=await popupPromise;

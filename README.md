@@ -1244,3 +1244,23 @@ Cron retains its existing explicit live-PBS settings and does not prompt. Add
 opts into reuse from that completed report. Use a stable output root across runs.
 Old readings are not evidence of today's free space or successful protection.
 No new dependencies or server permissions are required.
+
+
+### Backup Capacity Report PDF
+
+On **Capacity Planning**, click **Export Backup Capacity Report**. A printable
+report opens in a new tab. Choose **Print / Save As PDF**, then select your
+browser's PDF destination. No PDF package or server-side browser is required.
+The same baseline report is saved as `backup-capacity-report.html` and linked
+under Downloads.
+
+It includes selected workload totals, a top-ten chart, PBS location/capacity,
+retention and cleanup evidence, and supported planning statements. Historical
+PBS evidence is prominently dated. Unknown physical requirements remain unknown.
+The layout flows across pages; it is not forced into a fixed page count.
+
+Check **Include Current Management Scenario** before exporting to include your
+current comparison, explicitly labeled as leaving production jobs unchanged.
+Scenarios are excluded by default. In the printable report, enable **Include
+Selected VM Appendix** if the full selected-VM table is needed. Print settings
+support Letter and A4. Allow the report popup if your browser blocks it.
