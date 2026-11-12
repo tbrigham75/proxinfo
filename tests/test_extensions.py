@@ -112,8 +112,8 @@ class PBSReportingTests(unittest.TestCase):
             ask.assert_not_called()
         args.no_prompt = False
         with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='') as ask, patch('pve_inventory.getpass.getpass') as secret:
-            self.assertIsNone(inv.pbs_settings(args, {}))
-            self.assertIn('[skip]', ask.call_args.args[0])
+            self.assertIsNotNone(inv.pbs_settings(args, {}))
+            self.assertIn('[include]', ask.call_args_list[0].args[0])
             secret.assert_not_called()
 
     def test_skip_flag_never_asks_for_credentials(self):

@@ -10,3 +10,7 @@ config.*.json
 
 pbs-history.sqlite3*
 .proxinfo/
+
+# Generated report root and landing page
+reports/
+/index.html

@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 
 
 class CronBusy(Exception):
@@ -1046,7 +1046,7 @@ def pbs_settings(args, config):
     if requested is None:
         requested = False
         if interactive:
-            requested = prompt_choice("Optional PBS backup-server report", ("include", "skip"), "skip") == "include"
+            requested = prompt_choice("PBS backup-server report (skip reuses compatible previous data)", ("include", "skip"), "include") == "include"
     if not requested:
         return None
     values = dict(url=args.pbs_url or setting("url"), token_id=setting("token_id"),
@@ -2766,7 +2766,7 @@ REPORT_HELP = {
     "units": ("Storage and memory units", "GiB and TiB are measures of size: 1 GiB is 1,024 MiB, and 1 TiB is 1,024 GiB. Storage vendors often use decimal GB and TB instead. A drive sold as 2 TB is about 1.82 TiB before filesystem overhead. All human-readable sizes in this report use binary units consistently. CSV fields ending in _bytes contain the original byte counts."),
     "retention": ("How many backups are kept", "Retention rules decide which older backups should remain. A job can have its own rules or use settings from its storage destination. Several rules can apply together; their counts should not simply be added. Rules for days, weeks or months use periods that contain backups. A job's listed rules do not establish the effective PBS policy, and this report does not confirm that cleanup ran."),
     "schedule": ("Backup schedules", "The schedule is when PVE intends to start a backup job. It does not show when a backup last succeeded. Simple daily times are shown directly. Custom schedules may use Proxmox calendar notation, such as mon..fri 02:00 for weekday mornings at 02:00. Times follow the PVE schedule's time zone, not necessarily your browser's local time. Ask IT to confirm complex schedules."),
-    "pbs": ("What this report says about backup storage", "Proxmox Backup Server (PBS) stores backups separately from the running VMs. It can compress data and share identical pieces across VMs and backup versions, so adding VM disk sizes does not tell you how much PBS space they use. PBS reporting is optional and off by default. When enabled, its page shows filesystem capacity, visible backup groups and saved versions, retention settings, and recent cleanup results. Filesystem usage may include other data. Logical snapshot sizes are not unique space assigned to an individual VM."),
+    "pbs": ("What this report says about backup storage", "Proxmox Backup Server (PBS) stores backups separately from the running VMs. It can compress data and share identical pieces across VMs and backup versions, so adding VM disk sizes does not tell you how much PBS space they use. Manual PBS setup defaults to Include. Skipping live PBS can reuse clearly dated historical data. When enabled, its page shows filesystem capacity, visible backup groups and saved versions, retention settings, and recent cleanup results. Filesystem usage may include other data. Logical snapshot sizes are not unique space assigned to an individual VM."),
 }
 
 
@@ -3014,7 +3014,7 @@ def pbs_page_html(report):
     status = pbs.get("status", "not requested")
     intro = '<p class="eyebrow">Separate backup server</p><h2 tabindex="-1">PBS Backup Storage</h2>'
     if not pbs.get("requested"):
-        return intro + '<section class="panel"><h2>PBS reporting was skipped</h2><p>It is off by default. Choose include at the optional PBS prompt or add <code>--pbs</code> next time to collect backup-server information. No PBS credentials are needed when skipped.</p><p>This report still includes the PVE inventory and review findings. PBS capacity and cleanup results are unavailable.</p></section>'
+        return intro + '<section class="panel"><h2>PBS reporting was skipped</h2><p>Choose include at the optional PBS prompt or add <code>--pbs</code> next time to collect backup-server information. No PBS credentials are needed when skipped.</p><p>This report still includes the PVE inventory and review findings. PBS capacity and cleanup results are unavailable.</p></section>'
     out = [intro, '<p>PBS server: ' + esc(pbs.get('server')) + '</p>', '<p class="page-intro">Collection status: <strong>' + esc(status) + '</strong>. Capacity comes from PBS itself, not from adding VM disk sizes. ' + report_help_link("pbs", "Explain backup storage") + '</p>']
     for store in pbs.get("datastores", []):
         total, used = store["total_bytes"], store["used_bytes"]
@@ -3679,6 +3679,86 @@ def run_description(report):
     return ("PBS ONLY; PVE inventory not requested" if scope.get("pbs_only") else "SELECTED VMS ONLY — " + json.dumps(scope) if scope.get("targeted") else "All visible VMs") + " | " + json.dumps(run, ensure_ascii=False)
 
 
+def saved_pbs_fallback(report, root, expected=None, source=None, stores=None, namespaces=None):
+    """Reuse structured evidence conservatively, retaining its original timestamp."""
+    if report['pbs'].get('datastores'):
+        return
+    candidates = []
+    paths = [source / 'inventory.json' if source.is_dir() else source] if source else root.glob('*/inventory.json')
+    for path in paths:
+        try:
+            if not (path.parent / 'report-complete.json').is_file():
+                continue
+            old = json.loads(path.read_text(encoding='utf-8'))
+            pbs = old['pbs']
+            stamp = pbs.get('provenance', {}).get('collected_at') or old['generated_at']
+            observed = datetime.fromisoformat(stamp)
+            if observed.tzinfo is None or observed > datetime.now(timezone.utc):
+                continue
+            server = pbs.get('server')
+            if not server or not isinstance(pbs.get('datastores'), list) or not pbs['datastores']:
+                continue
+            if expected and server != expected:
+                continue
+            if old.get('report_schema', 1) != 1:
+                continue
+            if namespaces and not set(n.strip('/') for n in namespaces).issubset({n for d in pbs['datastores'] for n in d.get('namespaces', [])}):
+                continue
+            if stores and not set(stores).issubset({d['store'] for d in pbs['datastores']}):
+                continue
+            if not all(isinstance(pbs.get(k), list) for k in ('groups', 'snapshots', 'warnings')):
+                continue
+            # Validate legacy evidence against existing render/export contracts before accepting it.
+            pbs_page_html(old)
+            build_capacity_plan(old)
+            candidates.append((observed, path, old, stamp))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    if len({c[2]['pbs']['server'] for c in candidates}) > 1:
+        report['warnings'].append('Previous PBS data was not reused: multiple servers are possible. Select --pbs-previous-report.')
+        return
+    if not candidates:
+        report['warnings'].append('No compatible completed previous PBS collection was found.')
+        return
+    _, path, old, stamp = max(candidates, key=lambda c: c[0])
+    reason = 'Live PBS collection failed' if report['pbs'].get('requested') else 'Live PBS collection was skipped'
+    pbs = old['pbs']
+    pbs['provenance'] = dict(kind='historical', collected_at=stamp, source_report=pbs.get('provenance', {}).get('source_report') or str(path.parent), reason=reason)
+    pbs['status'] = 'historical'
+    report['pbs'] = pbs
+    pbs['warnings'].append(pbs_history_notice(report))
+    report['warnings'].append(pbs_history_notice(report))
+
+
+def pbs_history_notice(report):
+    source = report.get('pbs', {}).get('provenance', {})
+    if source.get('kind') != 'historical':
+        return ''
+    age = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(source['collected_at'])).days)
+    return 'Previous PBS Data - Collected ' + source['collected_at'] + ' (' + str(age) + ' days ago). ' + source['reason'] + '. All PBS capacity, backup and cleanup readings below are historical, not current.'
+
+
+def update_report_index(root):
+    entries = []
+    for path in root.glob('*/inventory.json'):
+        try:
+            if not (path.parent / 'report-complete.json').is_file():
+                continue
+            report = json.loads(path.read_text(encoding='utf-8'))
+            stamp = report['generated_at']
+            entries.append((stamp, path.parent.name, report.get('pbs', {}).get('status', 'unavailable')))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    entries.sort(reverse=True)
+    def link(entry, label):
+        return '<a href="' + parse.quote(entry[1] + '/inventory.html', safe='/') + '">' + html.escape(label) + '</a>'
+    body = '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>ProxInfo Reports</title><body><h1>ProxInfo Reports</h1>'
+    if entries:
+        body += '<p>' + link(entries[0], 'Open Latest Report') + '</p>'
+    body += '<h2>Report History</h2><ul>' + ''.join('<li>' + link(e, e[0]) + ' - PBS: ' + html.escape(e[2]) + '</li>' for e in entries) + '</ul></body></html>'
+    atomic_text(root / 'index.html', body)
+
+
 def export_report(report, directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -3688,6 +3768,13 @@ def export_report(report, directory):
                   [dict(setting=k, value=v) for k,v in dict(report.get("run", {}), scope=report.get("scope", {})).items()])
         # Once replacement starts, an old marker must not certify mixed-run files.
         (directory / "report-complete.json").unlink(missing_ok=True)
+        notice = pbs_history_notice(report)
+        if notice:
+            for page in Path(staging).glob('*.html'):
+                markup = page.read_text(encoding='utf-8')
+                markup = markup.replace('<body>', '<body><aside role="note" style="padding:1rem;border:3px solid #c98a00">' + html.escape(notice) + '</aside>', 1)
+                markup = markup.replace('Available now', 'Last Observed Available Space').replace('Current capacity', 'Last Observed Capacity')
+                page.write_text(markup, encoding='utf-8')
         for path in Path(staging).iterdir():
             path.replace(directory / path.name)
     marker = directory / '.report-complete.tmp'
@@ -3698,13 +3785,14 @@ def export_report(report, directory):
 
 def _export_report(report, directory):
     directory.mkdir(parents=True, exist_ok=True)
+    write_csv(directory / 'pbs_provenance.csv', ['kind','collected_at','source_report','reason'], [report.get('pbs', {}).get('provenance', dict(kind='live or unavailable', collected_at=report.get('generated_at')))])
     write_csv(directory / 'hosts.csv', ['node','address','status','details','storage'], report.get('hosts', []))
     write_csv(directory / 'changes.csv', ['vmid','change','previous','current'], report.get('changes', {}).get('items', []))
     workload = report.get('selected_backup_workload') or selected_backup_workload(report)
     write_csv(directory / 'selected_backup_vms.csv', ['vmid','name','node','jobs','destinations','configured_bytes','known_configured_bytes','complete','coverage','backup_evidence','excluded_disks'], workload['vms'])
     write_csv(directory / 'selected_backup_totals.csv', ['destination','vm_count','known_configured_bytes','complete'], [dict(destination='Overall unique selection', vm_count=workload['vm_count'], known_configured_bytes=workload['known_configured_bytes'], complete=workload['complete'])] + workload['destinations'])
     write_csv(directory / 'selected_backup_requirements.csv', ['component','required_bytes','reason'], workload['requirements'])
-    terminal = terminal_report(report) + '\nSELECTED BACKUP WORKLOAD: ' + str(len(workload['vms'])) + ' VMs; known included capacity ' + human(workload['known_configured_bytes']) + '; ' + workload['estimate_status']
+    terminal = pbs_history_notice(report) + '\n' + terminal_report(report) + '\nSELECTED BACKUP WORKLOAD: ' + str(len(workload['vms'])) + ' VMs; known included capacity ' + human(workload['known_configured_bytes']) + '; ' + workload['estimate_status']
     if report.get('capacity_plan'):
         terminal += '\n\n' + capacity_terminal_text(report)
     (directory / "inventory.txt").write_text(terminal, encoding="utf-8")
@@ -3712,7 +3800,7 @@ def _export_report(report, directory):
     (directory / "management-summary.html").write_text(management_summary_html(report), encoding="utf-8")
     (directory / 'capacity-plan.html').write_text('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ProxInfo Capacity Planning</title><style>' + HTML_STYLE + '</style></head><body><main class="shell"><div class="print-toolbar"><button class="button" onclick="window.print()">Print / Save As PDF</button> <a href="inventory.html#capacity">Open Full Report</a></div>' + capacity_page_html(report) + '</main></body></html>', encoding='utf-8')
     plan = report.get('capacity_plan') or {}
-    justification = ['ProxInfo Storage Expansion Planning', 'Collected: ' + str(report.get('generated_at')),
+    justification = ['ProxInfo Storage Expansion Planning', pbs_history_notice(report), 'Collected: ' + str(report.get('generated_at')),
                      'Reserve target: ' + str(plan.get('reserve_percent', 20)) + '% (planning assumption).']
     for store in plan.get('stores', []):
         justification.extend(['', store['management_text'], 'Confidence: ' + store['confidence']])
@@ -3873,6 +3961,10 @@ def main(argv=None):
     pbs_flags = parser.add_mutually_exclusive_group()
     pbs_flags.add_argument("--pbs", dest="pbs", action="store_true", default=None, help="Include read-only PBS API reporting")
     pbs_flags.add_argument("--no-pbs", dest="pbs", action="store_false", help="Skip PBS without asking")
+    reuse = parser.add_mutually_exclusive_group()
+    reuse.add_argument('--reuse-pbs', dest='reuse_pbs', action='store_true', default=None, help='Reuse saved PBS data if live PBS is skipped or fails')
+    reuse.add_argument('--no-reuse-pbs', dest='reuse_pbs', action='store_false', help='Disable saved PBS fallback')
+    parser.add_argument('--pbs-previous-report', type=Path, help='Specific completed report directory or inventory.json for PBS fallback')
     parser.add_argument("--pbs-only", action="store_true", help="Collect PBS without any PVE connection")
     parser.add_argument("--pbs-namespace", action="append", help="Exact namespace; / means root; repeat as needed")
     parser.add_argument("--pbs-timeout", type=float, default=60)
@@ -4067,7 +4159,10 @@ def main(argv=None):
             report['summary'] = {key: 'N/A (PVE inventory not requested)' for key in report['summary']}
             for total in report['storage_totals']:
                 total['total_bytes'] = total['known_subtotal_bytes'] = None
-        if args.pbs_history and report['pbs'].get('datastores') and pbs_config and pbs_config.get('url'):
+        if (args.reuse_pbs if args.reuse_pbs is not None else not args.cron) or args.pbs_previous_report:
+            expected = report['pbs'].get('server') or parse.urlparse(args.pbs_url or os.environ.get('PBS_URL', config.get('pbs_url', ''))).hostname or args.pbs_ssh_host or os.environ.get('PBS_SSH_HOST', config.get('pbs_ssh_host'))
+            saved_pbs_fallback(report, args.output_root or args.output_dir.parent, expected, args.pbs_previous_report, args.pbs_store, args.pbs_namespace)
+        if args.pbs_history and not pbs_history_notice(report) and report['pbs'].get('datastores') and pbs_config and pbs_config.get('url'):
             try:
                 history_root = args.pbs_history_dir or args.output_root or (args.output_dir.parent / '.proxinfo')
                 pbs_history(report, history_root, pbs_config['url'].rstrip('/'))
@@ -4075,10 +4170,20 @@ def main(argv=None):
             except (OSError, sqlite3.Error) as exc:
                 report['pbs']['warnings'].append('Local capacity history unavailable: ' + str(exc))
                 report['run']['status'] = 'finished with history unavailable'
-        if not tracker.cancelled and not tracker.expired:
+        if not tracker.cancelled and not tracker.expired and not pbs_history_notice(report):
             if (pbs_config or {}).get('auth') != 'ssh':
                 pbs_location_details(report, config, args, tracker)
+        report['report_schema'] = 1
         report['capacity_plan'] = build_capacity_plan(report, args.pbs_reserve_percent, growth_overrides)
+        if pbs_history_notice(report):
+            for item in report['capacity_plan']['stores']:
+                item['projections'] = []
+                item['immediate_required_total_bytes'] = item['immediate_additional_bytes'] = None
+                item['confidence'] = 'Historical evidence only; fresh capacity measurements required'
+                item['days_until_full'] = item['days_until_reserve'] = None
+                item['management_text'] = pbs_history_notice(report) + ' Current expansion requirements are unavailable without fresh readings.'
+                item['basis'] = 'Historical capacity only; current forecast withheld'
+            report['capacity_plan']['notes'].append(pbs_history_notice(report))
         report['capacity_plan']['jobs'] = capacity_job_scope(report)
         report['selected_backup_workload'] = selected_backup_workload(report)
         report['capacity_plan']['history_enabled'] = args.pbs_history
@@ -4092,6 +4197,10 @@ def main(argv=None):
                 raise ValueError('Restore-test file must be a JSON list of records')
             report['restore_tests'] = [{k:r.get(k) for k in ('server','datastore','source','date','result','notes')} for r in records]
         print(export_report(report, args.output_dir))
+        try:
+            update_report_index(args.output_root or args.output_dir.parent)
+        except OSError as exc:
+            print('Report saved; index.html could not be updated: ' + str(exc), file=sys.stderr)
         if args.diagnostics is not None:
             secrets = diagnostic_secrets(config)
             for name, value in os.environ.items():
@@ -4117,7 +4226,6 @@ def main(argv=None):
         if args.cron:
             cron_status = ("cancelled" if tracker.cancelled else "incomplete" if incomplete or report['pbs'].get('warnings') else "complete")
             target = parse.quote(args.output_dir.name + "/inventory.html", safe="/")
-            atomic_text(args.output_root / "latest.html", '<!doctype html><meta charset="utf-8"><title>Latest ProxInfo report</title><p>Latest exported report: ' + html.escape(cron_status) + ' | ' + html.escape(report['generated_at']) + '</p><a href="' + target + '">Open report</a><p>Check last-run.json for the latest attempt, which may have failed after this export.</p>')
         return 130 if tracker.cancelled else 3 if args.cron and cron_status == "incomplete" else 0
     except CronBusy as exc:
         print(str(exc), file=sys.stderr)

@@ -26,15 +26,15 @@ class CronTests(unittest.TestCase):
                 report=json.loads((folder/'inventory.json').read_text(encoding='utf-8'))
                 self.assertFalse(report['pbs']['requested'])
             self.assertEqual(json.loads((root/'last-run.json').read_text())['status'],'complete')
-            self.assertTrue((root/'latest.html').exists())
+            self.assertTrue((root/'index.html').exists())
 
     def test_partial_and_failed_status_leave_last_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)
             self.assertEqual(self.run_cron(root,FakeClient({'/nodes/a/qemu/100/config':inv.ReadError('denied')})),3)
-            old=(root/'latest.html').read_text()
+            old=(root/'index.html').read_text()
             self.assertEqual(self.run_cron(root,FakeClient({'/cluster/resources':inv.ReadError('unreachable')})),1)
-            self.assertEqual((root/'latest.html').read_text(),old)
+            self.assertEqual((root/'index.html').read_text(),old)
             self.assertEqual(json.loads((root/'last-run.json').read_text())['status'],'failed')
 
     def test_overlap_does_not_replace_active_status(self):

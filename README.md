@@ -123,7 +123,7 @@ Use reports from the same environment. Selection scope and node membership must 
 
 ### PBS additions
 
-PBS remains off by default. Enable it with the existing `--pbs` options. Its page now has Overview, Backups, Activity, Retention & cleanup, and Evidence controls. Configured datastore folders and the configured PBS server are shown. Backup task outcomes/durations and the latest confirmed successful task in checked history are separate from snapshot freshness; they do not establish every VM's backup success. Sync-job visibility uses GET `/admin/sync`; applicable datastore audit and remote audit visibility are required, depending on server version and job direction. Missing access remains unavailable; no job is started.
+Manual PBS setup defaults to Include; unattended runs still require explicit live-PBS configuration. Enable it with the existing `--pbs` options. Its page now has Overview, Backups, Activity, Retention & cleanup, and Evidence controls. Configured datastore folders and the configured PBS server are shown. Backup task outcomes/durations and the latest confirmed successful task in checked history are separate from snapshot freshness; they do not establish every VM's backup success. Sync-job visibility uses GET `/admin/sync`; applicable datastore audit and remote audit visibility are required, depending on server version and job direction. Missing access remains unavailable; no job is started.
 
 Retention review candidates expose protected snapshots and groups without a visible applicable PBS prune policy. Other retention mechanisms may apply. These are review prompts, not deletion advice or recoverable-byte estimates. Backup coverage is displayed as a table while retaining ownership uncertainty. CSV/JSON preserve the collected detail, with the added task and sync metadata in JSON.
 
@@ -151,7 +151,7 @@ Supply it using `--restore-tests ./restore-tests.json`. These are explicitly lab
 
 Validate new host and PBS readings against your own web consoles before relying on scheduled output. Automated tests simulate endpoints and cannot establish visibility or correctness on your live servers.
 
-Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. Optional PBS reporting is **off by default**. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
+Read-only Python inventory that runs on **WSL or Ubuntu and connects to PVE over SSH**, or runs directly on PVE. Manual PBS reporting defaults to **Include**; skipping it enables compatible historical fallback. No third-party Python dependencies. Cluster mode inventories all visible QEMU VMs and templates. LXC containers are outside this VM inventory; SSH/API/pvesh mode counts visible containers, while regular CLI mode reports that count as N/A.
 
 ## Recommended: run from WSL or Ubuntu over SSH
 
@@ -205,7 +205,7 @@ Choose **`password`** to sign in with the account password you normally use for 
 
 To use a token instead, select **`api`** at the first question. The script asks for the PVE API host, **API Token ID** (such as `inventory@pve!report`), **API Token Secret** (the Value shown when you created the token), and an optional trusted CA certificate file. Paste the secret at the hidden-input prompt. The token secret is not your account password or the token's name. It is not written into the reports. If your server uses the private PVE CA, provide a trusted copy of its CA PEM file; certificate verification remains enabled. See the API permissions section below.
 
-PBS backup-server reporting is optional and **off by default**. At `Optional PBS backup-server report (include/skip) [skip]`, press Enter to skip it. Only selecting `include` asks for PBS connection details. `--no-pbs` skips this question too. PVE inventory and all PVE review/summary exports still work when PBS is skipped or unreachable.
+PBS setup defaults to Include. Choose skip or use `--no-pbs` to skip the live connection and reuse compatible previous PBS data. Add `--no-reuse-pbs` to prevent fallback. PVE reporting works without a live PBS connection.
 
 On a first connection, SSH may ask you to confirm the host fingerprint. Verify it against the PVE server before accepting. Existing host keys remain checked. WSL uses its own SSH configuration and keys unless you have explicitly configured access to Windows keys.
 
@@ -617,7 +617,7 @@ Additional exports:
 
 When PBS is skipped, PBS CSV files contain headers only and the report explicitly says PBS was not requested. The complete structured data, including collection status and warnings, is in `inventory.json`.
 
-## Optional PBS reporting — off by default
+## Optional PBS reporting
 
 Choose `include` at the optional prompt or enable it explicitly:
 
@@ -774,7 +774,7 @@ API behavior was checked against upstream Proxmox sources. Your installed versio
 
 ## Guided setup and report navigation
 
-Run `python3 pve_inventory.py` for guided setup. Choose the connection method by name or number. Supplying `--mode ssh` selects SSH and skips that menu; the script now explains this. SSH asks password/key authentication before the host and login details. The flag is `--mode ssh`, not `--ssh`. PBS remains off by default.
+Run `python3 pve_inventory.py` for guided setup. Choose the connection method by name or number. Supplying `--mode ssh` selects SSH and skips that menu; the script now explains this. SSH asks password/key authentication before the host and login details. The flag is `--mode ssh`, not `--ssh`. Manual PBS setup defaults to Include; unattended runs still require explicit live-PBS configuration.
 
 The PVE node dropdown combines with any search and usage filter. The count line lists active filters. **Show all VMs / Clear filters** restores the full list. **Find VM** clears filters and highlights the exact VM without hiding other machines. Click **PVE node** to sort naturally in either direction.
 
@@ -964,9 +964,9 @@ To change the schedule, edit the entry with `crontab -e`. To disable it, put `#`
 
 Each launch creates a unique `pve-report-DATE-TIME-ID` directory beneath `/var/lib/proxinfo/reports`. Each run contains the HTML, CSVs, JSON, print summary, and logs.
 
-- `latest.html` links to the latest fully **exported** report, which may have incomplete measurements; its status and collection date are shown.
+- `index.html` links to the latest fully **exported** report, which may have incomplete measurements; its status and collection date are shown.
 - `last-run.json` describes the latest acquired run: `running`, `complete`, `incomplete`, `failed`, or `cancelled`.
-- A failed launch leaves the previous `latest.html` unchanged. Check `last-run.json` and timestamps before treating that link as current.
+- A failed launch leaves the previous `index.html` unchanged. Check `last-run.json` and timestamps before treating that link as current.
 - `collection.log` captures startup and collection milestones. Authentication and other startup errors are also captured in `/var/log/proxinfo/cron.log` by the cron redirection.
 - `report-complete.json` inside a run confirms export completion, not complete measurement coverage.
 
@@ -976,7 +976,7 @@ To retrieve a report, run this **from WSL/Ubuntu**, replacing the example folder
 scp -r root@pve01:/var/lib/proxinfo/reports/pve-report-DATE-TIME-ID ./
 ```
 
-Open that folder's `inventory.html` locally. Keep its `management-summary.html` beside it. Copying just the root `latest.html` without its target run folder will not preserve the link.
+Open that folder's `inventory.html` locally. Keep its `management-summary.html` beside it. Copying just the root `index.html` without its target run folder will not preserve the link.
 
 ### Scheduled outcomes and overlap protection
 
@@ -1003,7 +1003,7 @@ PBS remains off by default even if credentials are saved. To include it, replace
 
 ## PBS investigation tools (1.3)
 
-PBS is still optional and off by default. PBS-only mode connects **only to PBS**, using the selected PBS authentication method. It needs no PVE connection or PVE API credentials. Manual runs support PBS SSH, a web-account password, or an API token:
+PBS is optional and defaults to Include in manual setup. PBS-only mode connects **only to PBS**, using the selected PBS authentication method. It needs no PVE connection or PVE API credentials. Manual runs support PBS SSH, a web-account password, or an API token:
 
 ```sh
 python3 pve_inventory.py --pbs-only --pbs-store backups
@@ -1028,7 +1028,7 @@ A planned nightly entry can use this actual command (absolute paths required for
 /usr/bin/python3 /opt/proxinfo/pve_inventory.py --cron --pbs-only --config /etc/proxinfo/scheduled.json --output-root /var/lib/proxinfo/pbs-reports --pbs-history --max-runtime 1800
 ```
 
-Use the same cron setup procedure as the PVE section. Omit `--mode` for PBS-only runs. `latest.html`, logs, locking, and cron exit codes work as for other scheduled runs. Manual prompting is unchanged.
+Use the same cron setup procedure as the PVE section. Omit `--mode` for PBS-only runs. `index.html`, logs, locking, and cron exit codes work as for other scheduled runs. Manual prompting is unchanged.
 
 ### Connection checks, capacity and cleanup
 
@@ -1212,3 +1212,35 @@ Normal collection also includes this data in `inventory.json`. Reports and CSVs
 may contain infrastructure names and backup details; share them appropriately.
 Windows fixture and native browser tests do not establish compatibility with your
 live PVE/PBS permissions or SSH/Okta flow. Live testing remains your next step.
+
+
+### Report landing page and previous PBS data (1.8.0)
+
+Open `index.html` in the report root for the latest completed report and dated
+history. Copy the entire root to a webserver to preserve relative links. The
+landing page updates atomically only after report export succeeds. No reports
+are automatically deleted.
+
+Manual PBS setup now defaults to Include, with SSH as the default connection
+method. Skipping PBS or failing to connect automatically reuses the newest
+compatible completed collection in the report root. Multiple possible servers
+are not silently resolved. Partial live results are kept without field mixing.
+Historical PBS information is prominently dated in HTML/print and terminal
+output, with provenance in JSON and `pbs_provenance.csv`. Historical warnings
+also appear in PBS warnings exports. Current PVE selections remain current;
+historical PBS readings do not create new history samples or current forecasts.
+
+Examples:
+
+```bash
+python3 pve_inventory.py --output-root ./reports
+python3 pve_inventory.py --no-pbs --output-root ./reports
+python3 pve_inventory.py --no-pbs --no-reuse-pbs --output-root ./reports
+python3 pve_inventory.py --no-pbs --pbs-previous-report ./reports/OLDER-RUN --output-root ./reports
+```
+
+Cron retains its existing explicit live-PBS settings and does not prompt. Add
+`--reuse-pbs` to opt into historical fallback. `--pbs-previous-report` explicitly
+opts into reuse from that completed report. Use a stable output root across runs.
+Old readings are not evidence of today's free space or successful protection.
+No new dependencies or server permissions are required.
