@@ -191,7 +191,7 @@ class ReviewBreakdownAndSummaryTests(unittest.TestCase):
     def test_review_findings_have_evidence_and_no_deletion_actions(self):
         report = self.report()
         rules = {r['rule'] for r in report['review_items']}
-        self.assertTrue({'large-vm', 'large-stopped-vm', 'no-backup-job', 'excluded-disks', 'pbs-capacity', 'pbs-cleanup-failure'} <= rules)
+        self.assertTrue({'large-vm', 'large-stopped-vm', 'excluded-disks', 'pbs-capacity', 'pbs-cleanup-failure'} <= rules)
         self.assertTrue(all(r['evidence'] and r['follow_up'] for r in report['review_items']))
         self.assertNotIn('large-stopped-vm', {r['rule'] for r in inv.review_items(dict(report, vms=[dict(report['vms'][1], template=True)]))})
 

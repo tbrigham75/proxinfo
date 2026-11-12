@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from urllib import error, parse, request
 
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 
 class CronBusy(Exception):
@@ -1265,7 +1265,7 @@ def build_capacity_plan(report, reserve_percent=20.0, growth_overrides=None):
         'Growth is net filesystem usage change, including other data and observed cleanup, not a per-job or per-VM footprint.',
         'Forecasts assume comparable backup scope, retention and workload. No unverified cleanup recovery is subtracted.',
         'Required total = (currently unavailable space + daily growth × days) / (1 − reserve percentage).',
-        'Illustrative rates are examples, not observed growth, probability bounds or recommended purchase sizes.',
+        'Filesystem trends describe observed occupancy, not the unmet needs of selected VMs. User-entered rates remain assumptions.',
         'Targets describe reported filesystem capacity, not raw disks before RAID, replication or overhead. Currently reserved bytes are treated as fixed; verify usable capacity and reservation policy before expanding.',
     ])
     now = _capacity_timestamp(report.get('generated_at'))
@@ -1343,10 +1343,9 @@ def build_capacity_plan(report, reserve_percent=20.0, growth_overrides=None):
             primary = observed
             item.update(basis='Observed net filesystem growth', confidence='Limited: historical trend, not a guarantee', primary_scenario='Observed Net Growth')
         else:
-            scenarios = [('No Net Growth', 'illustrative', Decimal(0))] + [
-                (str(rate) + ' GiB/Day Example', 'illustrative', Decimal(rate * 1024**3)) for rate in (5, 10, 20)]
+            scenarios = []
             primary = None
-            item.update(basis='Illustrative planning scenarios; growth not measured', confidence='Not an evidence-based forecast')
+            item.update(basis='Insufficient history; no automatic growth estimate', confidence='Not an evidence-based forecast')
         for label, source, rate in scenarios:
             for days in horizons:
                 needed, additional = required(rate, days)
@@ -1381,8 +1380,8 @@ def build_capacity_plan(report, reserve_percent=20.0, growth_overrides=None):
             text += ('For 90 days at ' + human(float(primary)) + '/day (' + item['basis'].lower() + '), plan for '
                      + human(needed) + ' total (' + human(extra) + ' additional). ')
         else:
-            text += 'Future growth is not established; illustrated growth scenarios are assumptions for discussion, not a measured purchase recommendation. '
-        item['management_text'] = text + 'No potential cleanup recovery is credited. Separate datastore forecasts must not be added together.'
+            text += 'Insufficient evidence to estimate future PBS space for the selected workload. '
+        item['management_text'] = text + 'This filesystem scenario does not size unmet selected-workload demand. No potential cleanup recovery is credited. Separate datastore forecasts must not be added together.'
     if not stores:
         plan['notes'].append('Include PBS and a readable datastore capacity to calculate expansion scenarios.')
     return plan
@@ -2395,9 +2394,6 @@ def review_items(report):
         if large and vm["status"] == "stopped" and not vm["template"]:
             add("large-stopped-vm", vm, "Large machine currently off", "Stopped at collection time with " + human(vm["configured_bytes"]) + " assigned",
                 "Confirm whether this machine is still needed. Being off does not prove it is unused or safe to remove.")
-        if vm["backup"] == "No":
-            add("no-backup-job", vm, "No active backup schedule found", "No enabled PVE job checked here selects this machine",
-                "Confirm its backup arrangements with IT. Manual or external backups may still exist.")
         excluded = [d["slot"] for d in vm["disks"] if d["counted"] and d["backup_disk"] is False]
         if excluded:
             add("excluded-disks", vm, "Disk marked excluded from backups", "backup=0 on " + ", ".join(excluded),
@@ -2739,7 +2735,7 @@ function filterRows(){const shown=[];Array.from(body.rows).forEach(row=>{const m
 search.addEventListener('input',filterRows);nodeFilter.addEventListener('change',filterRows);missingOnly.addEventListener('change',filterRows);
 document.querySelector('#show-resources').addEventListener('change',event=>{table.dataset.resources=String(event.target.checked);document.querySelector('#table-total-note').closest('td').colSpan=event.target.checked?4:2;document.querySelector('#table-ram-total').hidden=!event.target.checked;});
 const globalNode=document.querySelector('#global-node-filter');const nodeViews=JSON.parse(document.querySelector('#node-view-data')?.textContent||'{}');const fullViews={};['overview','hosts','review','storage'].forEach(key=>{fullViews[key]=document.querySelector(`[data-page="${key}"]`).innerHTML;});
-function applyNodeView(value){if(globalNode)globalNode.value=value;nodeFilter.value=value;filterRows();for(const key of Object.keys(fullViews)){document.querySelector(`[data-page="${key}"]`).innerHTML=value&&nodeViews[value]?nodeViews[value][key]:fullViews[key];}const note=document.querySelector('#global-scope-note');if(note)note.textContent=(value?'Viewing PVE node: '+value:'Viewing all collected PVE nodes')+'. Management Summary, print, PBS, backup-job definitions and exports retain their full collected scope.';document.querySelectorAll('[data-review-vmid]').forEach(link=>{link.onclick=event=>{event.preventDefault();applyNodeView('');search.value='';missingOnly.checked=false;filterRows();showPage('machines');location.hash='machines';const target=Array.from(body.rows).find(row=>row.cells[0].dataset.value===link.dataset.reviewVmid);body.querySelectorAll('.selected-vm').forEach(r=>r.classList.remove('selected-vm'));if(target){target.classList.add('selected-vm');target.scrollIntoView({block:'center'});}};});const missingButton=document.querySelector('#show-missing');if(missingButton)missingButton.onclick=()=>{missingOnly.checked=true;filterRows();showPage('machines');location.hash='machines';};}
+function applyNodeView(value){if(globalNode)globalNode.value=value;nodeFilter.value=value;filterRows();for(const key of Object.keys(fullViews)){document.querySelector(`[data-page="${key}"]`).innerHTML=value&&nodeViews[value]?nodeViews[value][key]:fullViews[key];}const note=document.querySelector('#global-scope-note');if(note)note.textContent=(value?'Viewing PVE node: '+value:'Viewing all collected PVE nodes')+'. Capacity Planning, Management Summary, print, PBS, backup-job definitions and exports retain their full collected scope.';document.querySelectorAll('[data-review-vmid]').forEach(link=>{link.onclick=event=>{event.preventDefault();applyNodeView('');search.value='';missingOnly.checked=false;filterRows();showPage('machines');location.hash='machines';const target=Array.from(body.rows).find(row=>row.cells[0].dataset.value===link.dataset.reviewVmid);body.querySelectorAll('.selected-vm').forEach(r=>r.classList.remove('selected-vm'));if(target){target.classList.add('selected-vm');target.scrollIntoView({block:'center'});}};});const missingButton=document.querySelector('#show-missing');if(missingButton)missingButton.onclick=()=>{missingOnly.checked=true;filterRows();showPage('machines');location.hash='machines';};}
 if(globalNode){globalNode.onchange=()=>applyNodeView(globalNode.value);nodeFilter.addEventListener('change',()=>applyNodeView(nodeFilter.value));}
 function clearFilters(){search.value='';nodeFilter.value='';missingOnly.checked=false;applyNodeView('');}
 document.querySelector('#clear-filters').addEventListener('click',clearFilters);
@@ -3076,6 +3072,9 @@ def title_controls(markup):
 
 def management_body(report):
     markup = _management_body(report)
+    workload = report.get('selected_backup_workload') or selected_backup_workload(report)
+    statement = '<section><h2>Selected Backup Workload</h2><p>' + str(len(workload['vms'])) + ' selected VMs; known included assigned capacity ' + human(workload['known_configured_bytes']) + (' (complete visible scope)' if workload['complete'] else ' (partial)') + '.</p><p>' + html.escape(workload['estimate_status'] + ': ' + workload['estimate_reason']) + '</p></section>'
+    markup = markup.replace('</article>', statement + '</article>')
     if report.get('capacity_plan'):
         markup = markup.replace('</article>', capacity_management_html(report) + '</article>')
     if report.get('scope', {}).get('pbs_only'):
@@ -3240,6 +3239,126 @@ def capacity_policy_text(store):
     return lines
 
 
+def selected_workload_totals(rows, complete=True):
+    disks = {}
+    for row in rows:
+        complete = complete and row['complete']
+        for disk in row['disks']:
+            if not disk['identity']:
+                complete = False
+                continue
+            key = tuple(disk['identity'])
+            value = disk['capacity_bytes']
+            disks[key] = value if key not in disks or disks[key] == value else None
+    complete = complete and all(v is not None for v in disks.values())
+    values = [v for v in disks.values() if v is not None]
+    return dict(vm_count=len(rows), complete=complete,
+                known_configured_bytes=sum(values) if values or complete else None)
+
+
+def selected_backup_workload(report):
+    """PVE-selected logical scope; PBS observations never shrink this selection."""
+    active = {str(j['id']): j for j in report.get('jobs') or [] if enabled(j.get('enabled', 1))}
+    rows = []
+    destinations = {d['storage']: d for d in report.get('pbs_destinations', [])}
+    for vm in report.get('vms', []):
+        jobs = sorted(set(vm.get('enabled_jobs', [])) & set(active))
+        if not jobs:
+            continue
+        disks = unique_disks([d for d in vm.get('disks', []) if d.get('backup_disk') is True])
+        complete = bool(vm.get('config_available')) and all(d.get('capacity_bytes') is not None and d.get('identity') for d in disks) and all(d.get('backup_disk') is not None for d in vm.get('disks', []) if d.get('counted'))
+        known = sum(d['capacity_bytes'] for d in disks if d.get('capacity_bytes') is not None and d.get('identity'))
+        targets = sorted({str(active[j].get('storage') or 'Unknown') for j in jobs})
+        matches = []
+        for target in targets:
+            dest = destinations.get(target, {})
+            if dest.get('server') != report.get('pbs', {}).get('server'):
+                continue
+            matches.extend(g for g in report.get('pbs', {}).get('groups', []) if
+                           g.get('backup_type') == 'vm' and str(g.get('backup_id')) == str(vm['vmid']) and
+                           g.get('store') == dest.get('datastore') and g.get('namespace', '') == (dest.get('namespace') or ''))
+        evidence = []
+        for target in targets:
+            dest = destinations.get(target, {})
+            if dest.get('server') != report.get('pbs', {}).get('server'):
+                continue
+            store = next((st for st in report.get('pbs', {}).get('datastores', []) if st.get('store') == dest.get('datastore')), {})
+            tasks = [t for t in store.get('backup_attempts', []) if t.get('worker_id', t.get('worker-id')) == str(dest.get('datastore')) + ':vm/' + str(vm['vmid'])]
+            for task in tasks:
+                state = 'running' if task.get('endtime') is None else 'success' if task.get('status') == 'OK' else 'failed' if task.get('status') else 'unknown'
+                evidence.append(dict(destination=target, state=state, completed=task.get('endtime'), detail=task.get('status'), ownership_confirmed=False))
+        coverage = 'Matching backup group visible; successful coverage and cluster ownership unconfirmed' if matches else 'No confirmed successful backup in available evidence'
+        if evidence:
+            states = sorted({e['state'] for e in evidence})
+            coverage += '; task records: ' + ', '.join(states) + '. Task IDs do not establish namespace or cluster ownership.'
+        rows.append(dict(vmid=vm['vmid'], name=vm['name'], node=vm['node'], jobs=jobs, destinations=targets,
+                         configured_bytes=known if complete else None, known_configured_bytes=known if complete or any(d.get('capacity_bytes') is not None and d.get('identity') for d in disks) else None,
+                         complete=complete, coverage=coverage, backup_evidence=evidence,
+                         excluded_disks=[d['slot'] for d in vm.get('disks', []) if d.get('counted') and d.get('backup_disk') is False],
+                         disks=[dict(identity=d.get('identity'), capacity_bytes=d.get('capacity_bytes')) for d in disks]))
+    complete = report.get('jobs') is not None and not report.get('scope', {}).get('targeted') and all(r['complete'] for r in rows)
+    memberships = report.get('backup_job_members', {})
+    selected_ids = {str(r['vmid']) for r in rows}
+    for job in active:
+        if memberships.get(job) is None or not {str(v) for v in memberships[job]}.issubset(selected_ids):
+            complete = False
+    unresolved_members = sorted({str(v) for job in active for v in (memberships.get(job) or [])} - selected_ids)
+    unknown_jobs = sorted(job for job in active if memberships.get(job) is None)
+    totals = selected_workload_totals(rows, complete)
+    destination_totals = [dict(destination=target, **selected_workload_totals([r for r in rows if target in r['destinations']], complete)) for target in sorted({t for r in rows for t in r['destinations']})]
+    return dict(vms=rows, destinations=destination_totals, unresolved_member_ids=unresolved_members, unknown_membership_jobs=unknown_jobs, **totals,
+                requirements=[dict(component=label, required_bytes=None, reason=reason) for label, reason in (
+                    ('Catch-Up Backups', 'Missing or failed backups do not establish the unique compressed bytes needed for a first successful backup.'),
+                    ('Retained Changes', 'Snapshot logical sizes and keep counts do not establish unique changed bytes after compression and deduplication; overlapping rules and protected snapshots matter.'),
+                    ('Peak Working Space', 'Collection does not establish peak writes before prune and garbage collection can safely release chunks.'))],
+                estimate_status='Insufficient evidence to estimate PBS space',
+                estimate_reason='Selected capacity is not unique compressed backup data. Available records do not establish complete successful coverage, retained unique changes, or peak backup demand for this selection.')
+
+
+
+BACKUP_SCENARIO_SCRIPT = r"""
+(function(){
+const source=document.getElementById('backup-selection-data');if(!source)return;
+const baseline=JSON.parse(source.textContent), box=document.getElementById('backup-scenario');
+const picked=new Set(baseline.vms.map(v=>String(v.vmid)));
+const format=n=>{if(n===null)return 'N/A';let x=Number(n);for(const u of ['B','KiB','MiB','GiB','TiB','PiB']){if(x<1024||u==='PiB')return x.toFixed(2)+' '+u;x/=1024;}};
+let current;
+function update(){
+ const rows=baseline.vms.filter(v=>picked.has(String(v.vmid))), disks=new Map();let complete=baseline.complete;
+ for(const v of rows){complete=complete&&v.complete;for(const d of v.disks){if(!d.identity){complete=false;continue;}const k=JSON.stringify(d.identity),n=d.capacity_bytes===null?null:BigInt(d.capacity_bytes);if(!disks.has(k))disks.set(k,n);else if(disks.get(k)!==n)disks.set(k,null);}}
+ let total=0n,known=false;for(const n of disks.values()){if(n===null)complete=false;else {total+=n;known=true;}}
+ current={kind:'Management scenario; production jobs unchanged',baseline_vm_ids:baseline.vms.map(v=>v.vmid),included_vm_ids:rows.map(v=>v.vmid),excluded_vm_ids:baseline.vms.filter(v=>!picked.has(String(v.vmid))).map(v=>v.vmid),known_configured_bytes:known||complete?total.toString():null,complete,physical_pbs_requirement:null,reason:'Insufficient evidence; logical capacity reduction is not reclaimable PBS space'};
+ document.getElementById('backup-scenario-total').textContent='Scenario: '+rows.length+' VMs; known included assigned capacity '+format(known||complete?total:null)+' · '+(complete?'Complete':'Partial')+'. Excluded VM IDs: '+(current.excluded_vm_ids.join(', ')||'None')+'. PBS savings: not established.';
+ const chart=document.getElementById('backup-scenario-chart');chart.replaceChildren();const largest=rows.filter(v=>v.configured_bytes!==null).sort((a,b)=>Number(b.configured_bytes)-Number(a.configured_bytes)).slice(0,10);const max=Number(largest[0]?.configured_bytes)||1;
+ for(const v of largest){const item=document.createElement('div'),bar=document.createElement('div');item.textContent=v.vmid+' · '+v.name+' · '+v.node+' — '+format(v.configured_bytes);bar.style.cssText='height:12px;background:var(--accent,#4488bb);width:'+100*Number(v.configured_bytes)/max+'%';item.append(bar);chart.append(item);}
+}
+for(const v of baseline.vms){const label=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.checked=true;input.dataset.vmid=v.vmid;input.addEventListener('change',()=>{if(input.checked)picked.add(String(v.vmid));else picked.delete(String(v.vmid));update();});label.append(input,document.createTextNode(' '+v.vmid+' · '+v.name+' ('+v.node+')'));const line=document.createElement('div');line.append(label);box.append(line);}
+window.resetBackupScenario=()=>{baseline.vms.forEach(v=>picked.add(String(v.vmid)));box.querySelectorAll('input').forEach(i=>i.checked=true);update();};
+window.printBackupScenario=()=>{const win=window.open('','_blank');if(!win)return;win.document.title='ProxInfo Management Scenario';const heading=win.document.createElement('h1');heading.textContent='Management Scenario - Production Jobs Unchanged';win.document.body.append(heading);for(const text of ['Collected: '+baseline.collected_at, 'Baseline: '+baseline.vm_count+' selected VMs; known included assigned capacity '+format(baseline.known_configured_bytes), document.getElementById('backup-scenario-total').textContent, 'Logical capacity is not physical PBS consumption or reclaimable space.']){const p=win.document.createElement('p');p.textContent=text;win.document.body.append(p);}const chart=document.getElementById('backup-scenario-chart').cloneNode(true);win.document.body.append(chart);win.focus();win.print();};
+window.downloadBackupScenario=()=>{const blob=new Blob([JSON.stringify({...current,vms:baseline.vms.filter(v=>picked.has(String(v.vmid)))},null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='backup-management-scenario.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+const table=document.getElementById('selected-backup-table');table.querySelectorAll('th button').forEach((button,index)=>button.addEventListener('click',()=>{const direction=button.dataset.desc==='yes'?1:-1;button.dataset.desc=direction===1?'no':'yes';const rows=[...table.tBodies[0].rows];rows.sort((a,b)=>direction*(index===3?Number(a.dataset.capacity??-1)-Number(b.dataset.capacity??-1):a.cells[index].textContent.localeCompare(b.cells[index].textContent,undefined,{numeric:true})));rows.forEach(r=>table.tBodies[0].append(r));}));update();
+})();
+"""
+
+def selected_workload_html(report):
+    data = report.get('selected_backup_workload') or selected_backup_workload(report)
+    esc = lambda v: html.escape(str(v), quote=True)
+    rows = sorted(data['vms'], key=lambda r: (r['configured_bytes'] is None, -(r['configured_bytes'] or 0), r['vmid']))
+    ranked = [r for r in rows if r['configured_bytes'] is not None][:10]
+    maximum = max([r['configured_bytes'] for r in ranked] or [1]) or 1
+    chart = ''.join('<div><span>' + esc(str(r['vmid']) + ' · ' + r['name'] + ' · ' + r['node']) + '</span><div style="background:var(--accent,#4488bb);height:12px;width:' + str(100*r['configured_bytes']/maximum) + '%"></div><span>' + human(r['configured_bytes']) + '</span></div>' for r in ranked) or '<p>No selected VM has a complete known included disk size to rank.</p>'
+    total = data['known_configured_bytes']
+    top_total = selected_workload_totals(ranked)['known_configured_bytes']
+    share = str(round(100*(top_total or 0)/total, 1)) + '%' if data['complete'] and total else 'N/A (incomplete or zero total)'
+    table = ''.join('<tr data-capacity="' + str(r['configured_bytes'] if r['configured_bytes'] is not None else -1) + '"><td>' + esc(r['vmid']) + '</td><td>' + esc(r['name']) + '</td><td>' + esc(r['node']) + '</td><td>' + human(r['configured_bytes']) + '</td><td>' + esc(', '.join(r['jobs'])) + '</td><td>' + esc(', '.join(r['destinations'])) + '</td><td>' + esc(', '.join(r['excluded_disks']) or 'None') + '</td><td>' + esc(r['coverage']) + '</td></tr>' for r in rows)
+    wire = dict(data, collected_at=report.get('generated_at'), vms=[dict(r, configured_bytes=str(r['configured_bytes']) if r['configured_bytes'] is not None else None, disks=[dict(d, capacity_bytes=str(d['capacity_bytes']) if d['capacity_bytes'] is not None else None) for d in r['disks']]) for r in rows])
+    payload = json.dumps(wire, ensure_ascii=True).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+    destination_table = record_table([dict(d, capacity=human(d['known_configured_bytes'])) for d in data.get('destinations', [])], [('destination','PVE Destination'), ('vm_count','Unique Selected VMs'), ('capacity','Known Included Assigned Capacity'), ('complete','Complete Coverage')])
+    gaps = '<p>Selected guest IDs without VM details: ' + esc(', '.join(data['unresolved_member_ids']) or 'None identified') + '. Jobs with unknown membership: ' + esc(', '.join(data['unknown_membership_jobs']) or 'None identified') + '.</p>'
+    requirements_table = record_table(data['requirements'], [('component','Requirement'), ('required_bytes','Estimated Physical Bytes'), ('reason','Why An Estimate Is Unavailable')])
+    return '<section class="panel"><h2>Selected Backup Workload</h2><p>' + str(len(rows)) + ' unique selected VMs · Known included assigned capacity: <strong>' + human(total) + '</strong> · ' + ('Complete visible VM scope' if data['complete'] else 'Partial: unknown membership, sizes or uninspected guests may add requirements') + '</p>' + gaps + '<h3>By Backup Destination</h3>' + destination_table + '<p>Destinations are separated by PVE storage ID; aliases and shared PBS filesystems must not be added together.</p><p>Only enabled PVE jobs define this selection. Failed or absent PBS backups do not remove VMs. Shared volume references count once; disk sizes are not physical PBS usage.</p><h3>Top 10 Selected VMs</h3>' + chart + '<p>Top 10 share of selected assigned capacity: ' + share + '. Ranking includes only VMs with complete known disk sizes; unknown sizes can change the ranking.</p><div class="table-wrap"><table id="selected-backup-table"><thead><tr><th><button>VM ID</button></th><th><button>Name</button></th><th><button>Host</button></th><th><button>Included Assigned Capacity</button></th><th><button>Jobs</button></th><th><button>Destinations</button></th><th><button>Excluded Disks</button></th><th><button>Backup Coverage</button></th></tr></thead><tbody>' + table + '</tbody><tfoot><tr><th colspan="3">Unique Included Assigned Capacity</th><td>' + human(total) + (' (complete)' if data['complete'] else ' (partial)') + '</td><td colspan="4">Shared volume references counted once</td></tr></tfoot></table></div><h3>Catch-Up, Retention And Peak Requirements</h3><p><strong>' + esc(data['estimate_status']) + '</strong>. ' + esc(data['estimate_reason']) + '</p><p>Catch-up, ongoing retention and peak requirements are unresolved separately; none is treated as zero. Protected snapshots and overlapping policies remain evidence to review below.</p>' + requirements_table + '</section><section class="panel"><h2>Management Scenario</h2><p>Temporarily exclude selected VMs from a comparison. Production jobs and the baseline above remain unchanged. No physical PBS savings or immediately reclaimable space are inferred.</p><div id="backup-scenario"></div><button type="button" onclick="resetBackupScenario()">Reset Scenario</button> <button type="button" onclick="downloadBackupScenario()">Export Scenario</button> <button type="button" onclick="printBackupScenario()">Print Scenario</button><p id="backup-scenario-total"></p><h3>Scenario Top 10</h3><div id="backup-scenario-chart"></div><script type="application/json" id="backup-selection-data">' + payload + '</script><script>' + BACKUP_SCENARIO_SCRIPT + '</script></section>'
+
+
 def capacity_page_html(report):
     """Explain evidence, planning assumptions and capacity targets separately."""
     esc = lambda value: html.escape(display(value), quote=True)
@@ -3249,7 +3368,7 @@ def capacity_page_html(report):
     out = ['<p class="eyebrow">Storage expansion evidence</p><h2 tabindex="-1">Capacity Planning</h2>'
            '<p class="page-intro">See the space needed to restore a free-space reserve now, '
            'then compare 30-, 90-, and 180-day growth scenarios. These are capacity targets '
-           'for the reported PBS filesystem, not measurements of one backup job.</p>'
+           'for the reported PBS filesystem. These trend scenarios do not size the entire selected PVE workload or unmet backup demand.</p>'
            '<div class="callout">Free-space reserve target: <strong>' + esc(reserve) + '%</strong>. '
            'A reserve leaves room for upcoming writes; it is not additional data already stored. '
            'Datastores may share a filesystem, so their capacity figures must not be added together.</div>']
@@ -3344,7 +3463,7 @@ def capacity_page_html(report):
                '<li>Existing backups are already part of measured storage usage; do not add VM or snapshot totals again.</li>'
                '<li>A larger datastore can provide room, but does not repair failed cleanup or establish that backups are succeeding.</li>'
                '</ul></section>')
-    return ''.join(out)
+    return selected_workload_html(report) + ''.join(out)
 
 
 def capacity_management_html(report):
@@ -3388,7 +3507,7 @@ def capacity_terminal_text(report):
                          '; additional=' + human(row.get('additional_bytes')))
         lines.append('  Expansion wording: ' + str(store.get('management_text') or 'N/A'))
         lines.extend('  Assumption: ' + str(note) for note in store.get('assumptions') or [])
-    lines.append('Illustrative rates are examples, not measured forecasts. Existing data is already included; no cleanup savings are deducted.')
+    lines.append('Filesystem trends do not estimate unmet selected-workload demand. Existing data is already included; no cleanup savings are deducted.')
     return '\n'.join(lines)
 
 
@@ -3396,7 +3515,7 @@ def downloads_html():
     files = [('Host inventory', 'hosts.csv'), ('VM spreadsheet', 'vms.csv'), ('Disk spreadsheet', 'disks.csv'),
              ('Full inventory', 'inventory.json'), ('Printable summary', 'management-summary.html'),
              ('PBS backup groups', 'pbs_groups.csv'), ('PBS snapshots', 'pbs_snapshots.csv'),
-             ('Capacity planning spreadsheet', 'capacity_planning.csv'), ('Backup job scope', 'backup_job_scope.csv'),
+             ('Capacity planning spreadsheet', 'capacity_planning.csv'), ('Backup job scope', 'backup_job_scope.csv'), ('Selected backup VMs', 'selected_backup_vms.csv'), ('Selected backup totals', 'selected_backup_totals.csv'), ('Selected backup requirements', 'selected_backup_requirements.csv'),
              ('Printable capacity plan', 'capacity-plan.html'), ('Storage expansion justification', 'capacity-justification.txt')]
     return '<h2>Downloads</h2><p>These files cover the entire collected report, regardless of browser filters. Keep them alongside this HTML file.</p><section class="panel">' + ''.join('<p><a href="' + path + '">' + label + '</a></p>' for label, path in files) + '</section>'
 
@@ -3581,7 +3700,11 @@ def _export_report(report, directory):
     directory.mkdir(parents=True, exist_ok=True)
     write_csv(directory / 'hosts.csv', ['node','address','status','details','storage'], report.get('hosts', []))
     write_csv(directory / 'changes.csv', ['vmid','change','previous','current'], report.get('changes', {}).get('items', []))
-    terminal = terminal_report(report)
+    workload = report.get('selected_backup_workload') or selected_backup_workload(report)
+    write_csv(directory / 'selected_backup_vms.csv', ['vmid','name','node','jobs','destinations','configured_bytes','known_configured_bytes','complete','coverage','backup_evidence','excluded_disks'], workload['vms'])
+    write_csv(directory / 'selected_backup_totals.csv', ['destination','vm_count','known_configured_bytes','complete'], [dict(destination='Overall unique selection', vm_count=workload['vm_count'], known_configured_bytes=workload['known_configured_bytes'], complete=workload['complete'])] + workload['destinations'])
+    write_csv(directory / 'selected_backup_requirements.csv', ['component','required_bytes','reason'], workload['requirements'])
+    terminal = terminal_report(report) + '\nSELECTED BACKUP WORKLOAD: ' + str(len(workload['vms'])) + ' VMs; known included capacity ' + human(workload['known_configured_bytes']) + '; ' + workload['estimate_status']
     if report.get('capacity_plan'):
         terminal += '\n\n' + capacity_terminal_text(report)
     (directory / "inventory.txt").write_text(terminal, encoding="utf-8")
@@ -3596,6 +3719,7 @@ def _export_report(report, directory):
         evidence = next((s for s in report.get('pbs', {}).get('datastores', []) if s.get('store') == store.get('store')), {})
         justification.extend(capacity_policy_text(evidence))
         justification.extend('- ' + note for note in store.get('assumptions', []))
+    justification.extend(['', 'SELECTED PVE WORKLOAD', str(len(workload['vms'])) + ' VMs; known included assigned capacity ' + human(workload['known_configured_bytes']), 'Coverage: ' + ('complete visible scope' if workload['complete'] else 'partial'), workload['estimate_status'], workload['estimate_reason'], 'Filesystem trend scenarios above do not establish requirements for unprotected selected workloads.'])
     justification.extend([''] + plan.get('notes', []))
     (directory / 'capacity-justification.txt').write_text('\n'.join(justification), encoding='utf-8')
     projection_rows = []
@@ -3956,6 +4080,7 @@ def main(argv=None):
                 pbs_location_details(report, config, args, tracker)
         report['capacity_plan'] = build_capacity_plan(report, args.pbs_reserve_percent, growth_overrides)
         report['capacity_plan']['jobs'] = capacity_job_scope(report)
+        report['selected_backup_workload'] = selected_backup_workload(report)
         report['capacity_plan']['history_enabled'] = args.pbs_history
         if not args.pbs_history:
             report['capacity_plan']['notes'].append('Local capacity history was disabled for this run.')

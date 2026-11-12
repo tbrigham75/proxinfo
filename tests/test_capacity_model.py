@@ -20,7 +20,7 @@ class CapacityModelTests(unittest.TestCase):
         return [dict(time=f'2026-11-{day:02d}T00:00:00+00:00', used_bytes=used*GIB,
                      available_bytes=(1000-used)*GIB) for day, used in days_and_used]
 
-    def test_first_run_has_immediate_reserve_gap_but_only_illustrative_growth(self):
+    def test_first_run_has_reserve_gap_without_invented_growth(self):
         report = self.report(total_bytes=2*1024*GIB, used_bytes=2*1024*GIB, available_bytes=0)
         plan = inv.build_capacity_plan(report)
         store = plan['stores'][0]
@@ -28,9 +28,9 @@ class CapacityModelTests(unittest.TestCase):
         self.assertEqual(store['immediate_additional_bytes'], 512*GIB)
         self.assertEqual(store['days_until_full'], 0)
         self.assertIsNone(store['observed_growth_bytes_per_day'])
-        self.assertEqual(len(store['projections']), 12)
-        self.assertEqual({p['source'] for p in store['projections']}, {'illustrative'})
-        self.assertIn('not a measured purchase recommendation', store['management_text'])
+        self.assertEqual(store['projections'], [])
+        self.assertIsNone(store['primary_scenario'])
+        self.assertIn('Insufficient evidence', store['management_text'])
         self.assertIn('suppress measured growth', ' '.join(store['assumptions']))
 
     def test_manual_assumption_accounts_for_reserved_unavailable_space(self):
@@ -78,7 +78,7 @@ class CapacityModelTests(unittest.TestCase):
             with self.subTest(history=history):
                 store = inv.build_capacity_plan(self.report(capacity_history=history))['stores'][0]
                 self.assertIsNone(store['observed_growth_bytes_per_day'])
-                self.assertTrue(all(p['source'] == 'illustrative' for p in store['projections']))
+                self.assertEqual(store['projections'], [])
 
     def test_future_malformed_and_conflicting_readings_are_excluded(self):
         history = self.history([(1, 100), (5, 140), (11, 200), (12, 220)])

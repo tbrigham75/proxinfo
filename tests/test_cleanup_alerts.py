@@ -104,7 +104,7 @@ class CleanupAlertTests(unittest.TestCase):
         self.assertEqual([item['rule'] for item in items[:3]],
                          ['pbs-capacity-full', 'pbs-cleanup-failure', 'inventory-interrupted'])
         self.assertFalse(any(item['rule'] in ('missing-measurement', 'unreadable-settings') for item in items))
-        self.assertEqual(sum(item['rule'] == 'no-backup-job' for item in items), 2)
+        self.assertEqual(sum(item['rule'] == 'no-backup-job' for item in items), 0)
 
 
 if __name__ == '__main__':

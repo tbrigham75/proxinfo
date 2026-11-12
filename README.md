@@ -592,7 +592,7 @@ Environment variables override corresponding JSON fields (`url`, `token_id`, `to
 
 ## Review list, storage breakdowns and management handoff
 
-**Needs Attention** contains findings with the machine/datastore, evidence and a suggested follow-up. The rules flag large assigned disk space, large machines currently off, disks marked `backup=0`, no enabled PVE backup job, unreadable settings, incomplete measurements, PBS capacity at the review threshold and reported prune/GC failures. An off machine is not assumed unused. A missing PVE job is not proof that no backups exist. These are review prompts; nothing is excluded, changed or deleted.
+**Needs Attention** contains findings with the machine/datastore, evidence and a suggested follow-up. The rules flag large assigned disk space, large machines currently off, disks marked `backup=0`, unreadable settings, incomplete measurements, PBS capacity at the review threshold and reported prune/GC failures. An off machine is not assumed unused. Intentionally unselected VMs do not generate missing-schedule warnings. These are review prompts; nothing is excluded, changed or deleted.
 
 Defaults are **500 GiB** assigned space for a large machine and **90%** used filesystem capacity for a PBS capacity review. Override them explicitly:
 
@@ -1098,7 +1098,7 @@ The report contains:
 
 ### First run versus measured history
 
-On the first run, the immediate reserve requirement can be calculated from current capacity. Future growth needs more evidence. Until history contains at least **three distinct daily readings spanning seven days**, with the latest no older than seven days, the report shows explicitly illustrative **0, 5, 10 and 20 GiB/day** scenarios. These numbers are examples, not measurements of your environment or purchase recommendations.
+On the first run, the immediate reserve requirement can be calculated from current capacity. Future growth needs more evidence. Until history contains at least **three distinct daily readings spanning seven days**, with the latest no older than seven days, automatic future-growth projections remain unavailable. No preset daily growth rates are supplied. A user-entered growth rate remains an explicit assumption, never a measured requirement for the selected VM workload.
 
 With enough comparable history, the baseline uses first-to-last net growth. A highest-sampled-interval sensitivity scenario is also shown when higher; it is not a statistical confidence interval or guaranteed upper bound. Flat or declining history does not prove future demand is zero. A full datastore can suppress successful backups and hide unmet demand. Failed or unknown cleanup lowers confidence; the model credits **no unverified space recovery**.
 
@@ -1145,3 +1145,70 @@ The chart plots successive valid observations, with exact timestamps and values 
 ### First live PBS acceptance run
 
 Start with one datastore and PBS-only mode. Compare reported capacity, visible namespaces/group counts, oldest/latest snapshots, protected entries, prune settings, GC statistics, and verification state with the PBS web interface. Confirm the account has the documented audit access. Then test an intentionally limited namespace and a combined PVE/PBS run. Only after matching those readings should the scheduled history be relied upon. Automated fixtures and browser tests cannot validate your installed server version or account visibility.
+
+
+### Selected backup workload (1.7.0)
+
+Run ProxInfo normally and open **Capacity Planning** in `inventory.html`. No new
+switches are needed. The selected-workload section works with PVE inventory even
+when you skip PBS; include PBS to add destination, task and filesystem evidence.
+Manual and scheduled collection remain read-only.
+
+**Selected Backup Workload** counts VMs selected by enabled PVE backup jobs, across
+the collected cluster. A VM stays selected even if its PBS backups are missing or
+failing because storage is full. Intentionally unselected VMs are outside this
+analysis and do not produce a missing-backup-schedule warning.
+
+- **Included Assigned Capacity** is the configured size of disks included in
+  backup. It excludes `backup=0`, CD/cloud-init media and unused disks under the
+  existing disk rules; included EFI/TPM disks remain counted. It is not measured
+  storage consumption, guest filesystem usage or physical PBS backup data.
+- **Known included total** counts a shared volume identity once, even across VMs
+  and overlapping jobs. Conflicting sizes are unavailable. Partial totals label
+  missing configuration, identity, membership or sizes; unavailable is not zero.
+  Containers are not inventoried as VMs; selected guest IDs without VM details
+  are shown as scope gaps. Limited PVE access can hide additional jobs or guests.
+- **Top 10 Selected VMs** ranks complete included assigned capacities. Unknown
+  sizes can change the ranking. The share of the total deduplicates the top-ten
+  volume references; individual VM sizes should not be added when disks overlap.
+- **By Backup Destination** separates PVE storage IDs. These may be aliases for
+  the same PBS destination. Neither their workload totals nor filesystem
+  capacities should be added into an overall physical-storage claim.
+- **Backup Coverage** distinguishes visible matching groups and candidate task
+  outcomes from confirmed protection. Matching checks use server, datastore and
+  namespace. PBS backup task identifiers can omit namespace and do not establish
+  which PVE cluster owns a reused VM ID. An OK candidate task alone therefore
+  does not prove complete successful coverage of this selected workload.
+
+**Physical PBS requirements:** current collection does not establish a reliable
+physical-size estimate for all selected VMs. Catch-up backups, retained changes,
+and peak writes before cleanup each show the missing evidence. No compression
+ratio, deduplication ratio, per-VM chunk ownership, retention multiplier or
+cleanup savings is invented. Existing PBS filesystem forecasts remain useful
+context, but may understate unmet demand when backups are failing. They are not
+an estimate for completing all selected backups. A full selected-workload
+physical sizing model requires additional trustworthy evidence; this release
+reports that limitation instead of manufacturing an expansion amount.
+
+**Management Scenario** lets you temporarily deselect currently selected VMs.
+It recalculates the unique known assigned capacity and top-ten chart without
+changing the baseline, PVE jobs, or PBS data. **Reset Scenario** restores the
+selection; **Export Scenario** saves a labeled JSON file with included/excluded
+VM IDs and unknown physical requirements. **Print Scenario** opens a printable
+comparison. General node filters do not change Capacity Planning's collected
+baseline. Scenario choices are temporary and are not persisted into inventory
+exports or a later run.
+
+The Management Summary and expansion-request text include selected scope and
+its limitations. Additional downloads:
+
+| File | Contents |
+| --- | --- |
+| `selected_backup_vms.csv` | Included VMs, jobs, destinations, assigned bytes, excluded disks, completeness and candidate backup evidence |
+| `selected_backup_totals.csv` | Overall unique scope and separate destination subtotals in bytes |
+| `selected_backup_requirements.csv` | Catch-up, retained-change and peak requirements; unavailable numeric values and explanations |
+
+Normal collection also includes this data in `inventory.json`. Reports and CSVs
+may contain infrastructure names and backup details; share them appropriately.
+Windows fixture and native browser tests do not establish compatibility with your
+live PVE/PBS permissions or SSH/Okta flow. Live testing remains your next step.

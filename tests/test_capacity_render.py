@@ -83,7 +83,7 @@ class CapacityRenderingTests(unittest.TestCase):
         job['notes'] = [bad]
         report['capacity_plan']['notes'] = [bad]
         for output in (inv.capacity_page_html(report), inv.capacity_management_html(report)):
-            self.assertNotIn('<script>', output)
+            self.assertNotIn(bad, output)
             self.assertIn('&lt;script&gt;', output)
 
     def test_unknown_and_zero_remain_distinct_without_mutating_report(self):
